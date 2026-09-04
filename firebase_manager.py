@@ -1,6 +1,5 @@
 """
 Handles all Firebase Admin SDK initialization, authentication, reads, and updates.
-Credentials can be passed via environment variable (raw JSON) or local file.
 """
 import os
 import json
@@ -28,7 +27,6 @@ def init_firebase() -> None:
     cred_env = FIREBASE_CREDENTIALS
 
     try:
-        # Check if environment variable contains raw JSON string
         if cred_env.strip().startswith("{"):
             cred_dict = json.loads(cred_env)
             cred = credentials.Certificate(cred_dict)
@@ -36,7 +34,7 @@ def init_firebase() -> None:
             cred = credentials.Certificate(cred_env)
         else:
             raise FileNotFoundError(
-                f"Firebase credentials not found via path or valid JSON string in FIREBASE_CREDENTIALS"
+                "Firebase credentials not found via path or valid JSON string in FIREBASE_CREDENTIALS"
             )
 
         firebase_admin.initialize_app(cred, {
@@ -49,30 +47,39 @@ def init_firebase() -> None:
         raise
 
 
-def get_scripts_list() -> list[str]:
-    """Reads script identifiers from /scripts/."""
+def get_stocklist_mapping() -> dict[str, str]:
+    """
+    Reads from /stocklist/ in Firebase and returns a mapping:
+    {"Reliance Industries": "RELIANCE.NS", "NIFTY50": "^NSEI", ...}
+    """
     init_firebase()
     ref = db.reference(PATH_SCRIPTS)
     data = ref.get()
     if not data:
-        return []
+        return {}
+    
+    mapping = {}
     if isinstance(data, dict):
-        return [str(k).strip() for k in data.keys() if str(k).strip()]
-    if isinstance(data, list):
-        return [str(item).strip() for item in data if item]
-    return []
+        for name, ticker in data.items():
+            if name and ticker:
+                # Sanitize ticker string and fix common typos
+                t = str(ticker).strip()
+                if t.upper() == "^NESI":  # Correct common Nifty typo automatically
+                    t = "^NSEI"
+                mapping[str(name).strip()] = t
+    return mapping
 
 
-def get_stock_ohlc(script: str) -> dict | list | None:
-    """Fetches existing OHLC node for a specific script."""
+def get_stock_ohlc(display_name: str) -> dict | list | None:
+    """Fetches existing OHLC node for a specific display name."""
     init_firebase()
-    safe_script = sanitize_key(script)
-    ref = db.reference(f"{PATH_STOCKS}/{safe_script}")
+    safe_key = sanitize_key(display_name)
+    ref = db.reference(f"{PATH_STOCKS}/{safe_key}")
     return ref.get()
 
 
 def get_calendar_config() -> dict:
-    """Fetches NSE calendar rules and overrides from /config/nse_calendar."""
+    """Fetches NSE calendar rules and overrides."""
     init_firebase()
     ref = db.reference(PATH_CALENDAR)
     data = ref.get()
@@ -80,41 +87,38 @@ def get_calendar_config() -> dict:
 
 
 def set_calendar_config(payload: dict) -> None:
-    """Writes or seeds the NSE calendar config."""
+    """Seeds the NSE calendar config."""
     init_firebase()
     ref = db.reference(PATH_CALENDAR)
     ref.set(payload)
 
 
-def write_full_ohlc(script: str, records: dict[str, dict]) -> bool:
-    """
-    Overwrites the full 250 OHLC records for a script.
-    Guarantees index 0-249 schema.
-    """
+def write_full_ohlc(display_name: str, records: dict[str, dict]) -> bool:
+    """Writes the complete 250 records under /stocks/<Display Name>."""
     init_firebase()
-    safe_script = sanitize_key(script)
-    ref = db.reference(f"{PATH_STOCKS}/{safe_script}")
+    safe_key = sanitize_key(display_name)
+    ref = db.reference(f"{PATH_STOCKS}/{safe_key}")
     try:
         ref.set(records)
         return True
     except Exception as e:
-        logger.error(f"Firebase full write failed for {script}: {e}")
+        logger.error(f"Firebase full write failed for {display_name}: {e}")
         return False
 
 
-def update_live_candle(script: str, candle: dict) -> bool:
-    """Updates only node /stocks/<script>/0 during live trading."""
+def update_live_candle(display_name: str, candle: dict) -> bool:
+    """Updates only node /stocks/<Display Name>/0."""
     init_firebase()
-    safe_script = sanitize_key(script)
-    ref = db.reference(f"{PATH_STOCKS}/{safe_script}/0")
+    safe_key = sanitize_key(display_name)
+    ref = db.reference(f"{PATH_STOCKS}/{safe_key}/0")
     try:
         ref.set(candle)
         return True
     except Exception as e:
-        logger.error(f"Firebase live candle write failed for {script}: {e}")
+        logger.error(f"Firebase live candle write failed for {display_name}: {e}")
         return False
 
 
 def sanitize_key(key: str) -> str:
-    """Sanitizes Firebase keys replacing invalid characters."""
+    """Sanitizes Firebase keys replacing invalid characters except spaces."""
     return key.replace(".", "_").replace("$", "").replace("#", "").replace("[", "").replace("]", "").replace("/", "_")

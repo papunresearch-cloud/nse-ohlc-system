@@ -1,9 +1,5 @@
 """
 CHILD-2: Current-Day Live OHLC Update.
-Responsible for:
-- Fetching active intraday market values during trading hours.
-- Overwriting ONLY index 0 without shifting historical records (indexes 1-249 remain intact).
-- Price sanity checks to ensure no malformed data reaches Firebase.
 """
 from datetime import datetime
 import pytz
@@ -14,34 +10,31 @@ from yahoo_manager import download_intraday_today
 IST = pytz.timezone(TIMEZONE)
 
 
-def update_live_script(script: str) -> bool:
-    """Updates only node /stocks/<script>/0 with current market candle."""
-    # 1. Fetch current intraday data
-    candle = download_intraday_today(script)
+def update_live_script(display_name: str, ticker: str) -> bool:
+    """Updates only node /stocks/<display_name>/0 using live data from `ticker`."""
+    candle = download_intraday_today(ticker)
     if not candle:
-        logger.warning(f"[{script}] Unable to fetch current live candle from Yahoo")
+        logger.warning(f"[{display_name}] Live candle not retrieved for {ticker}")
         return False
 
-    # 2. Validate candle structure
     valid, err_msg = _validate_single_candle(candle)
     if not valid:
-        logger.error(f"[{script}] Live candle rejected: {err_msg}")
+        logger.error(f"[{display_name}] Live candle rejected: {err_msg}")
         return False
 
-    # 3. Verify node 0 date consistency
-    existing = get_stock_ohlc(script)
+    # Check date consistency against Index 1
+    existing = get_stock_ohlc(display_name)
     if isinstance(existing, dict) and "1" in existing:
         idx1_date = existing["1"].get("date")
         if idx1_date and idx1_date >= candle["date"]:
             logger.error(
-                f"[{script}] Live date conflict: Candle date {candle['date']} is not newer than Index 1 date {idx1_date}"
+                f"[{display_name}] Date conflict: Live candle date {candle['date']} is not newer than Index 1 date {idx1_date}"
             )
             return False
 
-    # 4. Perform localized write to Firebase
-    success = update_live_candle(script, candle)
+    success = update_live_candle(display_name, candle)
     if success:
-        logger.debug(f"[{script}] Live candle updated: CMP={candle['close']} (O={candle['open']} H={candle['high']} L={candle['low']})")
+        logger.debug(f"[{display_name}] Live candle updated: CMP={candle['close']}")
     return success
 
 

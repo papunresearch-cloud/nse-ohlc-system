@@ -1,16 +1,6 @@
 """
 MASTER / MOTHER PROGRAM
-Orchestrates the continuous maintenance of the 250-candle OHLC database.
-
-Key Responsibilities:
-- Binds to Render's $PORT using a lightweight background HTTP server.
-- Interrogates the market status (LIVE / CLOSED / HOLIDAY / MUHURAT).
-- Polls the script list dynamically from Firebase (/scripts/).
-- Enforces Child-1 (Sync) priority over Child-2 (Live Updates).
-- Isolates errors per script so one failure does not halt the system.
-- Operates statelessly with immediate recovery on server restarts.
 """
-
 import os
 import sys
 import time
@@ -28,7 +18,7 @@ from config import (
     TARGET_OHLC_COUNT,
     logger
 )
-from firebase_manager import init_firebase, get_scripts_list, get_stock_ohlc
+from firebase_manager import init_firebase, get_stocklist_mapping, get_stock_ohlc
 from market_calendar import MarketCalendar
 from sync_child import sync_historical_script
 from live_child import update_live_script
@@ -39,10 +29,9 @@ _keep_running = True
 
 
 # =====================================================================
-# RENDER CLOUD COMPATIBILITY: BACKGROUND HTTP HEALTH SERVER
+# RENDER CLOUD COMPATIBILITY
 # =====================================================================
 class RenderHealthCheckHandler(BaseHTTPRequestHandler):
-    """Responds with 200 OK to satisfy Render's Web Service port binder & health monitors."""
     def do_GET(self):
         self.send_response(200)
         self.send_header("Content-type", "text/plain; charset=utf-8")
@@ -55,12 +44,10 @@ class RenderHealthCheckHandler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def log_message(self, format, *args):
-        # Suppress HTTP access lines from cluttering orchestrator logs
         return
 
 
 def start_render_http_server():
-    """Starts an HTTP server on the PORT assigned by Render in a background daemon thread."""
     port_str = os.environ.get("PORT", "10000")
     try:
         port = int(port_str)
@@ -77,7 +64,7 @@ def start_render_http_server():
 # =====================================================================
 def handle_shutdown(signum, frame):
     global _keep_running
-    logger.info(f"Received termination signal ({signum}). Gracefully shutting down...")
+    logger.info(f"Received termination signal ({signum}). Shutting down...")
     _keep_running = False
 
 
@@ -100,35 +87,30 @@ class MasterOrchestrator:
         logger.info("NSE EQUITY OHLC DATABASE MAINTENANCE MASTER START")
         logger.info("==================================================")
 
-        # Execute an initial historical sync check immediately upon boot/restart
-        logger.info("Executing startup check on all registered scripts...")
+        # Run startup historical sync check
+        logger.info("Executing startup check on all registered stocks...")
         self.orchestrate_cycle(force_hist_check=True, market_is_live=False)
         self.last_hist_sync_time = time.time()
 
         while _keep_running:
             try:
                 now_ts = time.time()
-                
-                # Dynamically re-read calendar configurations/overrides from Firebase
                 self.calendar.refresh_calendar()
                 status, reason = self.calendar.get_market_status()
                 is_live = (status == "LIVE")
 
                 logger.info(f"Market Status: [{status}] - {reason}")
 
-                # Determine which operations are due
                 hist_due = (now_ts - self.last_hist_sync_time) >= HIST_SYNC_INTERVAL_SEC
                 live_due = is_live and ((now_ts - self.last_live_update_time) >= LIVE_UPDATE_INTERVAL_SEC)
 
                 if hist_due or live_due:
                     self.orchestrate_cycle(force_hist_check=hist_due, market_is_live=is_live)
-                    
                     if hist_due:
                         self.last_hist_sync_time = now_ts
                     if live_due:
                         self.last_live_update_time = now_ts
 
-                # Responsive sleeping: Wake up every 1 sec to capture SIGINT/SIGTERM quickly
                 for _ in range(MARKET_CHECK_INTERVAL_SEC):
                     if not _keep_running:
                         break
@@ -141,42 +123,35 @@ class MasterOrchestrator:
         logger.info("Master orchestrator stopped safely.")
 
     def orchestrate_cycle(self, force_hist_check: bool = False, market_is_live: bool = False):
-        """Fetches the external script list and processes each stock sequentially."""
-        scripts = get_scripts_list()
-        logger.info(f"SCRIPT LIST READ: {len(scripts)} scripts found in Firebase /scripts/")
+        stock_map = get_stocklist_mapping()
+        logger.info(f"STOCKLIST READ: {len(stock_map)} stocks found in Firebase /stocklist/")
 
-        if not scripts:
-            logger.warning("Firebase /scripts/ list is currently empty. Standing by...")
+        if not stock_map:
+            logger.warning("Firebase /stocklist/ is empty. Standing by...")
             return
 
-        for script in scripts:
+        for display_name, ticker in stock_map.items():
             if not _keep_running:
                 break
             try:
-                self.process_script(script, force_hist_check, market_is_live)
+                self.process_stock(display_name, ticker, force_hist_check, market_is_live)
             except Exception as e:
-                # Failure Isolation: An error on one script must never crash the loop
-                logger.error(f"Fault isolation caught exception for script [{script}]: {e}", exc_info=True)
+                logger.error(f"Fault isolation caught exception for [{display_name} ({ticker})]: {e}", exc_info=True)
 
-    def process_script(self, script: str, check_history: bool, market_is_live: bool):
-        """
-        State logic and synchronization routing for an individual script.
-        Enforces: CHILD-1 (Historical Sync) > CHILD-2 (Live Update)
-        """
-        existing_ohlc = get_stock_ohlc(script)
+    def process_stock(self, display_name: str, ticker: str, check_history: bool, market_is_live: bool):
+        existing_ohlc = get_stock_ohlc(display_name)
 
-        # 1. State: NO_DATABASE (New script detected or missing database)
+        # 1. State: NO_DATABASE
         if not existing_ohlc:
-            logger.info(f"[{script}] State: NO_DATABASE. Invoking CHILD-1 (Historical Sync)...")
-            sync_historical_script(script, gap_trading_days=TARGET_OHLC_COUNT, calendar=self.calendar)
+            logger.info(f"[{display_name}] State: NO_DATABASE. Invoking CHILD-1...")
+            sync_historical_script(display_name, ticker, gap_trading_days=TARGET_OHLC_COUNT, calendar=self.calendar)
             return
 
-        # 2. Check for missing historical trading days if periodic sync check is due
+        # 2. Check for missing trading days
         sync_required = False
         gap = 0
 
         if check_history:
-            # Extract Index 0
             idx0 = None
             if isinstance(existing_ohlc, dict):
                 idx0 = existing_ohlc.get("0")
@@ -184,48 +159,40 @@ class MasterOrchestrator:
                 idx0 = existing_ohlc[0]
 
             if not idx0 or "date" not in idx0:
-                logger.warning(f"[{script}] Malformed or missing index 0. Invoking CHILD-1...")
-                sync_historical_script(script, gap_trading_days=TARGET_OHLC_COUNT, calendar=self.calendar)
+                logger.warning(f"[{display_name}] Malformed index 0. Invoking CHILD-1...")
+                sync_historical_script(display_name, ticker, gap_trading_days=TARGET_OHLC_COUNT, calendar=self.calendar)
                 return
 
             try:
                 latest_fb_date = datetime.strptime(str(idx0["date"]), "%Y-%m-%d").date()
             except ValueError:
-                logger.error(f"[{script}] Invalid date format in index 0 ('{idx0.get('date')}'). Invoking CHILD-1...")
-                sync_historical_script(script, gap_trading_days=TARGET_OHLC_COUNT, calendar=self.calendar)
+                logger.error(f"[{display_name}] Invalid date format in index 0. Invoking CHILD-1...")
+                sync_historical_script(display_name, ticker, gap_trading_days=TARGET_OHLC_COUNT, calendar=self.calendar)
                 return
 
-            # Determine Yahoo Finance's latest available trading date
-            latest_yahoo_date = get_latest_available_trading_date(script)
-
+            latest_yahoo_date = get_latest_available_trading_date(ticker)
             if latest_yahoo_date:
                 gap = self.calendar.get_trading_day_gap(latest_fb_date, latest_yahoo_date)
                 if gap > 0:
                     logger.info(
-                        f"[{script}] SYNC_REQUIRED: Firebase Date={latest_fb_date}, "
-                        f"Yahoo Date={latest_yahoo_date}, Missing Trading Days={gap}"
+                        f"[{display_name}] SYNC_REQUIRED: Firebase={latest_fb_date}, "
+                        f"Yahoo={latest_yahoo_date}, Missing={gap} trading days"
                     )
                     sync_required = True
                 else:
-                    logger.debug(f"[{script}] SYNCHRONIZED (Latest Date: {latest_fb_date})")
+                    logger.debug(f"[{display_name}] SYNCHRONIZED ({latest_fb_date})")
 
-        # 3. Priority Step: CHILD-1 takes precedence over live updating
+        # 3. CHILD-1 Priority
         if sync_required:
-            sync_historical_script(script, gap_trading_days=gap, calendar=self.calendar)
+            sync_historical_script(display_name, ticker, gap_trading_days=gap, calendar=self.calendar)
             return
 
-        # 4. Secondary Step: CHILD-2 (Only if synchronized and market is LIVE)
+        # 4. CHILD-2 Live update (only if market LIVE)
         if market_is_live:
-            update_live_script(script)
+            update_live_script(display_name, ticker)
 
 
-# =====================================================================
-# PROGRAM ENTRY POINT
-# =====================================================================
 if __name__ == "__main__":
-    # Start the HTTP server to satisfy Render's port detection
     start_render_http_server()
-
-    # Launch orchestrator
     orchestrator = MasterOrchestrator()
     orchestrator.run()
