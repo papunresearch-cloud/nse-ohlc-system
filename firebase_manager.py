@@ -118,6 +118,15 @@ def update_live_candle(display_name: str, candle: dict) -> bool:
         logger.error(f"Firebase live candle write failed for {display_name}: {e}")
         return False
 
+def clear_live_candle(display_name: str) -> bool:
+    """Sets index 0 to None/null to prevent stale quote consumption."""
+    try:
+        ref = db.reference(f"{PATH_STOCKS}/{sanitize_key(display_name)}/0")
+        ref.set(None)
+        return True
+    except Exception as e:
+        logger.error(f"[{display_name}] Failed to clear index 0: {e}")
+        return False
 
 def sanitize_key(key: str) -> str:
     """Sanitizes Firebase keys replacing invalid characters except spaces."""
