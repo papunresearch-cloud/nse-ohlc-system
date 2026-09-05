@@ -123,8 +123,7 @@ def _merge_and_sort_records(existing_records: list[dict], df: pd.DataFrame) -> l
             "open": round(float(row.get("open", 0.0)), 2),
             "high": round(float(row.get("high", 0.0)), 2),
             "low": round(float(row.get("low", 0.0)), 2),
-            "close": round(float(row.get("close", 0.0)), 2),
-            "volume": volume
+            "close": round(float(row.get("close", 0.0)), 2)
         }
 
     # Sort descending: newest completed session first
