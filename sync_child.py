@@ -96,15 +96,35 @@ def _merge_and_sort_records(existing_records: list[dict], df: pd.DataFrame) -> l
         if d:
             date_map[d] = r
 
-    for _, row in df.iterrows():
-        d_str = row["date"].strftime("%Y-%m-%d") if isinstance(row["date"], (date, datetime)) else str(row["date"])
+    # Standardize DataFrame column names to lowercase to avoid KeyErrors
+    df_clean = df.copy()
+    df_clean.columns = [str(c).lower().strip() for c in df_clean.columns]
+
+    for _, row in df_clean.iterrows():
+        # Handle date extraction safely
+        row_date = row.get("date")
+        if isinstance(row_date, (date, datetime)):
+            d_str = row_date.strftime("%Y-%m-%d")
+        else:
+            d_str = str(row_date) if row_date is not None else ""
+
+        if not d_str or d_str == "nan":
+            continue
+
+        # Extract volume safely (returns 0 if not found or NaN)
+        vol_val = row.get("volume", 0)
+        try:
+            volume = int(vol_val) if pd.notnull(vol_val) else 0
+        except (ValueError, TypeError):
+            volume = 0
+
         date_map[d_str] = {
             "date": d_str,
-            "open": round(float(row["open"]), 2),
-            "high": round(float(row["high"]), 2),
-            "low": round(float(row["low"]), 2),
-            "close": round(float(row["close"]), 2),
-            "volume": int(row["volume"]) if pd.notnull(row["volume"]) else 0
+            "open": round(float(row.get("open", 0.0)), 2),
+            "high": round(float(row.get("high", 0.0)), 2),
+            "low": round(float(row.get("low", 0.0)), 2),
+            "close": round(float(row.get("close", 0.0)), 2),
+            "volume": volume
         }
 
     # Sort descending: newest completed session first
