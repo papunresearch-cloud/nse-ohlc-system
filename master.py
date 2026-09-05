@@ -143,8 +143,6 @@ class MasterOrchestrator:
         self.last_planned_date = None
         self.is_today_trading_day = False
         self.sync_audit_reported_today = False
-        self.preopen_cleared_today = False
-        self.postclose_cleared_today = False
         
         self.last_sync_attempt_time = 0.0
         self.last_live_update_time = 0.0
@@ -239,8 +237,6 @@ class MasterOrchestrator:
         self.is_today_trading_day = self.calendar.is_trading_day(today)
         self.last_planned_date = today
         self.sync_audit_reported_today = False
-        self.preopen_cleared_today = False
-        self.postclose_cleared_today = False
         
         stock_map = get_stocklist_mapping()
         self.script_status = {
