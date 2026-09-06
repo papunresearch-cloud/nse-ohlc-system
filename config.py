@@ -67,12 +67,9 @@ COOLDOWN_ON_429_SEC = int(os.getenv("COOLDOWN_ON_429_SEC", "60"))
 # INDEXING BOUNDARIES
 # ==========================================
 HISTORICAL_START_INDEX = 1
-TARGET_OHLC_COUNT = 250      # Exactly indices 1 through 250 for history
-INTRADAY_INDEX = "0"         # Reserved strictly for live intraday market bar
-
+INTRADAY_INDEX = "0"          # Reserved strictly for live intraday market bar
 
 # ==========================================
 # SETTINGS FOR PARAMETER.PY
 # ==========================================
 PARAM_UPDATE_INTERVAL_SEC = 900  # 15 minutes
-self.last_param_calc_time = 0.0
