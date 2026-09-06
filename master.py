@@ -2,6 +2,7 @@
 MASTER ORCHESTRATOR
 - SR Flip-Flop Power Latch (Default: ON).
 - Handles 30-second pulse commands: /start, /stop, /sync.
+- Embedded HTTP Server with minimal /health, GET, and HEAD handling for cron-job.org.
 - State-driven date planning (auto-adjusts if restarted or offline at midnight).
 - Pre-market sync window (08:00–08:30 IST) with 5-minute retry intervals.
 - 08:30 IST synchronization audit log with script-by-script diagnostic reporting.
@@ -89,12 +90,24 @@ STATE_BUS = SystemStateBus()
 
 
 # =====================================================================
-# HTTP PULSE RECEIVER & HEALTH SERVER
+# HTTP PULSE RECEIVER & HEALTH SERVER (CRON-JOB COMPATIBLE)
 # =====================================================================
 class PulseCommandServer(BaseHTTPRequestHandler):
+    def do_HEAD(self):
+        """Satisfies HEAD requests with 0 body bytes to pass keep-alive checks."""
+        self.send_response(200)
+        self.send_header("Content-type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
     def do_GET(self):
+        """Handles incoming pulse commands and keep-alive health pings."""
         path = self.path.lower().strip()
-        if path in ("/start", "/api/start"):
+        
+        # Dedicated keep-alive route for cron-job.org
+        if path in ("/health", "/ping"):
+            self._send_resp(200, "OK")
+        elif path in ("/start", "/api/start"):
             STATE_BUS.trigger_pulse("START")
             self._send_resp(200, "START latched ON.\n")
         elif path in ("/stop", "/api/stop"):
@@ -105,16 +118,18 @@ class PulseCommandServer(BaseHTTPRequestHandler):
             self._send_resp(200, "MANUAL SYNC triggered.\n")
         else:
             state_str = "ON" if STATE_BUS.is_power_on() else "OFF"
-            self._send_resp(200, f"NSE OHLC Service Running. Flip-Flop State: {state_str}\n")
+            self._send_resp(200, f"State: {state_str}\n")
 
     def _send_resp(self, code: int, message: str):
+        payload = message.encode("utf-8")
         self.send_response(code)
         self.send_header("Content-type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(payload)))
         self.end_headers()
-        self.wfile.write(message.encode("utf-8"))
+        self.wfile.write(payload)
 
     def log_message(self, format, *args):
-        return  # Suppress HTTP access logging in standard out
+        return  # Suppress HTTP access logging in stdout
 
 
 def start_http_listener():
@@ -157,7 +172,7 @@ class MasterOrchestrator:
 
         self.last_sync_attempt_time = 0.0
         self.last_live_update_time = 0.0
-        self.last_param_calc_time = 0.0  # Initialized here
+        self.last_param_calc_time = 0.0
 
         # Per-script dictionary holding independent operational state
         self.script_status = {}
