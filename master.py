@@ -30,6 +30,8 @@ from config import (
     HEARTBEAT_TICK_SEC,
     TARGET_OHLC_COUNT,
     HISTORICAL_START_INDEX,
+    PARAM_UPDATE_INTERVAL_SEC,
+    self.last_param_calc_time,
     logger
 )
 from firebase_manager import init_firebase, get_stocklist_mapping, get_stock_ohlc, clear_live_candle
@@ -37,6 +39,7 @@ from market_calendar import MarketCalendar
 from sync_child import sync_historical_script
 from live_child import update_live_script
 from yahoo_manager import get_latest_available_trading_date
+from parameter import update_all_parameters
 
 IST = pytz.timezone(TIMEZONE)
 _keep_running = True
@@ -143,6 +146,8 @@ class MasterOrchestrator:
         self.last_planned_date = None
         self.is_today_trading_day = False
         self.sync_audit_reported_today = False
+        self.preopen_cleared_today = False
+        self.postclose_cleared_today = False
         
         self.last_sync_attempt_time = 0.0
         self.last_live_update_time = 0.0
@@ -185,15 +190,6 @@ class MasterOrchestrator:
                     time.sleep(HEARTBEAT_TICK_SEC * 5)
                     continue
 
-                # 2. Pre-Market Index 0 Sanitation (09:00 AM IST)
-                if now_time.hour == 9 and now_time.minute >= 0 and not self.preopen_cleared_today:
-                    self.sanitize_all_indices_zero("Pre-Market (09:00 AM)")
-                    self.preopen_cleared_today = True
-
-                # 3. Post-Market Index 0 Sanitation (16:00 PM IST)
-                if now_time.hour >= 16 and not self.postclose_cleared_today:
-                    self.sanitize_all_indices_zero("Post-Market (16:00 PM)")
-                    self.postclose_cleared_today = True
 
                 # Priority 2: Pre-Market Historical Sync Window (08:00 – 08:30 IST)
                 sync_start = datetime.strptime(f"{SYNC_WINDOW_START_HOUR}:{SYNC_WINDOW_START_MIN}", "%H:%M").time()
@@ -220,6 +216,16 @@ class MasterOrchestrator:
                         self.execute_live_updates()
                         self.last_live_update_time = time.time()
 
+                    if (time.time() - self.last_live_update_time) >= LIVE_UPDATE_INTERVAL_SEC:
+                        self.execute_live_updates()
+                        self.last_live_update_time = time.time()
+
+                    if (time.time() - self.last_param_calc_time) >= PARAM_UPDATE_INTERVAL_SEC:
+                        active_synced_scripts = [name for name, meta in self.script_status.items() if meta["synced"]]
+                        if active_synced_scripts:
+                            update_all_parameters(active_synced_scripts)
+                        self.last_param_calc_time = time.time()
+                    
                 time.sleep(HEARTBEAT_TICK_SEC)
 
             except Exception as e:
@@ -237,6 +243,8 @@ class MasterOrchestrator:
         self.is_today_trading_day = self.calendar.is_trading_day(today)
         self.last_planned_date = today
         self.sync_audit_reported_today = False
+        self.preopen_cleared_today = False
+        self.postclose_cleared_today = False
         
         stock_map = get_stocklist_mapping()
         self.script_status = {

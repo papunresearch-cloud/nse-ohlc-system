@@ -70,6 +70,9 @@ HISTORICAL_START_INDEX = 1
 TARGET_OHLC_COUNT = 250      # Exactly indices 1 through 250 for history
 INTRADAY_INDEX = "0"         # Reserved strictly for live intraday market bar
 
-# Market Session Reset Times (IST)
-MARKET_PRE_OPEN_RESET_TIME = "09:00"
-MARKET_POST_CLOSE_RESET_TIME = "16:00"
+
+# ==========================================
+# SETTINGS FOR PARAMETER.PY
+# ==========================================
+PARAM_UPDATE_INTERVAL_SEC = 900  # 15 minutes
+self.last_param_calc_time = 0.0
