@@ -189,8 +189,6 @@ class MasterOrchestrator:
         threading.Thread(target=self.execute_historical_sync, kwargs={"is_manual": False}, daemon=True).start()
 
         while _keep_running:
-
-        while _keep_running:
             try:
                 # 1. Flip-Flop Power Check
                 if not STATE_BUS.is_power_on():
