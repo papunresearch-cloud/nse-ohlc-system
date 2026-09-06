@@ -184,7 +184,11 @@ class MasterOrchestrator:
 
         # Startup initialization
         self.replan_daily_routine()
-        self.execute_historical_sync(is_manual=False)
+        
+        # Run startup sync in a background daemon thread so HTTP listener remains immediately responsive
+        threading.Thread(target=self.execute_historical_sync, kwargs={"is_manual": False}, daemon=True).start()
+
+        while _keep_running:
 
         while _keep_running:
             try:
