@@ -3,13 +3,12 @@ MASTER ORCHESTRATOR
 - Priority 0: Watchlist is absolute master. Stocklist is continuously synchronized.
 - Never mutates or deletes from /watchlist or /watchlist/detailedDb.
 - Guarded OHLC protection: Stocks currently present in /watchlist are never purged.
-- Index 0 Persistence: Index 0 is NEVER deleted or cleared. It safely retains
-  the last closing price and is overwritten during live trading sessions.
 - SR Flip-Flop Power Latch (Default: ON).
 - Handles external 30-second pulse commands: /start, /stop, /sync.
 - Embedded HTTP Server with minimal /health, GET, and HEAD handling for cron-job.org.
 - State-driven date planning (auto-adjusts if restarted or offline at midnight).
 - Pre-market sync window (08:00–08:30 IST) with 5-minute retry intervals.
+- Index-0 Persistence: Index 0 is NEVER deleted or cleared; it retains its final closing value overnight.
 - Per-script live quarantine: Unsynced stocks are isolated by Child-2.
 - Parameter Engine: Computes indicators every 15 minutes during LIVE sessions.
 """
@@ -260,7 +259,7 @@ class MasterOrchestrator:
                 status, _ = self.calendar.get_market_status()
 
                 if status == "LIVE":
-                    # 5-minute live update pass (Index 0 overwrite)
+                    # 5-minute live update pass (Index 0)
                     if (time.time() - self.last_live_update_time) >= LIVE_UPDATE_INTERVAL_SEC:
                         self.execute_live_updates()
                         self.last_live_update_time = time.time()
@@ -431,7 +430,7 @@ class MasterOrchestrator:
 
 
 if __name__ == "__main__":
-    # Start HTTP port listener first so Render detects port immediately
+    # CRITICAL: Start HTTP port listener first so Render detects port immediately
     start_http_listener()
     orchestrator = MasterOrchestrator()
     orchestrator.run()
