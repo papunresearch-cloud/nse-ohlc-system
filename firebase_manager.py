@@ -4,6 +4,7 @@ FIREBASE MANAGER
 - Dynamic stock discovery from '/watchlist' and '/detailedDb' (No static stocklist node).
 - Read/write access for OHLC candle historical records under '/stocks/<Script Name>'.
 - Index 0 live scratchpad sanitization via .delete().
+- Calendar configuration handlers for market_calendar.py.
 """
 import os
 import json
@@ -27,17 +28,16 @@ def init_firebase():
         try:
             logger.info("Initializing Firebase Admin SDK connection...")
             
-            # Check if FIREBASE_CREDENTIALS is a JSON string or a file path
             cred_val = FIREBASE_CREDENTIALS
             if isinstance(cred_val, str) and cred_val.strip().startswith("{"):
-                # Render Environment: Raw JSON string
+                # Render cloud environment: raw JSON string
                 cred_dict = json.loads(cred_val)
                 cred = credentials.Certificate(cred_dict)
             elif os.path.exists(str(cred_val)):
-                # Local Development: Path to serviceAccountKey.json
+                # Local environment: file path
                 cred = credentials.Certificate(cred_val)
             elif os.path.exists("serviceAccountKey.json"):
-                # Fallback to local default file
+                # Local default fallback
                 cred = credentials.Certificate("serviceAccountKey.json")
             else:
                 raise FileNotFoundError(
@@ -61,13 +61,39 @@ def sanitize_key(key: str) -> str:
 
 
 # =====================================================================
-# 2. DYNAMIC WATCHLIST DISCOVERY (STRATEGY 3)
+# 2. CALENDAR CONFIG ACCESS (REQUIRED BY MARKET_CALENDAR.PY)
+# =====================================================================
+def get_calendar_config() -> dict:
+    """Reads the custom calendar overrides / holidays from Firebase."""
+    init_firebase()
+    try:
+        ref = db.reference("config/nse_calendar")
+        data = ref.get()
+        return data if isinstance(data, dict) else {}
+    except Exception as e:
+        logger.error(f"Error fetching calendar config: {e}")
+        return {}
+
+
+def set_calendar_config(payload: dict) -> bool:
+    """Saves or seeds custom calendar data in Firebase."""
+    init_firebase()
+    try:
+        ref = db.reference("config/nse_calendar")
+        ref.set(payload)
+        return True
+    except Exception as e:
+        logger.error(f"Error setting calendar config: {e}")
+        return False
+
+
+# =====================================================================
+# 3. DYNAMIC WATCHLIST DISCOVERY (STRATEGY 3)
 # =====================================================================
 def get_stocklist_mapping() -> dict[str, str]:
     """
     Dynamically maps active stock names to Yahoo Finance tickers directly
     from 'watchlist' and 'detailedDb' in Firebase memory.
-    Eliminates reliance on an intermediate static 'stocklist' node.
     """
     init_firebase()
     try:
@@ -93,7 +119,7 @@ def get_stocklist_mapping() -> dict[str, str]:
 
             if ticker:
                 t = str(ticker).strip()
-                if t.upper() == "^NESI":  # Automatic typo correction
+                if t.upper() == "^NESI":
                     t = "^NSEI"
                 mapping[name] = t
             else:
@@ -114,7 +140,7 @@ def get_stocklist() -> list:
 
 
 # =====================================================================
-# 3. OHLC DATA ACCESS
+# 4. OHLC DATA ACCESS
 # =====================================================================
 def get_stock_ohlc(display_name: str) -> dict:
     """Reads the complete OHLC dictionary for a stock under /stocks/<display_name>."""
