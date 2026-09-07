@@ -89,44 +89,35 @@ def _parse_firebase_historical_records(raw_data) -> list[dict]:
 
 
 def _merge_and_sort_records(existing_records: list[dict], df: pd.DataFrame) -> list[dict]:
-    """Combines existing historical rows with downloaded dataframe and deduplicates by date."""
+    """
+    Combines existing historical rows with downloaded dataframe, deduplicates by date,
+    and strips out today's ongoing session so Index 1 is always the last COMPLETED day.
+    """
     date_map = {}
     for r in existing_records:
         d = r.get("date")
         if d:
             date_map[d] = r
 
-    # Standardize DataFrame column names to lowercase to avoid KeyErrors
-    df_clean = df.copy()
-    df_clean.columns = [str(c).lower().strip() for c in df_clean.columns]
-
-    for _, row in df_clean.iterrows():
-        # Handle date extraction safely
-        row_date = row.get("date")
-        if isinstance(row_date, (date, datetime)):
-            d_str = row_date.strftime("%Y-%m-%d")
-        else:
-            d_str = str(row_date) if row_date is not None else ""
-
-        if not d_str or d_str == "nan":
-            continue
-
-        # Extract volume safely (returns 0 if not found or NaN)
-        vol_val = row.get("volume", 0)
-        try:
-            volume = int(vol_val) if pd.notnull(vol_val) else 0
-        except (ValueError, TypeError):
-            volume = 0
-
+    for _, row in df.iterrows():
+        d_str = row["date"].strftime("%Y-%m-%d") if isinstance(row["date"], (date, datetime)) else str(row["date"])
         date_map[d_str] = {
             "date": d_str,
-            "open": round(float(row.get("open", 0.0)), 2),
-            "high": round(float(row.get("high", 0.0)), 2),
-            "low": round(float(row.get("low", 0.0)), 2),
-            "close": round(float(row.get("close", 0.0)), 2)
+            "open": round(float(row["open"]), 2),
+            "high": round(float(row["high"]), 2),
+            "low": round(float(row["low"]), 2),
+            "close": round(float(row["close"]), 2),
+            "volume": int(row["volume"]) if pd.notnull(row["volume"]) else 0
         }
 
-    # Sort descending: newest completed session first
+    # -------------------------------------------------------------------------
+    # CRITICAL: Exclude today's ongoing session from historical series (1-250)
+    # -------------------------------------------------------------------------
+    today_ist = datetime.now(IST).strftime("%Y-%m-%d")
+    if today_ist in date_map:
+        del date_map[today_ist]
+
+    # Sort descending: newest completed session (e.g. Friday) will be first
     sorted_dates = sorted(date_map.keys(), reverse=True)
     return [date_map[d] for d in sorted_dates]
 

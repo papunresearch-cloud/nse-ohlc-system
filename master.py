@@ -3,12 +3,13 @@ MASTER ORCHESTRATOR
 - Priority 0: Watchlist is absolute master. Stocklist is continuously synchronized.
 - Never mutates or deletes from /watchlist or /watchlist/detailedDb.
 - Guarded OHLC protection: Stocks currently present in /watchlist are never purged.
+- Index 0 Persistence: Index 0 is NEVER deleted or cleared. It safely retains
+  the last closing price and is overwritten during live trading sessions.
 - SR Flip-Flop Power Latch (Default: ON).
 - Handles external 30-second pulse commands: /start, /stop, /sync.
 - Embedded HTTP Server with minimal /health, GET, and HEAD handling for cron-job.org.
 - State-driven date planning (auto-adjusts if restarted or offline at midnight).
 - Pre-market sync window (08:00–08:30 IST) with 5-minute retry intervals.
-- Index 0 live sanitization at 09:00 IST and 16:00 IST.
 - Per-script live quarantine: Unsynced stocks are isolated by Child-2.
 - Parameter Engine: Computes indicators every 15 minutes during LIVE sessions.
 """
@@ -45,8 +46,7 @@ from firebase_admin import db
 from firebase_manager import (
     init_firebase,
     reconcile_stocklist_with_watchlist,
-    get_stock_ohlc,
-    clear_live_candle
+    get_stock_ohlc
 )
 from market_calendar import MarketCalendar
 from sync_child import sync_historical_script
@@ -169,8 +169,6 @@ class MasterOrchestrator:
         self.last_planned_date = None
         self.is_today_trading_day = False
         self.sync_audit_reported_today = False
-        self.preopen_cleared_today = False
-        self.postclose_cleared_today = False
 
         self.last_sync_attempt_time = 0.0
         self.last_live_update_time = 0.0
@@ -241,16 +239,6 @@ class MasterOrchestrator:
                     time.sleep(HEARTBEAT_TICK_SEC * 5)
                     continue
 
-                # Pre-Market Index 0 Sanitation (09:00 AM IST)
-                if now_time.hour == 9 and now_time.minute >= 0 and not self.preopen_cleared_today:
-                    self.sanitize_all_indices_zero("Pre-Market (09:00 AM)")
-                    self.preopen_cleared_today = True
-
-                # Post-Market Index 0 Sanitation (16:00 PM IST)
-                if now_time.hour >= 16 and not self.postclose_cleared_today:
-                    self.sanitize_all_indices_zero("Post-Market (16:00 PM)")
-                    self.postclose_cleared_today = True
-
                 # Priority 3: Pre-Market Historical Sync Window (08:00 – 08:30 IST)
                 sync_start = datetime.strptime(f"{SYNC_WINDOW_START_HOUR}:{SYNC_WINDOW_START_MIN}", "%H:%M").time()
                 sync_cutoff = datetime.strptime(f"{SYNC_WINDOW_DEADLINE_HOUR}:{SYNC_WINDOW_DEADLINE_MIN}", "%H:%M").time()
@@ -272,7 +260,7 @@ class MasterOrchestrator:
                 status, _ = self.calendar.get_market_status()
 
                 if status == "LIVE":
-                    # 5-minute live update pass (Index 0)
+                    # 5-minute live update pass (Index 0 overwrite)
                     if (time.time() - self.last_live_update_time) >= LIVE_UPDATE_INTERVAL_SEC:
                         self.execute_live_updates()
                         self.last_live_update_time = time.time()
@@ -418,11 +406,6 @@ class MasterOrchestrator:
             except Exception as e:
                 logger.error(f"[{name}] Live update failed: {e}", exc_info=True)
 
-    def sanitize_all_indices_zero(self, label: str):
-        logger.info(f"[MAINTENANCE] Clearing Index 0 for all stocks ({label})...")
-        for name in self.script_status.keys():
-            clear_live_candle(name)
-
     def log_detailed_sync_audit(self):
         synced = [k for k, v in self.script_status.items() if v["synced"]]
         unsynced = [k for k, v in self.script_status.items() if not v["synced"]]
@@ -448,7 +431,7 @@ class MasterOrchestrator:
 
 
 if __name__ == "__main__":
-    # CRITICAL: Start HTTP port listener first so Render detects port immediately
+    # Start HTTP port listener first so Render detects port immediately
     start_http_listener()
     orchestrator = MasterOrchestrator()
     orchestrator.run()
