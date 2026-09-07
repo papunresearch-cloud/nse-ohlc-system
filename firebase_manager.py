@@ -90,7 +90,7 @@ def get_master_watchlist_mapping() -> dict[str, str]:
     """
     STRICT READ-ONLY: Reads from /watchlist and /watchlist/detailedDb (or /detailedDb).
     Builds the definitive source-of-truth mapping: { Stock Name: Yahoo Ticker }.
-    NEVER writes or mutates the watchlist nodes.
+    Handles character substitutions (. to _) and falls back to CODE/NSE + .NS.
     """
     init_firebase()
     try:
@@ -105,7 +105,6 @@ def get_master_watchlist_mapping() -> dict[str, str]:
         elif isinstance(watchlist_root, list):
             raw_names = watchlist_root
 
-        # Fallback to root detailedDb if not nested
         if not detailed_db:
             detailed_db = db.reference("detailedDb").get() or {}
 
@@ -119,24 +118,33 @@ def get_master_watchlist_mapping() -> dict[str, str]:
             logger.warning("[MASTER-WATCHLIST] Active watchlist array is empty in Firebase.")
             return {}
 
-        # 2. Pull TICKER for each active stock
+        # 2. Pull TICKER for each active stock with key normalization & CODE fallback
         master_mapping = {}
         for name in active_names:
-            stock_info = detailed_db.get(name) or {}
+            # Try exact name first, then name with '.' replaced by '_'
+            sanitized_name = name.replace(".", "_")
+            stock_info = detailed_db.get(name) or detailed_db.get(sanitized_name) or {}
+
             ticker = stock_info.get("TICKER") or stock_info.get("ticker") or stock_info.get("Ticker")
+            
+            # Fallback to CODE or NSE if TICKER key is missing
+            if not ticker:
+                code_val = stock_info.get("CODE") or stock_info.get("NSE") or stock_info.get("code") or stock_info.get("nse")
+                if code_val:
+                    ticker = f"{str(code_val).strip()}.NS"
+
             if ticker:
                 t = str(ticker).strip()
                 if t.upper() == "^NESI":
                     t = "^NSEI"
                 master_mapping[name] = t
             else:
-                logger.warning(f"[MASTER-WATCHLIST] Stock '{name}' has no TICKER in detailedDb.")
+                logger.warning(f"[MASTER-WATCHLIST] Stock '{name}' has no TICKER or CODE in detailedDb.")
 
         return master_mapping
     except Exception as e:
         logger.error(f"[MASTER-WATCHLIST] Failed to read master watchlist: {e}", exc_info=True)
         return {}
-
 
 def get_current_stocklist() -> dict[str, str]:
     """Reads current node at /stocklist."""
