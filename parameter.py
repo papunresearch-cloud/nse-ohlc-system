@@ -4,13 +4,17 @@ Calculates technical indicators and performance metrics for active scripts.
 - Source data: Reads OHLC historical series from Firebase `/stocks/<script>`
 - Lookups: Reads 1yr and 3yr values directly from `/watchlist/detailedDb/<script>`
 - Output: Writes sanitized calculations to Firebase `/param/<script>`
-- Formatting: Handles zero-division and missing data safely with "N/A"
+- Stamping: Stores both date and time (IST) separately for each script
 """
 
 import math
+from datetime import datetime
+import pytz
 from typing import Any, Dict, List, Optional
 from firebase_admin import db
-from config import logger
+from config import logger, TIMEZONE
+
+IST = pytz.timezone(TIMEZONE)
 
 
 def safe_round(val: Any, decimals: int = 2) -> Any:
@@ -76,14 +80,10 @@ def fetch_ordered_candles(script: str) -> List[Dict[str, Any]]:
 
 
 def calculate_rsi(closes_newest_first: List[float], period: int = 14) -> Any:
-    """
-    Calculates standard RSI using Exponential Moving Average on Close.
-    Requires chronological order (oldest to newest).
-    """
+    """Calculates standard RSI using Exponential Moving Average on Close."""
     if len(closes_newest_first) < (period + 1):
         return "N/A"
 
-    # Reverse to oldest -> newest for sequential calculation
     chronological = list(reversed(closes_newest_first))
     gains: List[float] = []
     losses: List[float] = []
@@ -113,7 +113,7 @@ def calculate_rsi(closes_newest_first: List[float], period: int = 14) -> Any:
 
 
 def calculate_sma(closes_newest_first: List[float], window: int) -> Any:
-    """Calculates Simple Moving Average over the requested window; returns 'N/A' if window is incomplete."""
+    """Calculates Simple Moving Average over the requested window."""
     if len(closes_newest_first) < window:
         return "N/A"
     sub_slice = closes_newest_first[:window]
@@ -121,7 +121,7 @@ def calculate_sma(closes_newest_first: List[float], window: int) -> Any:
 
 
 def fetch_detailed_metrics(script: str) -> Dict[str, Any]:
-    """Fetches static 1yr and 3yr metrics from /watchlist/detailedDb/<script> with case-insensitive fallback."""
+    """Fetches static 1yr and 3yr metrics from /watchlist/detailedDb/<script>."""
     ref = db.reference(f"watchlist/detailedDb/{script}")
     data = ref.get() or {}
 
@@ -160,22 +160,22 @@ def compute_script_parameters(script: str) -> Optional[Dict[str, Any]]:
         if lo is not None:
             lows.append(lo)
 
-    # 1. Moving Averages
+    # Moving Averages
     ma10 = calculate_sma(closes, 10)
     ma25 = calculate_sma(closes, 25)
     ma50 = calculate_sma(closes, 50)
     ma200 = calculate_sma(closes, 200)
 
-    # 2. RSI (14 days)
+    # RSI
     rsi = calculate_rsi(closes, 14)
 
-    # 3. 52-Week Extremes (250 sessions)
+    # 52-Week Extremes
     h_slice = highs[:250]
     l_slice = lows[:250]
     w52h = safe_round(max(h_slice), 2) if len(h_slice) >= 10 else "N/A"
     w52l = safe_round(min(l_slice), 2) if len(l_slice) >= 10 else "N/A"
 
-    # 4. Short/Medium Term Returns
+    # Periodic Returns
     c_1 = closes[1] if len(closes) > 1 else None
     c_6 = closes[6] if len(closes) > 6 else None
     c_21 = closes[21] if len(closes) > 21 else None
@@ -190,10 +190,15 @@ def compute_script_parameters(script: str) -> Optional[Dict[str, Any]]:
     ret_3mr = safe_div(c_1 - c_66, c_66) if (c_1 is not None and c_66 is not None) else "N/A"
     ret_6mr = safe_div(c_1 - c_121, c_121) if (c_1 is not None and c_121 is not None) else "N/A"
 
-    # 5. Long-term returns from /watchlist/detailedDb/<script>
     detailed_metrics = fetch_detailed_metrics(script)
 
+    # Timestamp Generation (IST)
+    now_ist = datetime.now(IST)
+    current_time_str = now_ist.strftime("%H:%M:%S")
+    current_date_str = str(c_0.get("date", now_ist.strftime("%Y-%m-%d"))) if c_0 else now_ist.strftime("%Y-%m-%d")
+
     payload = {
+        "date": current_date_str,
         "RSI": rsi,
         "10ma": ma10,
         "25ma": ma25,
@@ -209,11 +214,11 @@ def compute_script_parameters(script: str) -> Optional[Dict[str, Any]]:
         "6mr": ret_6mr,
         "1yr": detailed_metrics["1yr"],
         "3yr": detailed_metrics["3yr"],
-        "updated_at": c_0.get("date", "N/A") if c_0 else "N/A"
+        "updated_at": f"{current_date_str} {current_time_str}"
     }
 
     db.reference(f"param/{script}").set(payload)
-    logger.info(f"[{script}] Parameters saved to /param/{script}")
+    logger.info(f"[{script}] Parameters saved to /param/{script} at {current_time_str}")
     return payload
 
 
@@ -225,3 +230,13 @@ def update_all_parameters(scripts: List[str]) -> None:
             compute_script_parameters(script)
         except Exception as e:
             logger.error(f"[{script}] Failed to process parameters: {e}", exc_info=True)
+
+
+if __name__ == "__main__":
+    from firebase_manager import init_firebase, get_stocklist_mapping
+    init_firebase()
+    stock_map = get_stocklist_mapping()
+    stock_names = list(stock_map.keys())
+    print(f"Forcefully calculating parameters for {len(stock_names)} stocks...")
+    update_all_parameters(stock_names)
+    print("Parameter calculation complete.")
