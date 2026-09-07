@@ -304,7 +304,7 @@ class MasterOrchestrator:
         logger.info("Master orchestrator stopped cleanly.")
 
     def replan_daily_routine(self):
-        """Generates or updates today's plan and rebuilds script status mapping."""
+        """Generates or updates today's plan, rebuilds script status, and purges deleted stocks."""
         now_ist = datetime.now(IST)
         today = now_ist.date()
         self.calendar.refresh_calendar()
@@ -314,7 +314,18 @@ class MasterOrchestrator:
 
         stock_map = get_stocklist_mapping()
         
-        # Preserve sync states for existing stocks; register newly added ones
+        # 1. PURGE / GARBAGE COLLECTION: Delete stocks removed from watchlist
+        try:
+            stocks_node = db.reference("stocks").get() or {}
+            if isinstance(stocks_node, dict):
+                for db_script in list(stocks_node.keys()):
+                    if db_script not in stock_map:
+                        logger.warning(f"[PURGE] Script '{db_script}' deleted from watchlist. Removing from /stocks/...")
+                        db.reference(f"stocks/{db_script}").delete()
+        except Exception as e:
+            logger.error(f"[PURGE] Failed during orphaned stock cleanup: {e}")
+
+        # 2. Rebuild active in-memory dictionary
         new_status = {}
         for name, ticker in stock_map.items():
             if name in self.script_status:
@@ -330,7 +341,6 @@ class MasterOrchestrator:
         self.script_status = new_status
         status_label = "TRADING SESSION" if self.is_today_trading_day else "NON-TRADING DAY (Closed)"
         logger.info(f"[PLANNER] Day plan for {today} IST refreshed: {status_label} ({len(self.script_status)} stocks)")
-
     def execute_historical_sync(self, is_manual: bool = False):
         """Runs CHILD-1 historical sync under mutex lock to avoid duplicate workers."""
         if not self.sync_lock.acquire(blocking=False):

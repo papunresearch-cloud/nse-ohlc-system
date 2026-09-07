@@ -5,7 +5,7 @@ FIREBASE MANAGER
 - Read/write access for OHLC candle historical records under '/stocks/<Script Name>'.
 - Index 0 live scratchpad sanitization via .delete().
 - Calendar configuration handlers for market_calendar.py.
-- Export aliases for sync_child.py (write_full_ohlc / write_historical_ohlc).
+- Export aliases for sync_child.py and live_child.py.
 """
 import os
 import json
@@ -42,7 +42,7 @@ def init_firebase():
                 cred = credentials.Certificate("serviceAccountKey.json")
             else:
                 raise FileNotFoundError(
-                    f"Firebase credentials not found. Check FIREBASE_CREDENTIALS in config/env."
+                    "Firebase credentials not found. Check FIREBASE_CREDENTIALS in config/env."
                 )
 
             firebase_admin.initialize_app(cred, {
@@ -179,11 +179,11 @@ def write_full_ohlc(display_name: str, ohlc_dict: dict) -> bool:
         return False
 
 
-# Alias so both write_full_ohlc and write_historical_ohlc work everywhere
+# Alias for sync_child
 write_historical_ohlc = write_full_ohlc
 
 
-def write_live_ohlc(display_name: str, live_candle: dict) -> bool:
+def update_live_candle(display_name: str, live_candle: dict) -> bool:
     """Writes live intraday candle strictly to index 0."""
     init_firebase()
     try:
@@ -193,6 +193,10 @@ def write_live_ohlc(display_name: str, live_candle: dict) -> bool:
     except Exception as e:
         logger.error(f"Error writing live candle for {display_name}: {e}")
         return False
+
+
+# Alias for backwards compatibility
+write_live_ohlc = update_live_candle
 
 
 def clear_live_candle(display_name: str) -> bool:
