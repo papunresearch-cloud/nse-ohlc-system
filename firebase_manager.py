@@ -49,26 +49,53 @@ def init_firebase() -> None:
 
 def get_stocklist_mapping() -> dict[str, str]:
     """
-    Reads from /stocklist/ in Firebase and returns a mapping:
-    {"Reliance Industries": "RELIANCE.NS", "NIFTY50": "^NSEI", ...}
+    Dynamically maps active stock names to Yahoo Finance tickers directly
+    from 'watchlist' and 'detailedDb' in memory without relying on a static
+    'stocklist' node.
     """
     init_firebase()
-    ref = db.reference(PATH_SCRIPTS)
-    data = ref.get()
-    if not data:
-        return {}
-    
-    mapping = {}
-    if isinstance(data, dict):
-        for name, ticker in data.items():
-            if name and ticker:
-                # Sanitize ticker string and fix common typos
-                t = str(ticker).strip()
-                if t.upper() == "^NESI":  # Correct common Nifty typo automatically
-                    t = "^NSEI"
-                mapping[str(name).strip()] = t
-    return mapping
+    try:
+        # 1. Fetch watchlist node
+        watchlist_ref = db.reference("watchlist").get() or {}
 
+        # Handle flat or nested Firebase structures
+        if isinstance(watchlist_ref, dict) and "watchlist" in watchlist_ref:
+            raw_names = watchlist_ref.get("watchlist", [])
+            detailed_db = watchlist_ref.get("detailedDb", {})
+        else:
+            raw_names = watchlist_ref
+            detailed_db = db.reference("detailedDb").get() or {}
+
+        # 2. Extract active script names
+        if isinstance(raw_names, dict):
+            active_names = list(raw_names.values())
+        elif isinstance(raw_names, list):
+            active_names = raw_names
+        else:
+            active_names = []
+
+        active_names = [str(n).strip() for n in active_names if n]
+
+        # 3. Match each active script to its Yahoo Finance TICKER
+        mapping = {}
+        for name in active_names:
+            stock_info = detailed_db.get(name) or {}
+            ticker = stock_info.get("TICKER") or stock_info.get("ticker") or stock_info.get("Ticker")
+
+            if ticker:
+                t = str(ticker).strip()
+                if t.upper() == "^NESI":  # Automatic typo correction
+                    t = "^NSEI"
+                mapping[name] = t
+            else:
+                logger.warning(f"[DISCOVERY] No valid TICKER found in detailedDb for active stock: '{name}'")
+
+        logger.info(f"[DISCOVERY] Dynamically mapped {len(mapping)} active stocks from watchlist.")
+        return mapping
+
+    except Exception as e:
+        logger.error(f"[DISCOVERY] Failed to build dynamic stock mapping: {e}", exc_info=True)
+        return {}
 
 def get_stock_ohlc(display_name: str) -> dict | list | None:
     """Fetches existing OHLC node for a specific display name."""
