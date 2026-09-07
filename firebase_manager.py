@@ -3,12 +3,20 @@ FIREBASE MANAGER
 - Centralized Firebase Admin SDK connection and lifecycle management.
 - Dynamic stock discovery from '/watchlist' and '/detailedDb' (No static stocklist node).
 - Read/write access for OHLC candle historical records under '/stocks/<Script Name>'.
-- Index 0 live scratchpad sanitization.
+- Index 0 live scratchpad sanitization via .delete().
 """
 import os
+import json
 import firebase_admin
 from firebase_admin import credentials, db
-from config import logger, FIREBASE_CRED_PATH, FIREBASE_DB_URL
+from config import (
+    logger,
+    FIREBASE_CREDENTIALS,
+    FIREBASE_DATABASE_URL,
+    PATH_STOCKS,
+    PATH_SCRIPTS,
+    TARGET_OHLC_COUNT
+)
 
 # =====================================================================
 # 1. CENTRALIZED FIREBASE INITIALIZATION
@@ -18,19 +26,38 @@ def init_firebase():
     if not firebase_admin._apps:
         try:
             logger.info("Initializing Firebase Admin SDK connection...")
-            if not os.path.exists(FIREBASE_CRED_PATH):
+            
+            # Check if FIREBASE_CREDENTIALS is a JSON string or a file path
+            cred_val = FIREBASE_CREDENTIALS
+            if isinstance(cred_val, str) and cred_val.strip().startswith("{"):
+                # Render Environment: Raw JSON string
+                cred_dict = json.loads(cred_val)
+                cred = credentials.Certificate(cred_dict)
+            elif os.path.exists(str(cred_val)):
+                # Local Development: Path to serviceAccountKey.json
+                cred = credentials.Certificate(cred_val)
+            elif os.path.exists("serviceAccountKey.json"):
+                # Fallback to local default file
+                cred = credentials.Certificate("serviceAccountKey.json")
+            else:
                 raise FileNotFoundError(
-                    f"Firebase credentials file not found at: {FIREBASE_CRED_PATH}"
+                    f"Firebase credentials not found. Check FIREBASE_CREDENTIALS in config/env."
                 )
 
-            cred = credentials.Certificate(FIREBASE_CRED_PATH)
             firebase_admin.initialize_app(cred, {
-                "databaseURL": FIREBASE_DB_URL
+                "databaseURL": FIREBASE_DATABASE_URL
             })
             logger.info("Firebase Admin successfully connected.")
         except Exception as e:
             logger.critical(f"Fatal error initializing Firebase Admin: {e}", exc_info=True)
             raise e
+
+
+def sanitize_key(key: str) -> str:
+    """Sanitizes script name string for Firebase path safety."""
+    if not key:
+        return ""
+    return str(key).strip().replace(".", "_").replace("$", "_").replace("#", "_").replace("[", "_").replace("]", "_").replace("/", "_")
 
 
 # =====================================================================
@@ -44,7 +71,6 @@ def get_stocklist_mapping() -> dict[str, str]:
     """
     init_firebase()
     try:
-        # Fetch root watchlist
         watchlist_node = db.reference("watchlist").get() or {}
         detailed_db = db.reference("detailedDb").get() or {}
 
@@ -60,7 +86,6 @@ def get_stocklist_mapping() -> dict[str, str]:
 
         active_names = [str(n).strip() for n in raw_names if n]
 
-        # Match each active script to its Yahoo Finance TICKER
         mapping = {}
         for name in active_names:
             stock_info = detailed_db.get(name) or {}
@@ -82,6 +107,12 @@ def get_stocklist_mapping() -> dict[str, str]:
         return {}
 
 
+def get_stocklist() -> list:
+    """Returns active stock names list."""
+    mapping = get_stocklist_mapping()
+    return list(mapping.keys())
+
+
 # =====================================================================
 # 3. OHLC DATA ACCESS
 # =====================================================================
@@ -89,7 +120,7 @@ def get_stock_ohlc(display_name: str) -> dict:
     """Reads the complete OHLC dictionary for a stock under /stocks/<display_name>."""
     init_firebase()
     try:
-        ref = db.reference(f"stocks/{display_name}")
+        ref = db.reference(f"{PATH_STOCKS}/{display_name}")
         data = ref.get()
         return data if isinstance(data, dict) else {}
     except Exception as e:
@@ -101,7 +132,7 @@ def save_stock_ohlc(display_name: str, payload: dict) -> bool:
     """Saves historical OHLC records into /stocks/<display_name>."""
     init_firebase()
     try:
-        ref = db.reference(f"stocks/{display_name}")
+        ref = db.reference(f"{PATH_STOCKS}/{display_name}")
         ref.set(payload)
         return True
     except Exception as e:
@@ -109,11 +140,35 @@ def save_stock_ohlc(display_name: str, payload: dict) -> bool:
         return False
 
 
-def clear_live_candle(display_name: str) -> bool:
-    """Clears Index 0 for a stock to sanitize live pre/post market states."""
+def write_historical_ohlc(display_name: str, ohlc_dict: dict) -> bool:
+    """Writes historical candles (indices 1 to 250) without wiping live index 0."""
     init_firebase()
     try:
-        ref = db.reference(f"stocks/{display_name}/0")
+        ref = db.reference(f"{PATH_STOCKS}/{display_name}")
+        ref.update(ohlc_dict)
+        return True
+    except Exception as e:
+        logger.error(f"Error updating historical OHLC for {display_name}: {e}")
+        return False
+
+
+def write_live_ohlc(display_name: str, live_candle: dict) -> bool:
+    """Writes live intraday candle strictly to index 0."""
+    init_firebase()
+    try:
+        ref = db.reference(f"{PATH_STOCKS}/{display_name}/0")
+        ref.set(live_candle)
+        return True
+    except Exception as e:
+        logger.error(f"Error writing live candle for {display_name}: {e}")
+        return False
+
+
+def clear_live_candle(display_name: str) -> bool:
+    """Safely purges index 0 using .delete() instead of .set(None)."""
+    init_firebase()
+    try:
+        ref = db.reference(f"{PATH_STOCKS}/{display_name}/0")
         ref.delete()
         return True
     except Exception as e:
