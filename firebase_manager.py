@@ -5,6 +5,7 @@ FIREBASE MANAGER
 - Read/write access for OHLC candle historical records under '/stocks/<Script Name>'.
 - Index 0 live scratchpad sanitization via .delete().
 - Calendar configuration handlers for market_calendar.py.
+- Export aliases for sync_child.py (write_full_ohlc / write_historical_ohlc).
 """
 import os
 import json
@@ -64,7 +65,7 @@ def sanitize_key(key: str) -> str:
 # 2. CALENDAR CONFIG ACCESS (REQUIRED BY MARKET_CALENDAR.PY)
 # =====================================================================
 def get_calendar_config() -> dict:
-    """Reads the custom calendar overrides / holidays from Firebase."""
+    """Reads custom calendar overrides / holidays from Firebase."""
     init_firebase()
     try:
         ref = db.reference("config/nse_calendar")
@@ -140,7 +141,7 @@ def get_stocklist() -> list:
 
 
 # =====================================================================
-# 4. OHLC DATA ACCESS
+# 4. OHLC DATA ACCESS (CHILD-1 & CHILD-2 SUPPORT)
 # =====================================================================
 def get_stock_ohlc(display_name: str) -> dict:
     """Reads the complete OHLC dictionary for a stock under /stocks/<display_name>."""
@@ -166,7 +167,7 @@ def save_stock_ohlc(display_name: str, payload: dict) -> bool:
         return False
 
 
-def write_historical_ohlc(display_name: str, ohlc_dict: dict) -> bool:
+def write_full_ohlc(display_name: str, ohlc_dict: dict) -> bool:
     """Writes historical candles (indices 1 to 250) without wiping live index 0."""
     init_firebase()
     try:
@@ -174,8 +175,12 @@ def write_historical_ohlc(display_name: str, ohlc_dict: dict) -> bool:
         ref.update(ohlc_dict)
         return True
     except Exception as e:
-        logger.error(f"Error updating historical OHLC for {display_name}: {e}")
+        logger.error(f"Error updating full OHLC for {display_name}: {e}")
         return False
+
+
+# Alias so both write_full_ohlc and write_historical_ohlc work everywhere
+write_historical_ohlc = write_full_ohlc
 
 
 def write_live_ohlc(display_name: str, live_candle: dict) -> bool:
