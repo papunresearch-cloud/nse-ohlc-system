@@ -214,16 +214,6 @@ class MasterOrchestrator:
                     time.sleep(HEARTBEAT_TICK_SEC * 5)
                     continue
 
-                # 2. Pre-Market Index 0 Sanitation (09:00 AM IST)
-                if now_time.hour == 9 and now_time.minute >= 0 and not self.preopen_cleared_today:
-                    self.sanitize_all_indices_zero("Pre-Market (09:00 AM)")
-                    self.preopen_cleared_today = True
-
-                # 3. Post-Market Index 0 Sanitation (16:00 PM IST)
-                if now_time.hour >= 16 and not self.postclose_cleared_today:
-                    self.sanitize_all_indices_zero("Post-Market (16:00 PM)")
-                    self.postclose_cleared_today = True
-
                 # Priority 2: Pre-Market Historical Sync Window (08:00 – 08:30 IST)
                 sync_start = datetime.strptime(f"{SYNC_WINDOW_START_HOUR}:{SYNC_WINDOW_START_MIN}", "%H:%M").time()
                 sync_cutoff = datetime.strptime(f"{SYNC_WINDOW_DEADLINE_HOUR}:{SYNC_WINDOW_DEADLINE_MIN}", "%H:%M").time()

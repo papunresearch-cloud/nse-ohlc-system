@@ -119,10 +119,11 @@ def update_live_candle(display_name: str, candle: dict) -> bool:
         return False
 
 def clear_live_candle(display_name: str) -> bool:
-    """Sets index 0 to None/null to prevent stale quote consumption."""
+    """Safely removes index 0 from Firebase using .delete() instead of .set(None)."""
     try:
-        ref = db.reference(f"{PATH_STOCKS}/{sanitize_key(display_name)}/0")
-        ref.set(None)
+        safe_key = sanitize_key(display_name)
+        ref = db.reference(f"{PATH_STOCKS}/{safe_key}/0")
+        ref.delete()
         return True
     except Exception as e:
         logger.error(f"[{display_name}] Failed to clear index 0: {e}")
