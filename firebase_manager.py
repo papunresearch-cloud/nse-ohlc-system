@@ -89,8 +89,8 @@ def set_calendar_config(payload: dict) -> bool:
 def get_master_watchlist_mapping() -> dict[str, str]:
     """
     STRICT READ-ONLY: Reads from /watchlist and /watchlist/detailedDb (or /detailedDb).
-    Builds the definitive source-of-truth mapping: { Stock Name: Yahoo Ticker }.
-    Handles character substitutions (. to _) and falls back to CODE/NSE + .NS.
+    Builds the definitive source-of-truth mapping: { Clean Stock Name: Yahoo Ticker }.
+    Sanitizes keys to eliminate illegal Firebase characters (. $ # [ ] /).
     """
     init_firebase()
     try:
@@ -118,16 +118,22 @@ def get_master_watchlist_mapping() -> dict[str, str]:
             logger.warning("[MASTER-WATCHLIST] Active watchlist array is empty in Firebase.")
             return {}
 
-        # 2. Pull TICKER for each active stock with key normalization & CODE fallback
+        # 2. Extract tickers and sanitize dictionary keys for Firebase safety
         master_mapping = {}
         for name in active_names:
-            # Try exact name first, then name with '.' replaced by '_'
-            sanitized_name = name.replace(".", "_")
-            stock_info = detailed_db.get(name) or detailed_db.get(sanitized_name) or {}
+            sanitized_name = sanitize_key(name)
+            
+            # Match against detailedDb using original name, sanitized name, or with dots replaced
+            stock_info = (
+                detailed_db.get(name) or 
+                detailed_db.get(sanitized_name) or 
+                detailed_db.get(name.replace(".", "_")) or 
+                {}
+            )
 
             ticker = stock_info.get("TICKER") or stock_info.get("ticker") or stock_info.get("Ticker")
             
-            # Fallback to CODE or NSE if TICKER key is missing
+            # Fallback to CODE or NSE if TICKER key is omitted
             if not ticker:
                 code_val = stock_info.get("CODE") or stock_info.get("NSE") or stock_info.get("code") or stock_info.get("nse")
                 if code_val:
@@ -137,7 +143,8 @@ def get_master_watchlist_mapping() -> dict[str, str]:
                 t = str(ticker).strip()
                 if t.upper() == "^NESI":
                     t = "^NSEI"
-                master_mapping[name] = t
+                # Store under the sanitized key so Firebase accepts it without HTTP 400
+                master_mapping[sanitized_name] = t
             else:
                 logger.warning(f"[MASTER-WATCHLIST] Stock '{name}' has no TICKER or CODE in detailedDb.")
 
@@ -169,31 +176,35 @@ def reconcile_stocklist_with_watchlist() -> tuple[bool, dict[str, str]]:
     master_map = get_master_watchlist_mapping()
     current_stocklist = get_current_stocklist()
 
-    # Safety Guard: If master watchlist read fails completely, do not clear stocklist
+    # Safety Guard: Never clear stocklist if master watchlist returns empty
     if not master_map:
         logger.warning("[RECONCILE] Master watchlist returned empty. Skipping sync to prevent accidental data loss.")
         return False, current_stocklist
 
+    # Ensure all keys in master_map are safe for Firebase
+    safe_master_map = {sanitize_key(k): v for k, v in master_map.items()}
+
     # Check for discrepancies
     diff_detected = False
-    if set(master_map.keys()) != set(current_stocklist.keys()):
+    if set(safe_master_map.keys()) != set(current_stocklist.keys()):
         diff_detected = True
     else:
-        for stock, ticker in master_map.items():
+        for stock, ticker in safe_master_map.items():
             if current_stocklist.get(stock) != ticker:
                 diff_detected = True
                 break
 
     if diff_detected:
-        logger.info(f"[RECONCILE] Discrepancy detected between watchlist ({len(master_map)}) and stocklist ({len(current_stocklist)}).")
+        logger.info(f"[RECONCILE] Discrepancy detected between watchlist ({len(safe_master_map)}) and stocklist ({len(current_stocklist)}).")
         try:
-            # Overwrite /stocklist directly with master truth
-            db.reference(PATH_SCRIPTS).set(master_map)
-            logger.info(f"[RECONCILE] /stocklist successfully synchronized with {len(master_map)} stocks.")
-            return True, master_map
+            db.reference(PATH_SCRIPTS).set(safe_master_map)
+            logger.info(f"[RECONCILE] /stocklist successfully synchronized with {len(safe_master_map)} stocks.")
+            return True, safe_master_map
         except Exception as e:
             logger.error(f"[RECONCILE] Failed to write synchronized /stocklist: {e}", exc_info=True)
             return False, current_stocklist
+
+    return False, current_stocklist
 
     return False, current_stocklist
 
