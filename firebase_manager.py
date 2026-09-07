@@ -1,82 +1,66 @@
 """
-Handles all Firebase Admin SDK initialization, authentication, reads, and updates.
+FIREBASE MANAGER
+- Centralized Firebase Admin SDK connection and lifecycle management.
+- Dynamic stock discovery from '/watchlist' and '/detailedDb' (No static stocklist node).
+- Read/write access for OHLC candle historical records under '/stocks/<Script Name>'.
+- Index 0 live scratchpad sanitization.
 """
 import os
-import json
 import firebase_admin
 from firebase_admin import credentials, db
-from config import (
-    FIREBASE_DATABASE_URL,
-    FIREBASE_CREDENTIALS,
-    PATH_SCRIPTS,
-    PATH_STOCKS,
-    PATH_CALENDAR,
-    logger
-)
+from config import logger, FIREBASE_CRED_PATH, FIREBASE_DB_URL
 
-_is_initialized = False
+# =====================================================================
+# 1. CENTRALIZED FIREBASE INITIALIZATION
+# =====================================================================
+def init_firebase():
+    """Initializes Firebase Admin SDK if not already active."""
+    if not firebase_admin._apps:
+        try:
+            logger.info("Initializing Firebase Admin SDK connection...")
+            if not os.path.exists(FIREBASE_CRED_PATH):
+                raise FileNotFoundError(
+                    f"Firebase credentials file not found at: {FIREBASE_CRED_PATH}"
+                )
 
-
-def init_firebase() -> None:
-    """Idempotently initializes Firebase Admin SDK."""
-    global _is_initialized
-    if firebase_admin._apps or _is_initialized:
-        return
-
-    logger.info("Initializing Firebase Admin SDK connection...")
-    cred_env = FIREBASE_CREDENTIALS
-
-    try:
-        if cred_env.strip().startswith("{"):
-            cred_dict = json.loads(cred_env)
-            cred = credentials.Certificate(cred_dict)
-        elif os.path.exists(cred_env):
-            cred = credentials.Certificate(cred_env)
-        else:
-            raise FileNotFoundError(
-                "Firebase credentials not found via path or valid JSON string in FIREBASE_CREDENTIALS"
-            )
-
-        firebase_admin.initialize_app(cred, {
-            'databaseURL': FIREBASE_DATABASE_URL
-        })
-        _is_initialized = True
-        logger.info("Firebase Admin successfully connected.")
-    except Exception as e:
-        logger.critical(f"FATAL: Firebase initialization failed: {e}", exc_info=True)
-        raise
+            cred = credentials.Certificate(FIREBASE_CRED_PATH)
+            firebase_admin.initialize_app(cred, {
+                "databaseURL": FIREBASE_DB_URL
+            })
+            logger.info("Firebase Admin successfully connected.")
+        except Exception as e:
+            logger.critical(f"Fatal error initializing Firebase Admin: {e}", exc_info=True)
+            raise e
 
 
+# =====================================================================
+# 2. DYNAMIC WATCHLIST DISCOVERY (STRATEGY 3)
+# =====================================================================
 def get_stocklist_mapping() -> dict[str, str]:
     """
     Dynamically maps active stock names to Yahoo Finance tickers directly
-    from 'watchlist' and 'detailedDb' in memory without relying on a static
-    'stocklist' node.
+    from 'watchlist' and 'detailedDb' in Firebase memory.
+    Eliminates reliance on an intermediate static 'stocklist' node.
     """
     init_firebase()
     try:
-        # 1. Fetch watchlist node
-        watchlist_ref = db.reference("watchlist").get() or {}
+        # Fetch root watchlist
+        watchlist_node = db.reference("watchlist").get() or {}
+        detailed_db = db.reference("detailedDb").get() or {}
 
-        # Handle flat or nested Firebase structures
-        if isinstance(watchlist_ref, dict) and "watchlist" in watchlist_ref:
-            raw_names = watchlist_ref.get("watchlist", [])
-            detailed_db = watchlist_ref.get("detailedDb", {})
+        # Safely extract active script names (handles flat list or dictionary)
+        if isinstance(watchlist_node, dict) and "watchlist" in watchlist_node:
+            raw_names = watchlist_node.get("watchlist", [])
+        elif isinstance(watchlist_node, dict):
+            raw_names = list(watchlist_node.values())
+        elif isinstance(watchlist_node, list):
+            raw_names = watchlist_node
         else:
-            raw_names = watchlist_ref
-            detailed_db = db.reference("detailedDb").get() or {}
+            raw_names = []
 
-        # 2. Extract active script names
-        if isinstance(raw_names, dict):
-            active_names = list(raw_names.values())
-        elif isinstance(raw_names, list):
-            active_names = raw_names
-        else:
-            active_names = []
+        active_names = [str(n).strip() for n in raw_names if n]
 
-        active_names = [str(n).strip() for n in active_names if n]
-
-        # 3. Match each active script to its Yahoo Finance TICKER
+        # Match each active script to its Yahoo Finance TICKER
         mapping = {}
         for name in active_names:
             stock_info = detailed_db.get(name) or {}
@@ -88,7 +72,7 @@ def get_stocklist_mapping() -> dict[str, str]:
                     t = "^NSEI"
                 mapping[name] = t
             else:
-                logger.warning(f"[DISCOVERY] No valid TICKER found in detailedDb for active stock: '{name}'")
+                logger.warning(f"[DISCOVERY] No TICKER found in detailedDb for active stock: '{name}'")
 
         logger.info(f"[DISCOVERY] Dynamically mapped {len(mapping)} active stocks from watchlist.")
         return mapping
@@ -97,65 +81,41 @@ def get_stocklist_mapping() -> dict[str, str]:
         logger.error(f"[DISCOVERY] Failed to build dynamic stock mapping: {e}", exc_info=True)
         return {}
 
-def get_stock_ohlc(display_name: str) -> dict | list | None:
-    """Fetches existing OHLC node for a specific display name."""
+
+# =====================================================================
+# 3. OHLC DATA ACCESS
+# =====================================================================
+def get_stock_ohlc(display_name: str) -> dict:
+    """Reads the complete OHLC dictionary for a stock under /stocks/<display_name>."""
     init_firebase()
-    safe_key = sanitize_key(display_name)
-    ref = db.reference(f"{PATH_STOCKS}/{safe_key}")
-    return ref.get()
-
-
-def get_calendar_config() -> dict:
-    """Fetches NSE calendar rules and overrides."""
-    init_firebase()
-    ref = db.reference(PATH_CALENDAR)
-    data = ref.get()
-    return data or {}
-
-
-def set_calendar_config(payload: dict) -> None:
-    """Seeds the NSE calendar config."""
-    init_firebase()
-    ref = db.reference(PATH_CALENDAR)
-    ref.set(payload)
-
-
-def write_full_ohlc(display_name: str, records: dict[str, dict]) -> bool:
-    """Writes the complete 250 records under /stocks/<Display Name>."""
-    init_firebase()
-    safe_key = sanitize_key(display_name)
-    ref = db.reference(f"{PATH_STOCKS}/{safe_key}")
     try:
-        ref.set(records)
+        ref = db.reference(f"stocks/{display_name}")
+        data = ref.get()
+        return data if isinstance(data, dict) else {}
+    except Exception as e:
+        logger.error(f"Error fetching OHLC data for {display_name}: {e}")
+        return {}
+
+
+def save_stock_ohlc(display_name: str, payload: dict) -> bool:
+    """Saves historical OHLC records into /stocks/<display_name>."""
+    init_firebase()
+    try:
+        ref = db.reference(f"stocks/{display_name}")
+        ref.set(payload)
         return True
     except Exception as e:
-        logger.error(f"Firebase full write failed for {display_name}: {e}")
+        logger.error(f"Error saving OHLC for {display_name}: {e}")
         return False
 
-
-def update_live_candle(display_name: str, candle: dict) -> bool:
-    """Updates only node /stocks/<Display Name>/0."""
-    init_firebase()
-    safe_key = sanitize_key(display_name)
-    ref = db.reference(f"{PATH_STOCKS}/{safe_key}/0")
-    try:
-        ref.set(candle)
-        return True
-    except Exception as e:
-        logger.error(f"Firebase live candle write failed for {display_name}: {e}")
-        return False
 
 def clear_live_candle(display_name: str) -> bool:
-    """Safely removes index 0 from Firebase using .delete() instead of .set(None)."""
+    """Clears Index 0 for a stock to sanitize live pre/post market states."""
+    init_firebase()
     try:
-        safe_key = sanitize_key(display_name)
-        ref = db.reference(f"{PATH_STOCKS}/{safe_key}/0")
+        ref = db.reference(f"stocks/{display_name}/0")
         ref.delete()
         return True
     except Exception as e:
-        logger.error(f"[{display_name}] Failed to clear index 0: {e}")
+        logger.error(f"Error clearing live candle (0) for {display_name}: {e}")
         return False
-
-def sanitize_key(key: str) -> str:
-    """Sanitizes Firebase keys replacing invalid characters except spaces."""
-    return key.replace(".", "_").replace("$", "").replace("#", "").replace("[", "").replace("]", "").replace("/", "_")
