@@ -3,10 +3,11 @@ MASTER ORCHESTRATOR
 - SR Flip-Flop Power Latch (Default: ON).
 - Handles 30-second pulse commands: /start, /stop, /sync.
 - Embedded HTTP Server with minimal /health, GET, and HEAD handling for cron-job.org.
-- Real-time Firebase Watchlist Stream Listener (Strategy 1): Trips SYNC on any mutation.
+- Real-time Firebase Watchlist Stream Listener: Auto-syncs on additions/deletions.
+- Mutex-locked historical sync (prevents boot vs. pulse race conditions).
+- Delayed 08:30 audit gate (waits for initial boot sync before logging errors).
 - State-driven date planning (auto-adjusts if restarted or offline at midnight).
 - Pre-market sync window (08:00–08:30 IST) with 5-minute retry intervals.
-- 08:30 IST synchronization audit log with script-by-script diagnostic reporting.
 - Index 0 live sanitization: Clears index 0 at 09:00 IST and 16:00 IST.
 - Per-script live quarantine: Unsynced stocks are skipped by Child-2.
 - Index 1 vs Index 0 alignment: Sync reads Index 1; Live updates Index 0.
@@ -106,6 +107,7 @@ class PulseCommandServer(BaseHTTPRequestHandler):
         """Handles incoming pulse commands and keep-alive health pings."""
         path = self.path.lower().strip()
         
+        # Dedicated keep-alive route for cron-job.org
         if path in ("/health", "/ping"):
             self._send_resp(200, "OK")
         elif path in ("/start", "/api/start"):
@@ -145,7 +147,7 @@ def start_http_listener():
 
 
 # =====================================================================
-# REAL-TIME WATCHLIST STREAM LISTENER (STRATEGY 1)
+# REAL-TIME WATCHLIST STREAM LISTENER
 # =====================================================================
 class WatchlistStreamListener:
     def __init__(self, orchestrator_ref):
@@ -161,11 +163,7 @@ class WatchlistStreamListener:
             return
 
         logger.info(f"[STREAM-LISTENER] Watchlist update detected on path: {event.path}")
-        
-        # 1. Re-discover active symbols from Firebase
-        self.orchestrator.replan_daily_routine()
-
-        # 2. Trip SYNC pulse to immediately run CHILD-1
+        # Signal sync; orchestrator refreshes mapping inside execute_historical_sync
         STATE_BUS.trigger_pulse("SYNC")
 
     def start(self):
@@ -208,7 +206,9 @@ class MasterOrchestrator:
         self.last_live_update_time = 0.0
         self.last_param_calc_time = 0.0
 
-        # Per-script dictionary holding independent operational state
+        # Concurrency lock & boot flag
+        self.sync_lock = threading.Lock()
+        self.initial_boot_sync_done = False
         self.script_status = {}
 
     def run(self):
@@ -216,11 +216,15 @@ class MasterOrchestrator:
         logger.info("NSE EQUITY OHLC DATABASE MAINTENANCE ACTIVE")
         logger.info("==================================================")
 
-        # Startup initialization
+        # Initial routine plan
         self.replan_daily_routine()
-        
-        # Run startup sync in background thread so HTTP listener remains responsive
-        threading.Thread(target=self.execute_historical_sync, kwargs={"is_manual": False}, daemon=True).start()
+
+        # Run startup sync in background thread with boot completion flag
+        def boot_sync_worker():
+            self.execute_historical_sync(is_manual=False)
+            self.initial_boot_sync_done = True
+
+        threading.Thread(target=boot_sync_worker, daemon=True).start()
 
         while _keep_running:
             try:
@@ -239,7 +243,7 @@ class MasterOrchestrator:
                     self.execute_historical_sync(is_manual=True)
                     continue
 
-                # Priority 1: State-Driven Date Catch-Up
+                # Priority 1: State-Driven Date Catch-Up (midnight or late wake)
                 if self.last_planned_date != today_date:
                     self.replan_daily_routine()
 
@@ -269,8 +273,8 @@ class MasterOrchestrator:
                         self.execute_historical_sync(is_manual=False)
                         self.last_sync_attempt_time = time.time()
 
-                # Audit Report Check at or after 08:30 IST
-                if now_time >= sync_cutoff and not self.sync_audit_reported_today:
+                # Audit Report Check: Fires at/after 08:30 IST ONLY after boot sync finishes
+                if now_time >= sync_cutoff and not self.sync_audit_reported_today and self.initial_boot_sync_done:
                     self.log_detailed_sync_audit()
                     self.sync_audit_reported_today = True
 
@@ -328,45 +332,54 @@ class MasterOrchestrator:
         logger.info(f"[PLANNER] Day plan for {today} IST refreshed: {status_label} ({len(self.script_status)} stocks)")
 
     def execute_historical_sync(self, is_manual: bool = False):
-        """Runs CHILD-1 historical sync for scripts with strict fault isolation."""
-        now_str = datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S")
+        """Runs CHILD-1 historical sync under mutex lock to avoid duplicate workers."""
+        if not self.sync_lock.acquire(blocking=False):
+            logger.info("[CHILD-1] Historical sync already running in another thread. Skipping duplicate call.")
+            return
 
-        for name, meta in list(self.script_status.items()):
-            if not _keep_running:
-                break
-            if not STATE_BUS.is_power_on() and not is_manual:
-                break
+        try:
+            # Refresh mappings dynamically in case watchlist had additions/removals
+            self.replan_daily_routine()
+            now_str = datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S")
 
-            # Skip stocks already synced unless manually forced
-            if meta["synced"] and not is_manual:
-                continue
+            for name, meta in list(self.script_status.items()):
+                if not _keep_running:
+                    break
+                if not STATE_BUS.is_power_on() and not is_manual:
+                    break
 
-            meta["last_attempt_at"] = now_str
-            ticker = meta["ticker"]
-
-            try:
-                gap = self._calculate_script_gap(name, ticker)
-                if gap == 0:
-                    meta["synced"] = True
-                    meta["error"] = None
-                    logger.info(f"[{name}] Index 1 matches latest exchange session (Gap=0). Synced.")
+                # Skip stocks already synced unless manually forced
+                if meta["synced"] and not is_manual:
                     continue
 
-                success, msg = sync_historical_script(name, ticker, gap_trading_days=gap, calendar=self.calendar)
+                meta["last_attempt_at"] = now_str
+                ticker = meta["ticker"]
 
-                if success:
-                    meta["synced"] = True
-                    meta["error"] = None
-                    logger.info(f"[{name}] Sync successful: {msg}")
-                else:
+                try:
+                    gap = self._calculate_script_gap(name, ticker)
+                    if gap == 0:
+                        meta["synced"] = True
+                        meta["error"] = None
+                        logger.info(f"[{name}] Index 1 matches latest exchange session (Gap=0). Synced.")
+                        continue
+
+                    success, msg = sync_historical_script(name, ticker, gap_trading_days=gap, calendar=self.calendar)
+
+                    if success:
+                        meta["synced"] = True
+                        meta["error"] = None
+                        logger.info(f"[{name}] Sync successful: {msg}")
+                    else:
+                        meta["synced"] = False
+                        meta["error"] = msg
+                        logger.warning(f"[{name}] Sync incomplete: {msg}")
+
+                except Exception as e:
                     meta["synced"] = False
-                    meta["error"] = msg
-                    logger.warning(f"[{name}] Sync incomplete: {msg}")
-
-            except Exception as e:
-                meta["synced"] = False
-                meta["error"] = f"Exception: {str(e)}"
-                logger.error(f"Fault isolation caught exception for [{name}]: {e}", exc_info=True)
+                    meta["error"] = f"Exception: {str(e)}"
+                    logger.error(f"Fault isolation caught exception for [{name}]: {e}", exc_info=True)
+        finally:
+            self.sync_lock.release()
 
     def _calculate_script_gap(self, display_name: str, ticker: str) -> int:
         """Determines gap strictly by comparing Index 1 date vs Yahoo's latest date."""
@@ -444,7 +457,7 @@ if __name__ == "__main__":
     start_http_listener()
     orchestrator = MasterOrchestrator()
 
-    # Launch real-time Firebase watchlist stream listener (Strategy 1)
+    # Launch real-time Firebase watchlist stream listener
     watchlist_listener = WatchlistStreamListener(orchestrator)
     threading.Thread(target=watchlist_listener.start, daemon=True).start()
 
