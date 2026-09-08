@@ -3,7 +3,8 @@ CHILD-1: Historical Synchronization Engine.
 - Maintains up to 250 historical records under keys '1' through '250'.
 - Decouples historical verification from live-tracking permission.
 - Never fabricates synthetic OHLC prices.
-- Automatically handles vendor lag by preserving valid baselines and unblocking CHILD-2.
+- Handles vendor publication lag gracefully by preserving valid baselines.
+- Seeds initial bootstrap from best available data if Firebase is uninitialized.
 """
 from datetime import datetime, date
 import pandas as pd
@@ -52,11 +53,15 @@ def sync_historical_script(display_name: str, ticker: str, gap_trading_days: int
         existing_ohlc = get_stock_ohlc(display_name)
         existing_records = _parse_firebase_historical_records(existing_ohlc)
 
+        # ---------------------------------------------------------------------
         # 1. Inspect Current Firebase Baseline
+        # ---------------------------------------------------------------------
         if _audit_vendor_freshness(existing_records, expected_latest_str):
             return True, f"VERIFIED: Firebase baseline already current at {expected_latest_str}"
 
+        # ---------------------------------------------------------------------
         # 2. Determine Fetch Depth & Query Vendor
+        # ---------------------------------------------------------------------
         is_empty_bootstrap = not existing_records
         if is_empty_bootstrap:
             days_needed = TARGET_OHLC_COUNT + DEFAULT_SAFETY_MARGIN
@@ -74,7 +79,9 @@ def sync_historical_script(display_name: str, ticker: str, gap_trading_days: int
 
         sync_state = "UNKNOWN"
 
+        # ---------------------------------------------------------------------
         # 3. Check Freshness & Attempt Capped Deep-Fetch Retry (Max 30 Days)
+        # ---------------------------------------------------------------------
         if _audit_vendor_freshness(merged_records, expected_latest_str):
             sync_state = "VERIFIED"
         else:
@@ -93,7 +100,9 @@ def sync_historical_script(display_name: str, ticker: str, gap_trading_days: int
             else:
                 sync_state = "VENDOR_LAG"
 
+        # ---------------------------------------------------------------------
         # 4. Commit Fresh Records (VERIFIED / RECOVERED)
+        # ---------------------------------------------------------------------
         if sync_state in ("VERIFIED", "RECOVERED"):
             final_candles = merged_records[:TARGET_OHLC_COUNT]
             indexed_db = {str(idx + HISTORICAL_START_INDEX): c for idx, c in enumerate(final_candles)}
@@ -107,11 +116,14 @@ def sync_historical_script(display_name: str, ticker: str, gap_trading_days: int
                 return True, f"{sync_state}: {len(indexed_db)} bars committed (Index 1: {expected_latest_str})"
             return False, "Firebase write failed"
 
-        # 5. Handle VENDOR_LAG: Decouple Live Permission from Historical Lag
+        # ---------------------------------------------------------------------
+        # 5. Handle VENDOR_LAG: Decouple Live Permission & Support Initial Bootstrap
+        # ---------------------------------------------------------------------
         valid_existing, _ = validate_historical_payload(
             {str(idx + HISTORICAL_START_INDEX): c for idx, c in enumerate(existing_records)}
         ) if existing_records else (False, "No records")
 
+        # Condition A: Preserved valid baseline exists in Firebase
         if valid_existing:
             stale_date = existing_records[0].get("date")
             logger.warning(
@@ -120,8 +132,21 @@ def sync_historical_script(display_name: str, ticker: str, gap_trading_days: int
             )
             return True, f"VENDOR_LAG: Baseline preserved at {stale_date}; Live tracking allowed"
 
-        # Hard failure: vendor lagged AND no baseline exists in Firebase
-        msg = f"INITIAL_SYNC_FAILED: Yahoo missing {expected_latest_str} and no valid prior baseline exists."
+        # Condition B: Firebase node was empty; seed with available historical bars
+        if is_empty_bootstrap and merged_records:
+            final_candles = merged_records[:TARGET_OHLC_COUNT]
+            indexed_db = {str(idx + HISTORICAL_START_INDEX): c for idx, c in enumerate(final_candles)}
+            valid, err_msg = validate_historical_payload(indexed_db)
+            if valid and write_full_ohlc(display_name, indexed_db):
+                seeded_date = indexed_db[str(HISTORICAL_START_INDEX)]["date"]
+                logger.warning(
+                    f"[{display_name}] VENDOR_LAG_BOOTSTRAP: Initial baseline seeded with {len(indexed_db)} bars "
+                    f"(Latest available: {seeded_date}). CHILD-2 live tracking permitted."
+                )
+                return True, f"VENDOR_LAG: Bootstrapped at {seeded_date}; Live tracking allowed"
+
+        # Hard failure: vendor returned nothing usable and no prior baseline exists
+        msg = f"INITIAL_SYNC_FAILED: Yahoo missing {expected_latest_str} and no usable baseline could be constructed."
         logger.error(f"[{display_name}] {msg}. Firebase untouched.")
         return False, msg
 
