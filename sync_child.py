@@ -1,232 +1,180 @@
 """
-CHILD-1: Historical Synchronization & Data Validation Engine.
-- Maintains up to 250 historical records under keys '1' through '250'.
-- Enforces strict temporal freshness anchored to MarketCalendar.
-- Dynamic trading-day gap calculation; auto deep-fetch retry on stale data.
-- Strips current session only if the market is actively open.
-- Leaves index '0' untouched.
+yahoo_manager.py - Data Vendor Client & Normalizer
+Guarantees a clean DataFrame with explicit columns:
+['date', 'open', 'high', 'low', 'close', 'volume']
+Includes intraday fetching for CHILD-2 and exchange date lookups.
 """
-from datetime import datetime, date
+import time
+import math
+from datetime import datetime, timedelta, date
 import pandas as pd
+import yfinance as yf
 import pytz
 
-from config import TARGET_OHLC_COUNT, HISTORICAL_START_INDEX, DEFAULT_SAFETY_MARGIN, TIMEZONE, logger
-from firebase_manager import get_stock_ohlc, write_full_ohlc
-from yahoo_manager import download_historical_daily
-from market_calendar import MarketCalendar
+from config import (
+    TIMEZONE,
+    REQUEST_DELAY_SEC,
+    MAX_RETRIES,
+    BACKOFF_FACTOR,
+    COOLDOWN_ON_429_SEC,
+    logger
+)
 
 IST = pytz.timezone(TIMEZONE)
 
 
-def _get_expected_latest_date(calendar: MarketCalendar, now_ist: datetime) -> date:
+def download_historical_daily(ticker: str, days_needed: int) -> pd.DataFrame:
     """
-    Determines the single authority date that MUST occupy Index 1:
-    - If today is a trading day and market is LIVE/PRE_OPEN: Previous completed session.
-    - If today is a trading day and market is CLOSED (post 15:30 IST): Today's finalized session.
-    - If today is a non-trading day (weekend/holiday): Previous completed session.
+    Downloads daily historical candles from Yahoo Finance and returns a normalized
+    DataFrame where 'date' is a concrete column formatted as 'YYYY-MM-DD'.
+    
+    Returns:
+        pd.DataFrame with columns ['date', 'open', 'high', 'low', 'close', 'volume'],
+        or an empty DataFrame on failure.
     """
-    today = now_ist.date()
-    if calendar.is_trading_day(today):
-        status, _ = calendar.get_market_status(now_ist)
-        if status in ("LIVE", "PRE_OPEN"):
-            return calendar.get_previous_trading_day(today)
-        return today
-    return calendar.get_previous_trading_day(today)
+    calendar_days = math.ceil(days_needed * 1.5 + 15)
+    end_dt = datetime.now(IST)
+    start_dt = end_dt - timedelta(days=calendar_days)
+
+    start_str = start_dt.strftime("%Y-%m-%d")
+    # Buffer added to prevent exclusive end-date clipping on UTC/IST boundaries
+    end_str = (end_dt + timedelta(days=2)).strftime("%Y-%m-%d")
+
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            time.sleep(REQUEST_DELAY_SEC)
+            
+            df_raw = yf.download(
+                tickers=ticker,
+                start=start_str,
+                end=end_str,
+                interval="1d",
+                auto_adjust=False,
+                progress=False
+            )
+
+            if df_raw is not None and not df_raw.empty:
+                normalized = _normalize_df(df_raw)
+                if not normalized.empty:
+                    return normalized
+
+            logger.warning(f"[{ticker}] Attempt {attempt}: Received empty or invalid historical payload.")
+
+        except Exception as e:
+            err_str = str(e).lower()
+            if "429" in err_str or "too many requests" in err_str:
+                logger.warning(f"[{ticker}] HTTP 429 encountered. Cooling down for {COOLDOWN_ON_429_SEC}s...")
+                time.sleep(COOLDOWN_ON_429_SEC)
+            else:
+                backoff = BACKOFF_FACTOR ** attempt
+                logger.warning(f"[{ticker}] Attempt {attempt} failed: {e}. Backing off {backoff:.1f}s...")
+                time.sleep(backoff)
+
+    return pd.DataFrame()
 
 
-def sync_historical_script(display_name: str, ticker: str, gap_trading_days: int = 0, calendar: MarketCalendar = None) -> tuple[bool, str]:
+def download_intraday_today(ticker: str) -> dict:
     """
-    Coordinates historical catch-up or full baseline construction for indices 1 to 250.
-    Guarantees that Index 1 matches the latest completed market session.
+    Fetches the active live market candle for ticker (CHILD-2 / Index 0).
+    Returns dict: {'date': 'YYYY-MM-DD', 'open': float, 'high': float, 'low': float, 'close': float, 'volume': int}
+    """
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            time.sleep(REQUEST_DELAY_SEC)
+            t = yf.Ticker(ticker)
+            df = t.history(period="1d", interval="1m")
+            
+            if df is None or df.empty:
+                # Fallback to daily 1d snapshot if 1m is momentarily empty
+                df = t.history(period="1d", interval="1d")
+
+            if df is not None and not df.empty:
+                # Flatten MultiIndex if present
+                if isinstance(df.columns, pd.MultiIndex):
+                    df.columns = df.columns.get_level_values(0)
+                df.columns = [str(c).strip().lower() for c in df.columns]
+
+                now_ist = datetime.now(IST)
+                today_str = now_ist.strftime("%Y-%m-%d")
+
+                # Accumulate intraday stats
+                c_open = float(df["open"].iloc[0])
+                c_high = float(df["high"].max())
+                c_low = float(df["low"].min())
+                c_close = float(df["close"].iloc[-1])
+                c_vol = int(df["volume"].sum()) if "volume" in df.columns else 0
+
+                return {
+                    "date": today_str,
+                    "open": round(c_open, 2),
+                    "high": round(c_high, 2),
+                    "low": round(c_low, 2),
+                    "close": round(c_close, 2),
+                    "volume": c_vol
+                }
+
+        except Exception as e:
+            logger.warning(f"[{ticker}] Intraday fetch attempt {attempt} failed: {e}")
+            time.sleep(1)
+
+    return {}
+
+
+def get_latest_available_trading_date(ticker: str) -> date:
+    """
+    Interrogates Yahoo Finance to discover the latest completed daily session date.
     """
     try:
-        if calendar is None:
-            calendar = MarketCalendar()
-
-        now_ist = datetime.now(IST)
-        expected_latest_date = _get_expected_latest_date(calendar, now_ist)
-        expected_latest_str = expected_latest_date.strftime("%Y-%m-%d")
-
-        existing_ohlc = get_stock_ohlc(display_name)
-        existing_records = _parse_firebase_historical_records(existing_ohlc)
-
-        # 1. Determine Initial Fetch Depth
-        if not existing_records:
-            days_needed = TARGET_OHLC_COUNT + DEFAULT_SAFETY_MARGIN
-        else:
-            curr_latest_str = existing_records[0].get("date")
-            try:
-                curr_latest_date = datetime.strptime(curr_latest_str, "%Y-%m-%d").date()
-                actual_gap = calendar.get_trading_day_gap(curr_latest_date, expected_latest_date)
-            except (ValueError, TypeError):
-                actual_gap = TARGET_OHLC_COUNT
-
-            gap_to_use = max(gap_trading_days, actual_gap)
-            days_needed = max(gap_to_use + DEFAULT_SAFETY_MARGIN, 10)
-
-        # 2. Query Historical Daily Candles
-        df = download_historical_daily(ticker, days_needed=days_needed)
-        merged_records = _merge_and_sort_records(existing_records, df, calendar, now_ist)
-
-        # 3. Freshness Verification & Adaptive Deep-Fetch Retry
-        if merged_records:
-            actual_latest_str = merged_records[0]["date"]
-            if actual_latest_str != expected_latest_str:
-                logger.warning(
-                    f"[{display_name}] Stale data detected (Got: {actual_latest_str}, Expected: {expected_latest_str}). "
-                    f"Executing adaptive deep-fetch retry..."
-                )
-                deep_days = TARGET_OHLC_COUNT + DEFAULT_SAFETY_MARGIN
-                df_deep = download_historical_daily(ticker, days_needed=deep_days)
-                merged_records = _merge_and_sort_records(existing_records, df_deep, calendar, now_ist)
-
-        if not merged_records:
-            msg = f"Vendor returned empty data or normalization failed for {ticker}"
-            logger.warning(f"[{display_name}] {msg}")
-            return False, msg
-
-        # Final Freshness Gate
-        actual_latest_str = merged_records[0]["date"]
-        if actual_latest_str != expected_latest_str:
-            msg = f"Stale vendor data: Latest bar {actual_latest_str} != Expected {expected_latest_str}"
-            logger.error(f"[{display_name}] {msg}. Firebase left untouched.")
-            return False, msg
-
-        # 4. Slicing to Target Depth
-        final_candles = merged_records[:TARGET_OHLC_COUNT]
-
-        # 5. Build Sequential Payload (1 to N)
-        indexed_db = {}
-        for idx, candle in enumerate(final_candles):
-            indexed_db[str(idx + HISTORICAL_START_INDEX)] = candle
-
-        # 6. Structural Validation
-        valid, err_msg = validate_historical_payload(indexed_db)
-        if not valid:
-            msg = f"Sanity validation rejected: {err_msg}"
-            logger.error(f"[{display_name}] {msg}. Firebase left untouched.")
-            return False, msg
-
-        # 7. Write to Firebase
-        write_ok = write_full_ohlc(display_name, indexed_db)
-        if write_ok:
-            rec_count = len(indexed_db)
-            latest_dt = indexed_db["1"]["date"]
-            return True, f"OK ({rec_count} historical bars, Index 1: {latest_dt})"
-        else:
-            return False, "Firebase Realtime DB rejected write payload"
-
+        t = yf.Ticker(ticker)
+        df = t.history(period="5d", interval="1d")
+        if df is not None and not df.empty:
+            last_dt = df.index[-1]
+            if hasattr(last_dt, "date"):
+                return last_dt.date()
+            return datetime.strptime(str(last_dt)[:10], "%Y-%m-%d").date()
     except Exception as e:
-        logger.error(f"[{display_name}] Internal sync exception: {e}", exc_info=True)
-        return False, f"Exception: {str(e)}"
+        logger.warning(f"[{ticker}] Failed to detect latest vendor date: {e}")
+    return None
 
 
-def _parse_firebase_historical_records(raw_data) -> list[dict]:
-    """Extracts only keys '1' through '250', completely discarding '0'."""
-    if not raw_data or not isinstance(raw_data, dict):
-        return []
-    records = []
-    for i in range(HISTORICAL_START_INDEX, TARGET_OHLC_COUNT + 1):
-        k = str(i)
-        if k in raw_data and isinstance(raw_data[k], dict) and "date" in raw_data[k]:
-            records.append(raw_data[k])
-    return records
-
-
-def _merge_and_sort_records(existing_records: list[dict], df: pd.DataFrame, calendar: MarketCalendar, now_ist: datetime) -> list[dict]:
+def _normalize_df(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Combines existing historical rows with downloaded dataframe, deduplicates by date,
-    and strips out ongoing session so Index 1 is always the last COMPLETED session.
+    Flattens MultiIndex headers, moves DatetimeIndex into a concrete 'date' column,
+    converts timestamps to IST, and lowercases all column names.
+    Rejects partial frames missing essential OHLC price feeds.
     """
-    date_map = {}
-    for r in existing_records:
-        d = r.get("date")
-        if d:
-            date_map[d] = r
+    clean_df = df.copy()
 
-    if df is not None and not df.empty:
-        df_clean = df.copy()
-        if isinstance(df_clean.columns, pd.MultiIndex):
-            df_clean.columns = df_clean.columns.get_level_values(0)
-        df_clean.columns = [str(c).strip().lower() for c in df_clean.columns]
+    # 1. Flatten MultiIndex columns
+    if isinstance(clean_df.columns, pd.MultiIndex):
+        clean_df.columns = clean_df.columns.get_level_values(0)
 
-        for _, row in df_clean.iterrows():
-            row_date = row.get("date")
-            if isinstance(row_date, (date, datetime)):
-                d_str = row_date.strftime("%Y-%m-%d")
-            else:
-                d_str = str(row_date) if row_date is not None else ""
+    # 2. Extract DatetimeIndex into a dedicated 'date' column
+    if isinstance(clean_df.index, pd.DatetimeIndex):
+        dt_index = clean_df.index
+        if dt_index.tz is None:
+            dt_index = dt_index.tz_localize("UTC").tz_convert(IST)
+        else:
+            dt_index = dt_index.tz_convert(IST)
+        clean_df["date"] = dt_index.strftime("%Y-%m-%d")
+        clean_df = clean_df.reset_index(drop=True)
+    elif "Date" in clean_df.columns or "date" in clean_df.columns:
+        date_col = "Date" if "Date" in clean_df.columns else "date"
+        clean_df["date"] = pd.to_datetime(clean_df[date_col]).dt.tz_localize(None).dt.strftime("%Y-%m-%d")
+        if date_col != "date":
+            clean_df = clean_df.drop(columns=[date_col])
 
-            if not d_str or d_str.lower() == "nan":
-                continue
+    # 3. Normalize all column headers to lowercase strings
+    clean_df.columns = [str(c).strip().lower() for c in clean_df.columns]
 
-            vol_raw = row.get("volume", 0)
-            try:
-                volume_val = int(vol_raw) if pd.notnull(vol_raw) else 0
-            except (ValueError, TypeError):
-                volume_val = 0
+    # 4. Strict Column Integrity Gate (Reject missing OHLC feeds)
+    price_cols = ["open", "high", "low", "close"]
+    if not all(col in clean_df.columns for col in price_cols):
+        return pd.DataFrame()
 
-            date_map[d_str] = {
-                "date": d_str,
-                "open": round(float(row.get("open", 0.0)), 2),
-                "high": round(float(row.get("high", 0.0)), 2),
-                "low": round(float(row.get("low", 0.0)), 2),
-                "close": round(float(row.get("close", 0.0)), 2),
-                "volume": volume_val
-            }
+    # Volume defaults safely to 0 if absent
+    if "volume" not in clean_df.columns:
+        clean_df["volume"] = 0
 
-    # Remove today's candle ONLY if the session is currently active/open
-    today_date = now_ist.date()
-    if calendar.is_trading_day(today_date):
-        status, _ = calendar.get_market_status(now_ist)
-        if status in ("LIVE", "PRE_OPEN"):
-            today_str = today_date.strftime("%Y-%m-%d")
-            if today_str in date_map:
-                del date_map[today_str]
-
-    sorted_dates = sorted(date_map.keys(), reverse=True)
-    return [date_map[d] for d in sorted_dates]
-
-
-def validate_historical_payload(payload: dict[str, dict]) -> tuple[bool, str]:
-    """Validates sequential keys starting at 1, price integrity, and descending dates."""
-    count = len(payload)
-    if count == 0:
-        return False, "Historical payload is completely empty"
-    if count > TARGET_OHLC_COUNT:
-        return False, f"Payload count {count} exceeds limit {TARGET_OHLC_COUNT}"
-
-    dates_seen = []
-    for i in range(1, count + 1):
-        k = str(i)
-        if k not in payload:
-            return False, f"Missing contiguous historical sequential index '{k}'"
-
-        bar = payload[k]
-        for field in ("date", "open", "high", "low", "close"):
-            if field not in bar or bar[field] is None:
-                return False, f"Index {k} missing required field '{field}'"
-
-        try:
-            o, h, l, c = float(bar["open"]), float(bar["high"]), float(bar["low"]), float(bar["close"])
-        except (ValueError, TypeError):
-            return False, f"Index {k} contains non-numeric values"
-
-        if o <= 0 or h <= 0 or l <= 0 or c <= 0:
-            return False, f"Index {k} has non-positive price (O={o}, H={h}, L={l}, C={c})"
-
-        if (h < l) or (h < max(o, c) - 0.05) or (l > min(o, c) + 0.05):
-            return False, f"Index {k} OHLC boundary violation (O={o}, H={h}, L={l}, C={c})"
-
-        d_str = str(bar["date"])
-        try:
-            d_val = datetime.strptime(d_str, "%Y-%m-%d").date()
-        except ValueError:
-            return False, f"Index {k} has invalid date format: {d_str}"
-
-        if dates_seen and d_val >= dates_seen[-1]:
-            return False, f"Index {k} date {d_val} is not strictly older than {dates_seen[-1]}"
-
-        dates_seen.append(d_val)
-
-    return True, "Valid"
+    required_cols = ["date", "open", "high", "low", "close", "volume"]
+    return clean_df[required_cols]

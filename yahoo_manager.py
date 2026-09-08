@@ -1,14 +1,16 @@
 """
-Yahoo Finance interaction manager.
-Provides safe ticker resolution, retry with backoff, rate-limit cooldowns,
-and date/price sanitization for daily and intraday intervals.
+yahoo_manager.py - Data Vendor Client & Normalizer
+Guarantees a clean DataFrame with explicit columns:
+['date', 'open', 'high', 'low', 'close', 'volume']
+Includes intraday fetching for CHILD-2 and exchange date lookups.
 """
 import time
-from datetime import datetime, date
-import requests
-import yfinance as yf
+import math
+from datetime import datetime, timedelta, date
 import pandas as pd
+import yfinance as yf
 import pytz
+
 from config import (
     TIMEZONE,
     REQUEST_DELAY_SEC,
@@ -18,171 +20,161 @@ from config import (
     logger
 )
 
-# Shared browser-mimicking session to bypass basic cloud blocks
-_session = requests.Session()
-_session.headers.update({
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-})
-
 IST = pytz.timezone(TIMEZONE)
 
 
-def get_yahoo_ticker(script: str) -> str:
+def download_historical_daily(ticker: str, days_needed: int) -> pd.DataFrame:
     """
-    Translates script identifiers to Yahoo-compatible tickers.
-    Indexes starting with '^' are not suffixed with '.NS'.
-    """
-    cleaned = script.strip().upper()
-    if cleaned.startswith("^"):
-        return cleaned
-    # Custom mapping dictionary for special overrides
-    custom_map = {
-        "NIFTY50": "^NSEI",
-        "BANKNIFTY": "^NSEBANK",
-        "SENSEX": "^BSESN"
-    }
-    if cleaned in custom_map:
-        return custom_map[cleaned]
-    if not cleaned.endswith(".NS") and not cleaned.endswith(".BO"):
-        return f"{cleaned}.NS"
-    return cleaned
-
-
-def download_historical_daily(script: str, days_needed: int) -> pd.DataFrame:
-    """
-    Downloads daily historical OHLC with retries, exponential backoff,
-    and 429 rate-limit cooldown protection.
-    """
-    ticker_sym = get_yahoo_ticker(script)
-    # Estimate calendar days needed (~1.45 multiplier for weekends/holidays)
-    calendar_days = max(int(days_needed * 1.5) + 15, 30)
-    period_str = f"{calendar_days}d"
+    Downloads daily historical candles from Yahoo Finance and returns a normalized
+    DataFrame where 'date' is a concrete column formatted as 'YYYY-MM-DD'.
     
+    Returns:
+        pd.DataFrame with columns ['date', 'open', 'high', 'low', 'close', 'volume'],
+        or an empty DataFrame on failure.
+    """
+    calendar_days = math.ceil(days_needed * 1.5 + 15)
+    end_dt = datetime.now(IST)
+    start_dt = end_dt - timedelta(days=calendar_days)
+
+    start_str = start_dt.strftime("%Y-%m-%d")
+    # Buffer added to prevent exclusive end-date clipping on UTC/IST boundaries
+    end_str = (end_dt + timedelta(days=2)).strftime("%Y-%m-%d")
+
     for attempt in range(1, MAX_RETRIES + 1):
         try:
             time.sleep(REQUEST_DELAY_SEC)
-            ticker = yf.Ticker(ticker_sym, session=_session)
-            hist = ticker.history(period=period_str, interval="1d", auto_adjust=False)
             
-            if hist.empty:
-                logger.warning(f"Empty historical dataframe returned for {script} (Attempt {attempt}/{MAX_RETRIES})")
-                time.sleep(BACKOFF_FACTOR ** attempt)
-                continue
-            
-            return _normalize_df(hist)
+            df_raw = yf.download(
+                tickers=ticker,
+                start=start_str,
+                end=end_str,
+                interval="1d",
+                auto_adjust=False,
+                progress=False
+            )
 
-        except requests.exceptions.HTTPError as he:
-            if hasattr(he.response, 'status_code') and he.response.status_code == 429:
-                logger.error(f"HTTP 429 Rate Limit encountered on {script}. Entering cooldown {COOLDOWN_ON_429_SEC}s...")
-                time.sleep(COOLDOWN_ON_429_SEC)
-            else:
-                logger.warning(f"HTTP error on {script}: {he}. Retrying...")
-                time.sleep(BACKOFF_FACTOR ** attempt)
+            if df_raw is not None and not df_raw.empty:
+                normalized = _normalize_df(df_raw)
+                if not normalized.empty:
+                    return normalized
+
+            logger.warning(f"[{ticker}] Attempt {attempt}: Received empty or invalid historical payload.")
+
         except Exception as e:
-            if "429" in str(e):
-                logger.error(f"Rate limit detected for {script}. Cooling down...")
+            err_str = str(e).lower()
+            if "429" in err_str or "too many requests" in err_str:
+                logger.warning(f"[{ticker}] HTTP 429 encountered. Cooling down for {COOLDOWN_ON_429_SEC}s...")
                 time.sleep(COOLDOWN_ON_429_SEC)
             else:
-                logger.warning(f"Fetch failed for {script} ({e}). Attempt {attempt}/{MAX_RETRIES}")
-            time.sleep(BACKOFF_FACTOR ** attempt)
+                backoff = BACKOFF_FACTOR ** attempt
+                logger.warning(f"[{ticker}] Attempt {attempt} failed: {e}. Backing off {backoff:.1f}s...")
+                time.sleep(backoff)
 
-    logger.error(f"Exhausted all {MAX_RETRIES} attempts fetching historical data for {script}")
     return pd.DataFrame()
 
 
-def download_intraday_today(script: str) -> dict | None:
+def download_intraday_today(ticker: str) -> dict:
     """
-    Retrieves current active candle for index 0 during LIVE market hours.
-    Extracts open, high, low, and current price (as close).
+    Fetches the active live market candle for ticker (CHILD-2 / Index 0).
+    Returns dict: {'date': 'YYYY-MM-DD', 'open': float, 'high': float, 'low': float, 'close': float, 'volume': int}
     """
-    ticker_sym = get_yahoo_ticker(script)
     for attempt in range(1, MAX_RETRIES + 1):
         try:
             time.sleep(REQUEST_DELAY_SEC)
-            ticker = yf.Ticker(ticker_sym, session=_session)
+            t = yf.Ticker(ticker)
+            df = t.history(period="1d", interval="1m")
             
-            # Fast info retrieval preferred
-            fast = getattr(ticker, "fast_info", None)
-            if fast:
-                try:
-                    last_price = float(fast.last_price)
-                    day_open = float(fast.open)
-                    day_high = float(fast.day_high)
-                    day_low = float(fast.day_low)
-                    
-                    if day_open > 0 and last_price > 0:
-                        today_str = datetime.now(IST).strftime("%Y-%m-%d")
-                        return {
-                            "date": today_str,
-                            "open": round(day_open, 2),
-                            "high": round(max(day_high, last_price, day_open), 2),
-                            "low": round(min(day_low, last_price, day_open), 2),
-                            "close": round(last_price, 2)
-                        }
-                except Exception:
-                    pass  # Fall back to 1d history
-            
-            hist = ticker.history(period="1d", interval="5m", auto_adjust=False)
-            if not hist.empty:
-                hist = _normalize_df(hist)
-                day_open = float(hist['open'].iloc[0])
-                day_high = float(hist['high'].max())
-                day_low = float(hist['low'].min())
-                last_price = float(hist['close'].iloc[-1])
-                today_str = datetime.now(IST).strftime("%Y-%m-%d")
-                
+            if df is None or df.empty:
+                # Fallback to daily 1d snapshot if 1m is momentarily empty
+                df = t.history(period="1d", interval="1d")
+
+            if df is not None and not df.empty:
+                # Flatten MultiIndex if present
+                if isinstance(df.columns, pd.MultiIndex):
+                    df.columns = df.columns.get_level_values(0)
+                df.columns = [str(c).strip().lower() for c in df.columns]
+
+                now_ist = datetime.now(IST)
+                today_str = now_ist.strftime("%Y-%m-%d")
+
+                # Accumulate intraday stats
+                c_open = float(df["open"].iloc[0])
+                c_high = float(df["high"].max())
+                c_low = float(df["low"].min())
+                c_close = float(df["close"].iloc[-1])
+                c_vol = int(df["volume"].sum()) if "volume" in df.columns else 0
+
                 return {
                     "date": today_str,
-                    "open": round(day_open, 2),
-                    "high": round(max(day_high, last_price), 2),
-                    "low": round(min(day_low, last_price), 2),
-                    "close": round(last_price, 2)
+                    "open": round(c_open, 2),
+                    "high": round(c_high, 2),
+                    "low": round(c_low, 2),
+                    "close": round(c_close, 2),
+                    "volume": c_vol
                 }
 
         except Exception as e:
-            if "429" in str(e):
-                logger.error(f"429 rate limit during live fetch on {script}. Sleeping {COOLDOWN_ON_429_SEC}s")
-                time.sleep(COOLDOWN_ON_429_SEC)
-            else:
-                logger.warning(f"Live fetch failed for {script}: {e}. Attempt {attempt}/{MAX_RETRIES}")
-            time.sleep(BACKOFF_FACTOR)
+            logger.warning(f"[{ticker}] Intraday fetch attempt {attempt} failed: {e}")
+            time.sleep(1)
 
+    return {}
+
+
+def get_latest_available_trading_date(ticker: str) -> date:
+    """
+    Interrogates Yahoo Finance to discover the latest completed daily session date.
+    """
+    try:
+        t = yf.Ticker(ticker)
+        df = t.history(period="5d", interval="1d")
+        if df is not None and not df.empty:
+            last_dt = df.index[-1]
+            if hasattr(last_dt, "date"):
+                return last_dt.date()
+            return datetime.strptime(str(last_dt)[:10], "%Y-%m-%d").date()
+    except Exception as e:
+        logger.warning(f"[{ticker}] Failed to detect latest vendor date: {e}")
     return None
 
 
-def get_latest_available_trading_date(script: str) -> date | None:
-    """Queries small 5-day window to ascertain latest valid date finalized by Yahoo."""
-    ticker_sym = get_yahoo_ticker(script)
-    try:
-        time.sleep(REQUEST_DELAY_SEC)
-        ticker = yf.Ticker(ticker_sym, session=_session)
-        hist = ticker.history(period="5d", interval="1d", auto_adjust=False)
-        if hist.empty:
-            return None
-        hist = _normalize_df(hist)
-        latest_str = hist['date'].iloc[-1]
-        return datetime.strptime(latest_str, "%Y-%m-%d").date()
-    except Exception as e:
-        logger.warning(f"Unable to query latest Yahoo date for {script}: {e}")
-        return None
-
-
 def _normalize_df(df: pd.DataFrame) -> pd.DataFrame:
-    """Normalizes DataFrame timestamps to YYYY-MM-DD strings in Asia/Kolkata."""
-    df = df.copy()
-    if df.empty:
-        return df
+    """
+    Flattens MultiIndex headers, moves DatetimeIndex into a concrete 'date' column,
+    converts timestamps to IST, and lowercases all column names.
+    Rejects partial frames missing essential OHLC price feeds.
+    """
+    clean_df = df.copy()
 
-    # Normalize Index to Datetime in IST
-    if isinstance(df.index, pd.DatetimeIndex):
-        if df.index.tz is None:
-            df.index = df.index.tz_localize(pytz.UTC).tz_convert(IST)
+    # 1. Flatten MultiIndex columns
+    if isinstance(clean_df.columns, pd.MultiIndex):
+        clean_df.columns = clean_df.columns.get_level_values(0)
+
+    # 2. Extract DatetimeIndex into a dedicated 'date' column
+    if isinstance(clean_df.index, pd.DatetimeIndex):
+        dt_index = clean_df.index
+        if dt_index.tz is None:
+            dt_index = dt_index.tz_localize("UTC").tz_convert(IST)
         else:
-            df.index = df.index.tz_convert(IST)
-        df['date'] = df.index.strftime("%Y-%m-%d")
-    else:
-        df['date'] = pd.to_datetime(df['date']).dt.strftime("%Y-%m-%d")
+            dt_index = dt_index.tz_convert(IST)
+        clean_df["date"] = dt_index.strftime("%Y-%m-%d")
+        clean_df = clean_df.reset_index(drop=True)
+    elif "Date" in clean_df.columns or "date" in clean_df.columns:
+        date_col = "Date" if "Date" in clean_df.columns else "date"
+        clean_df["date"] = pd.to_datetime(clean_df[date_col]).dt.tz_localize(None).dt.strftime("%Y-%m-%d")
+        if date_col != "date":
+            clean_df = clean_df.drop(columns=[date_col])
 
-    df.columns = [str(col).lower() for col in df.columns]
-    req_cols = ['date', 'open', 'high', 'low', 'close']
-    return df[req_cols].dropna()
+    # 3. Normalize all column headers to lowercase strings
+    clean_df.columns = [str(c).strip().lower() for c in clean_df.columns]
+
+    # 4. Strict Column Integrity Gate (Reject missing OHLC feeds)
+    price_cols = ["open", "high", "low", "close"]
+    if not all(col in clean_df.columns for col in price_cols):
+        return pd.DataFrame()
+
+    # Volume defaults safely to 0 if absent
+    if "volume" not in clean_df.columns:
+        clean_df["volume"] = 0
+
+    required_cols = ["date", "open", "high", "low", "close", "volume"]
+    return clean_df[required_cols]
