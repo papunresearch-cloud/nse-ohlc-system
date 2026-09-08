@@ -99,15 +99,37 @@ def _merge_and_sort_records(existing_records: list[dict], df: pd.DataFrame) -> l
         if d:
             date_map[d] = r
 
-    for _, row in df.iterrows():
-        d_str = row["date"].strftime("%Y-%m-%d") if isinstance(row["date"], (date, datetime)) else str(row["date"])
+    # Flatten MultiIndex if batch-fetched and convert column headers to lowercase
+    df_clean = df.copy()
+    if isinstance(df_clean.columns, pd.MultiIndex):
+        df_clean.columns = df_clean.columns.get_level_values(0)
+    df_clean.columns = [str(c).strip().lower() for c in df_clean.columns]
+
+    for _, row in df_clean.iterrows():
+        # Handle date extraction safely across types
+        row_date = row.get("date")
+        if isinstance(row_date, (date, datetime)):
+            d_str = row_date.strftime("%Y-%m-%d")
+        else:
+            d_str = str(row_date) if row_date is not None else ""
+
+        if not d_str or d_str.lower() == "nan":
+            continue
+
+        # Safely extract volume without throwing KeyError
+        vol_raw = row.get("volume", 0)
+        try:
+            volume_val = int(vol_raw) if pd.notnull(vol_raw) else 0
+        except (ValueError, TypeError):
+            volume_val = 0
+
         date_map[d_str] = {
             "date": d_str,
-            "open": round(float(row["open"]), 2),
-            "high": round(float(row["high"]), 2),
-            "low": round(float(row["low"]), 2),
-            "close": round(float(row["close"]), 2),
-            "volume": int(row["volume"]) if pd.notnull(row["volume"]) else 0
+            "open": round(float(row.get("open", 0.0)), 2),
+            "high": round(float(row.get("high", 0.0)), 2),
+            "low": round(float(row.get("low", 0.0)), 2),
+            "close": round(float(row.get("close", 0.0)), 2),
+            "volume": volume_val
         }
 
     # -------------------------------------------------------------------------
@@ -117,7 +139,7 @@ def _merge_and_sort_records(existing_records: list[dict], df: pd.DataFrame) -> l
     if today_ist in date_map:
         del date_map[today_ist]
 
-    # Sort descending: newest completed session (e.g. Friday) will be first
+    # Sort descending: newest completed session will be first
     sorted_dates = sorted(date_map.keys(), reverse=True)
     return [date_map[d] for d in sorted_dates]
 
