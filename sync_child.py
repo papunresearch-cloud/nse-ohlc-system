@@ -1,9 +1,10 @@
 """
 CHILD-1: Historical Synchronization & Data Validation Engine.
 - Maintains up to 250 historical records under keys '1' through '250'.
-- Completely excludes and leaves index '0' untouched.
-- Slices excess rows to enforce the 250-bar capacity.
-- Supports recent listings/IPOs gracefully.
+- Enforces strict temporal freshness anchored to MarketCalendar.
+- Dynamic trading-day gap calculation; auto deep-fetch retry on stale data.
+- Strips current session only if the market is actively open.
+- Leaves index '0' untouched.
 """
 from datetime import datetime, date
 import pandas as pd
@@ -12,57 +13,101 @@ import pytz
 from config import TARGET_OHLC_COUNT, HISTORICAL_START_INDEX, DEFAULT_SAFETY_MARGIN, TIMEZONE, logger
 from firebase_manager import get_stock_ohlc, write_full_ohlc
 from yahoo_manager import download_historical_daily
+from market_calendar import MarketCalendar
 
 IST = pytz.timezone(TIMEZONE)
 
 
-def sync_historical_script(display_name: str, ticker: str, gap_trading_days: int = 0, calendar=None) -> tuple[bool, str]:
+def _get_expected_latest_date(calendar: MarketCalendar, now_ist: datetime) -> date:
+    """
+    Determines the single authority date that MUST occupy Index 1:
+    - If today is a trading day and market is LIVE/PRE_OPEN: Previous completed session.
+    - If today is a trading day and market is CLOSED (post 15:30 IST): Today's finalized session.
+    - If today is a non-trading day (weekend/holiday): Previous completed session.
+    """
+    today = now_ist.date()
+    if calendar.is_trading_day(today):
+        status, _ = calendar.get_market_status(now_ist)
+        if status in ("LIVE", "PRE_OPEN"):
+            return calendar.get_previous_trading_day(today)
+        return today
+    return calendar.get_previous_trading_day(today)
+
+
+def sync_historical_script(display_name: str, ticker: str, gap_trading_days: int = 0, calendar: MarketCalendar = None) -> tuple[bool, str]:
     """
     Coordinates historical catch-up or full baseline construction for indices 1 to 250.
-    Returns:
-        (True, "Success summary") or (False, "Exact rejection reason")
+    Guarantees that Index 1 matches the latest completed market session.
     """
     try:
+        if calendar is None:
+            calendar = MarketCalendar()
+
+        now_ist = datetime.now(IST)
+        expected_latest_date = _get_expected_latest_date(calendar, now_ist)
+        expected_latest_str = expected_latest_date.strftime("%Y-%m-%d")
+
         existing_ohlc = get_stock_ohlc(display_name)
-        # Parse ONLY historical keys ('1' to '250'); index '0' is completely ignored
         existing_records = _parse_firebase_historical_records(existing_ohlc)
 
-        # Determine fetch depth
+        # 1. Determine Initial Fetch Depth
         if not existing_records:
             days_needed = TARGET_OHLC_COUNT + DEFAULT_SAFETY_MARGIN
         else:
-            days_needed = max(gap_trading_days + DEFAULT_SAFETY_MARGIN, 10)
+            curr_latest_str = existing_records[0].get("date")
+            try:
+                curr_latest_date = datetime.strptime(curr_latest_str, "%Y-%m-%d").date()
+                actual_gap = calendar.get_trading_day_gap(curr_latest_date, expected_latest_date)
+            except (ValueError, TypeError):
+                actual_gap = TARGET_OHLC_COUNT
 
-        # Query historical daily candles from Yahoo Finance
+            gap_to_use = max(gap_trading_days, actual_gap)
+            days_needed = max(gap_to_use + DEFAULT_SAFETY_MARGIN, 10)
+
+        # 2. Query Historical Daily Candles
         df = download_historical_daily(ticker, days_needed=days_needed)
-        if df is None or df.empty:
-            msg = f"Vendor returned empty data or HTTP error for {ticker}"
-            logger.warning(f"[{display_name}] {msg}")
-            return False, msg
+        merged_records = _merge_and_sort_records(existing_records, df, calendar, now_ist)
 
-        # Merge, deduplicate, and sort newest to oldest
-        merged_records = _merge_and_sort_records(existing_records, df)
+        # 3. Freshness Verification & Adaptive Deep-Fetch Retry
+        if merged_records:
+            actual_latest_str = merged_records[0]["date"]
+            if actual_latest_str != expected_latest_str:
+                logger.warning(
+                    f"[{display_name}] Stale data detected (Got: {actual_latest_str}, Expected: {expected_latest_str}). "
+                    f"Executing adaptive deep-fetch retry..."
+                )
+                deep_days = TARGET_OHLC_COUNT + DEFAULT_SAFETY_MARGIN
+                df_deep = download_historical_daily(ticker, days_needed=deep_days)
+                merged_records = _merge_and_sort_records(existing_records, df_deep, calendar, now_ist)
+
         if not merged_records:
-            msg = "Merged dataset is empty after date normalization"
+            msg = f"Vendor returned empty data or normalization failed for {ticker}"
             logger.warning(f"[{display_name}] {msg}")
             return False, msg
 
-        # Retain up to TARGET_OHLC_COUNT (250) completed sessions
+        # Final Freshness Gate
+        actual_latest_str = merged_records[0]["date"]
+        if actual_latest_str != expected_latest_str:
+            msg = f"Stale vendor data: Latest bar {actual_latest_str} != Expected {expected_latest_str}"
+            logger.error(f"[{display_name}] {msg}. Firebase left untouched.")
+            return False, msg
+
+        # 4. Slicing to Target Depth
         final_candles = merged_records[:TARGET_OHLC_COUNT]
 
-        # Key strictly from "1" to "N" (where N <= 250)
+        # 5. Build Sequential Payload (1 to N)
         indexed_db = {}
         for idx, candle in enumerate(final_candles):
             indexed_db[str(idx + HISTORICAL_START_INDEX)] = candle
 
-        # Validate strictly keys 1 through N
+        # 6. Structural Validation
         valid, err_msg = validate_historical_payload(indexed_db)
         if not valid:
             msg = f"Sanity validation rejected: {err_msg}"
             logger.error(f"[{display_name}] {msg}. Firebase left untouched.")
             return False, msg
 
-        # Write historical payload to Firebase (preserves index '0')
+        # 7. Write to Firebase
         write_ok = write_full_ohlc(display_name, indexed_db)
         if write_ok:
             rec_count = len(indexed_db)
@@ -88,10 +133,10 @@ def _parse_firebase_historical_records(raw_data) -> list[dict]:
     return records
 
 
-def _merge_and_sort_records(existing_records: list[dict], df: pd.DataFrame) -> list[dict]:
+def _merge_and_sort_records(existing_records: list[dict], df: pd.DataFrame, calendar: MarketCalendar, now_ist: datetime) -> list[dict]:
     """
     Combines existing historical rows with downloaded dataframe, deduplicates by date,
-    and strips out today's ongoing session so Index 1 is always the last COMPLETED day.
+    and strips out ongoing session so Index 1 is always the last COMPLETED session.
     """
     date_map = {}
     for r in existing_records:
@@ -99,47 +144,46 @@ def _merge_and_sort_records(existing_records: list[dict], df: pd.DataFrame) -> l
         if d:
             date_map[d] = r
 
-    # Flatten MultiIndex if batch-fetched and convert column headers to lowercase
-    df_clean = df.copy()
-    if isinstance(df_clean.columns, pd.MultiIndex):
-        df_clean.columns = df_clean.columns.get_level_values(0)
-    df_clean.columns = [str(c).strip().lower() for c in df_clean.columns]
+    if df is not None and not df.empty:
+        df_clean = df.copy()
+        if isinstance(df_clean.columns, pd.MultiIndex):
+            df_clean.columns = df_clean.columns.get_level_values(0)
+        df_clean.columns = [str(c).strip().lower() for c in df_clean.columns]
 
-    for _, row in df_clean.iterrows():
-        # Handle date extraction safely across types
-        row_date = row.get("date")
-        if isinstance(row_date, (date, datetime)):
-            d_str = row_date.strftime("%Y-%m-%d")
-        else:
-            d_str = str(row_date) if row_date is not None else ""
+        for _, row in df_clean.iterrows():
+            row_date = row.get("date")
+            if isinstance(row_date, (date, datetime)):
+                d_str = row_date.strftime("%Y-%m-%d")
+            else:
+                d_str = str(row_date) if row_date is not None else ""
 
-        if not d_str or d_str.lower() == "nan":
-            continue
+            if not d_str or d_str.lower() == "nan":
+                continue
 
-        # Safely extract volume without throwing KeyError
-        vol_raw = row.get("volume", 0)
-        try:
-            volume_val = int(vol_raw) if pd.notnull(vol_raw) else 0
-        except (ValueError, TypeError):
-            volume_val = 0
+            vol_raw = row.get("volume", 0)
+            try:
+                volume_val = int(vol_raw) if pd.notnull(vol_raw) else 0
+            except (ValueError, TypeError):
+                volume_val = 0
 
-        date_map[d_str] = {
-            "date": d_str,
-            "open": round(float(row.get("open", 0.0)), 2),
-            "high": round(float(row.get("high", 0.0)), 2),
-            "low": round(float(row.get("low", 0.0)), 2),
-            "close": round(float(row.get("close", 0.0)), 2),
-            "volume": volume_val
-        }
+            date_map[d_str] = {
+                "date": d_str,
+                "open": round(float(row.get("open", 0.0)), 2),
+                "high": round(float(row.get("high", 0.0)), 2),
+                "low": round(float(row.get("low", 0.0)), 2),
+                "close": round(float(row.get("close", 0.0)), 2),
+                "volume": volume_val
+            }
 
-    # -------------------------------------------------------------------------
-    # CRITICAL: Exclude today's ongoing session from historical series (1-250)
-    # -------------------------------------------------------------------------
-    today_ist = datetime.now(IST).strftime("%Y-%m-%d")
-    if today_ist in date_map:
-        del date_map[today_ist]
+    # Remove today's candle ONLY if the session is currently active/open
+    today_date = now_ist.date()
+    if calendar.is_trading_day(today_date):
+        status, _ = calendar.get_market_status(now_ist)
+        if status in ("LIVE", "PRE_OPEN"):
+            today_str = today_date.strftime("%Y-%m-%d")
+            if today_str in date_map:
+                del date_map[today_str]
 
-    # Sort descending: newest completed session will be first
     sorted_dates = sorted(date_map.keys(), reverse=True)
     return [date_map[d] for d in sorted_dates]
 
@@ -171,7 +215,6 @@ def validate_historical_payload(payload: dict[str, dict]) -> tuple[bool, str]:
         if o <= 0 or h <= 0 or l <= 0 or c <= 0:
             return False, f"Index {k} has non-positive price (O={o}, H={h}, L={l}, C={c})"
 
-        # Cushion of 0.05 for rounding anomalies on candle extremes
         if (h < l) or (h < max(o, c) - 0.05) or (l > min(o, c) + 0.05):
             return False, f"Index {k} OHLC boundary violation (O={o}, H={h}, L={l}, C={c})"
 
