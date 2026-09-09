@@ -166,15 +166,49 @@ def _parse_firebase_historical_records(raw_data) -> list[dict]:
             records.append(raw_data[k])
     return records
 
+def _normalize_to_iso_date(val) -> str:
+    """Safely converts timestamps, dates, or non-ISO strings (e.g. 08.09.2026) to YYYY-MM-DD."""
+    if val is None or pd.isna(val):
+        return ""
+    if isinstance(val, (date, datetime)):
+        return val.strftime("%Y-%m-%d")
+    
+    s = str(val).strip()
+    if not s or s.lower() == "nan":
+        return ""
+
+    # Common date formats returned across Pandas/yfinance versions
+    for fmt in ("%Y-%m-%d", "%d.%m.%Y", "%d-%m-%Y", "%Y.%m.%d", "%d/%m/%Y"):
+        try:
+            return datetime.strptime(s, fmt).strftime("%Y-%m-%d")
+        except ValueError:
+            continue
+
+    # Fallback to pandas date parser if string pattern is non-standard
+    try:
+        parsed = pd.to_datetime(s, errors="coerce")
+        if pd.notnull(parsed):
+            return parsed.strftime("%Y-%m-%d")
+    except Exception:
+        pass
+
+    return s
+
 
 def _merge_and_sort_records(existing_records: list[dict], df: pd.DataFrame, calendar: MarketCalendar, now_ist: datetime) -> list[dict]:
-    """Combines existing records with downloaded dataframe, deduplicating strictly by date."""
+    """Combines existing records with downloaded dataframe, deduplicating strictly by normalized YYYY-MM-DD date."""
     date_map = {}
+    
+    # 1. Ingest existing Firebase historical records
     for r in existing_records:
-        d = r.get("date")
-        if d:
-            date_map[d] = r
+        raw_d = r.get("date")
+        iso_d = _normalize_to_iso_date(raw_d)
+        if iso_d:
+            r_copy = dict(r)
+            r_copy["date"] = iso_d
+            date_map[iso_d] = r_copy
 
+    # 2. Ingest and normalize new rows from Yahoo DataFrame
     if df is not None and not df.empty:
         df_clean = df.copy()
         if isinstance(df_clean.columns, pd.MultiIndex):
@@ -183,12 +217,9 @@ def _merge_and_sort_records(existing_records: list[dict], df: pd.DataFrame, cale
 
         for _, row in df_clean.iterrows():
             row_date = row.get("date")
-            if isinstance(row_date, (date, datetime)):
-                d_str = row_date.strftime("%Y-%m-%d")
-            else:
-                d_str = str(row_date) if row_date is not None else ""
+            d_str = _normalize_to_iso_date(row_date)
 
-            if not d_str or d_str.lower() == "nan":
+            if not d_str:
                 continue
 
             vol_raw = row.get("volume", 0)
@@ -206,7 +237,7 @@ def _merge_and_sort_records(existing_records: list[dict], df: pd.DataFrame, cale
                 "volume": volume_val
             }
 
-    # Exclude ongoing session from historical series (1-250) during market hours
+    # 3. Exclude ongoing session from historical series (1-250) during live market hours
     today_date = now_ist.date()
     if calendar.is_trading_day(today_date):
         status, _ = calendar.get_market_status(now_ist)
@@ -215,9 +246,9 @@ def _merge_and_sort_records(existing_records: list[dict], df: pd.DataFrame, cale
             if today_str in date_map:
                 del date_map[today_str]
 
+    # 4. Strictly sort newest to oldest by ISO YYYY-MM-DD
     sorted_dates = sorted(date_map.keys(), reverse=True)
     return [date_map[d] for d in sorted_dates]
-
 
 def validate_historical_payload(payload: dict[str, dict]) -> tuple[bool, str]:
     """Validates sequential keys starting at HISTORICAL_START_INDEX, price integrity, and descending dates."""
