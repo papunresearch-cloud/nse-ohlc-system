@@ -13,10 +13,12 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 from datetime import datetime, time as dt_time
 import pytz
 
+# Resolve PORT directly from the environment, defaulting to 10000 for Render
+PORT = int(os.environ.get("PORT", 10000))
+
 from config import (
     TIMEZONE,
-    PORT,
-    PARAM_CALC_INTERVAL_SEC,
+    PARAM_UPDATE_INTERVAL_SEC,
     logger
 )
 from market_calendar import MarketCalendar
@@ -61,7 +63,7 @@ class MasterOrchestrator:
         self.calendar = MarketCalendar()
         self.script_status = {}
         self.active_stocks = []
-        self.last_param_calc_time = 0
+        self.last_param_calc_time = 0.0
         self.final_param_calculated_today = False
         self.current_plan_date = None
 
@@ -105,7 +107,6 @@ class MasterOrchestrator:
         synced_count = 0
 
         for stock_name in self.active_stocks:
-            # Suffix mapping: Assumes standard .NS equity unless already formatted
             ticker = stock_name if ("." in stock_name or "^" in stock_name) else f"{stock_name}.NS"
 
             success, msg = sync_historical_script(stock_name, ticker, calendar=self.calendar)
@@ -168,7 +169,6 @@ class MasterOrchestrator:
                 # 1. Midnight Daily Re-plan Check
                 if self.current_plan_date != today_date:
                     self.replan_daily_routine(now_ist)
-                    # Run pre-market catchup sync
                     self.run_sync_cycle()
 
                 is_trading = self.calendar.is_trading_day(today_date)
@@ -179,7 +179,7 @@ class MasterOrchestrator:
                 # -------------------------------------------------------------
                 if is_trading and market_status == "LIVE":
                     current_ts = time.time()
-                    if current_ts - self.last_param_calc_time >= PARAM_CALC_INTERVAL_SEC:
+                    if current_ts - self.last_param_calc_time >= PARAM_UPDATE_INTERVAL_SEC:
                         synced_stocks = self.get_synced_stocks()
                         if synced_stocks:
                             logger.info(f"[PARAM ENGINE] Executing regular 15-minute calculation cycle across {len(synced_stocks)} stocks...")
@@ -209,7 +209,6 @@ class MasterOrchestrator:
                         except Exception as e:
                             logger.error(f"[MARKET CLOSE 15:30] Error during final parameter calculation: {e}", exc_info=True)
 
-                # Idle sleep between evaluation cycles
                 time.sleep(10)
 
             except Exception as e:
