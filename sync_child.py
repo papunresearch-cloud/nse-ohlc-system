@@ -50,14 +50,12 @@ def _normalize_to_iso_date(val) -> str:
     if not s or s.lower() == "nan":
         return ""
 
-    # Common date formats returned across Pandas/yfinance versions
     for fmt in ("%Y-%m-%d", "%d.%m.%Y", "%d-%m-%Y", "%Y.%m.%d", "%d/%m/%Y"):
         try:
             return datetime.strptime(s, fmt).strftime("%Y-%m-%d")
         except ValueError:
             continue
 
-    # Fallback to pandas date parser if string pattern is non-standard
     try:
         parsed = pd.to_datetime(s, errors="coerce")
         if pd.notnull(parsed):
@@ -112,26 +110,34 @@ def _merge_and_sort_records(
         raw_d = r.get("date")
         iso_d = _normalize_to_iso_date(raw_d)
         if iso_d:
-            r_copy = dict(r)
-            r_copy["date"] = iso_d
-            r_copy["open"] = _clean_price(r_copy.get("open"))
-            r_copy["high"] = _clean_price(r_copy.get("high"))
-            r_copy["low"] = _clean_price(r_copy.get("low"))
-            r_copy["close"] = _clean_price(r_copy.get("close"))
+            o = _clean_price(r.get("open"))
+            h = _clean_price(r.get("high"))
+            l = _clean_price(r.get("low"))
+            c = _clean_price(r.get("close"))
 
-            vol_raw = r_copy.get("volume", 0)
+            if o <= 0 or h <= 0 or l <= 0 or c <= 0 or h < l:
+                continue
+
+            vol_raw = r.get("volume", 0)
             try:
                 if pd.notnull(vol_raw):
                     vol_float = float(vol_raw)
-                    r_copy["volume"] = 0 if (math.isnan(vol_float) or math.isinf(vol_float)) else int(vol_float)
+                    volume_val = 0 if (math.isnan(vol_float) or math.isinf(vol_float)) else int(vol_float)
                 else:
-                    r_copy["volume"] = 0
+                    volume_val = 0
             except (ValueError, TypeError):
-                r_copy["volume"] = 0
+                volume_val = 0
 
-            date_map[iso_d] = r_copy
+            date_map[iso_d] = {
+                "date": iso_d,
+                "open": o,
+                "high": max(h, o, c),
+                "low": min(l, o, c),
+                "close": c,
+                "volume": volume_val,
+            }
 
-    # 2. Ingest and normalize new rows from Yahoo DataFrame
+    # 2. Ingest, sanitize, and validate downloaded Yahoo DataFrame
     if df is not None and not df.empty:
         df_clean = df.copy()
         if isinstance(df_clean.columns, pd.MultiIndex):
@@ -143,6 +149,15 @@ def _merge_and_sort_records(
             d_str = _normalize_to_iso_date(row_date)
 
             if not d_str:
+                continue
+
+            o = _clean_price(row.get("open"))
+            h = _clean_price(row.get("high"))
+            l = _clean_price(row.get("low"))
+            c = _clean_price(row.get("close"))
+
+            # Skip incomplete, zero-price, or corrupted boundary bars
+            if o <= 0 or h <= 0 or l <= 0 or c <= 0 or h < l:
                 continue
 
             vol_raw = row.get("volume", 0)
@@ -157,10 +172,10 @@ def _merge_and_sort_records(
 
             date_map[d_str] = {
                 "date": d_str,
-                "open": _clean_price(row.get("open")),
-                "high": _clean_price(row.get("high")),
-                "low": _clean_price(row.get("low")),
-                "close": _clean_price(row.get("close")),
+                "open": o,
+                "high": max(h, o, c),
+                "low": min(l, o, c),
+                "close": c,
                 "volume": volume_val,
             }
 
@@ -334,7 +349,9 @@ def sync_historical_script(
             final_candles = merged_records[:TARGET_OHLC_COUNT]
             indexed_db = {str(idx + HISTORICAL_START_INDEX): c for idx, c in enumerate(final_candles)}
             valid, err_msg = validate_historical_payload(indexed_db)
-            if valid and write_full_ohlc(display_name, indexed_db):
+            if not valid:
+                logger.warning(f"[{display_name}] Bootstrap validation failed: {err_msg}")
+            elif write_full_ohlc(display_name, indexed_db):
                 seeded_date = indexed_db[str(HISTORICAL_START_INDEX)]["date"]
                 logger.warning(
                     f"[{display_name}] VENDOR_LAG_BOOTSTRAP: Initial baseline seeded with {len(indexed_db)} bars "
