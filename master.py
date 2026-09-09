@@ -3,6 +3,7 @@ MASTER ORCHESTRATOR
 - Manages pre-market sync, live CHILD-2 updates, and technical parameter routines.
 - Includes HTTP health-check server on $PORT for Render deployment.
 - Triggers an isolated parameter calculation immediately at 15:30 IST market close.
+- Resolves display names to genuine NSE tickers before historical download.
 """
 import os
 import sys
@@ -13,7 +14,7 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 from datetime import datetime, time as dt_time
 import pytz
 
-# Resolve PORT directly from the environment, defaulting to 10000 for Render
+# Resolve PORT directly from environment, defaulting to 10000 for Render
 PORT = int(os.environ.get("PORT", 10000))
 
 from config import (
@@ -29,6 +30,27 @@ from firebase_manager import db
 IST = pytz.timezone(TIMEZONE)
 _keep_running = True
 
+# Watchlist Display Name -> Authentic Exchange Ticker Mapping
+STOCK_TICKER_MAP = {
+    "Bharat Electron": "BEL.NS",
+    "Caplin Point Lab": "CAPLIPOINT.NS",
+    "Coal India": "COALINDIA.NS",
+    "Gokul Agro": "GOKULAGRO.NS",
+    "Gravita India": "GRAVITA.NS",
+    "HCL Technologies": "HCLTECH.NS",
+    "REC Ltd": "RECLTD.NS",
+    "Va Tech Wabag": "WABAG.NS",
+    "Abbott India": "ABBOTINDIA.NS",
+    "Dixon Technolog_": "DIXON.NS",
+    "Infosys": "INFY.NS",
+    "Kaynes Tech": "KAYNES.NS",
+    "NMDC": "NMDC.NS",
+    "Reliance Industries": "RELIANCE.NS",
+    "TCS": "TCS.NS",
+    "Vedanta": "VEDL.NS",
+    "Wipro": "WIPRO.NS"
+}
+
 
 # =====================================================================
 # HTTP HEALTH-CHECK SERVER (FOR CLOUD DEPLOYMENTS)
@@ -42,7 +64,6 @@ class HealthHandler(BaseHTTPRequestHandler):
         self.wfile.write(b'{"status": "healthy", "service": "NSE Master Orchestrator"}')
 
     def log_message(self, format, *args):
-        # Suppress standard ping spam in Render application logs
         pass
 
 
@@ -67,12 +88,29 @@ class MasterOrchestrator:
         self.final_param_calculated_today = False
         self.current_plan_date = None
 
+    def resolve_ticker_for_stock(self, stock_name: str) -> str:
+        """Translates display name to authentic NSE ticker with fallback."""
+        if stock_name in STOCK_TICKER_MAP:
+            return STOCK_TICKER_MAP[stock_name]
+        
+        # Try retrieving TICKER from /param node in Firebase
+        try:
+            stored_ticker = db.reference(f"param/{stock_name}/TICKER").get()
+            if stored_ticker:
+                return str(stored_ticker).strip()
+        except Exception:
+            pass
+
+        if "." in stock_name or "^" in stock_name:
+            return stock_name
+        return f"{stock_name.replace(' ', '')}.NS"
+
     def replan_daily_routine(self, now_ist: datetime):
         """Initializes or resets the daily operational plan at midnight IST."""
         today = now_ist.date()
         is_trading = self.calendar.is_trading_day(today)
         self.current_plan_date = today
-        self.final_param_calculated_today = False  # Reset daily closing latch
+        self.final_param_calculated_today = False
 
         self.load_watchlist_from_firebase()
         plan_desc = f"TRADING SESSION ({len(self.active_stocks)} stocks)" if is_trading else "MARKET HOLIDAY / WEEKEND"
@@ -107,7 +145,7 @@ class MasterOrchestrator:
         synced_count = 0
 
         for stock_name in self.active_stocks:
-            ticker = stock_name if ("." in stock_name or "^" in stock_name) else f"{stock_name}.NS"
+            ticker = self.resolve_ticker_for_stock(stock_name)
 
             success, msg = sync_historical_script(stock_name, ticker, calendar=self.calendar)
             self.script_status[stock_name] = {
@@ -230,7 +268,6 @@ if __name__ == "__main__":
     signal.signal(signal.SIGTERM, handle_shutdown)
     signal.signal(signal.SIGINT, handle_shutdown)
 
-    # Initialize health server for Render
     server = start_health_server(PORT)
 
     orchestrator = MasterOrchestrator()
