@@ -1,14 +1,15 @@
 """
-CHILD-1: Historical Synchronization Engine.
-- Maintains up to 250 historical records under keys '1' through '250'.
-- Decouples historical verification from live-tracking permission.
-- Never fabricates synthetic OHLC prices.
-- Handles vendor publication lag gracefully by preserving valid baselines.
-- Seeds initial bootstrap from best available data if Firebase is uninitialized.
-- Sanitizes NaN, Infinity, and non-ISO dates to guarantee Firebase JSON compliance.
+CHILD-1: Historical Synchronization & Data Validation Engine.
+- Maintains up to 250 historical records strictly under keys '1' through '250'.
+- Guarantees Index 1 is the last COMPLETED trading day (never today's active session).
+- Strips any bar newer than expected_latest_date (prevents Index 0/1 collisions).
+- Sanitizes NaN / Inf floats to prevent Firebase JSON serialization errors.
+- Decouples vendor lag from live tracking so CHILD-2 is not blocked.
+- Completely leaves Index 0 untouched.
 """
+
 import math
-from datetime import datetime, date
+from datetime import datetime, date, time
 import pandas as pd
 import pytz
 
@@ -24,33 +25,38 @@ from yahoo_manager import download_historical_daily
 from market_calendar import MarketCalendar
 
 IST = pytz.timezone(TIMEZONE)
+MARKET_CLOSE_TIME = time(15, 30)
 
 
-def _clean_price(val) -> float:
-    """Guards against NaN, Inf, and non-numeric values before Firebase JSON serialization."""
-    if val is None or pd.isna(val):
-        return 0.0
-    try:
-        f_val = float(val)
-        if math.isnan(f_val) or math.isinf(f_val):
-            return 0.0
-        return round(f_val, 2)
-    except (ValueError, TypeError):
-        return 0.0
+def _get_expected_latest_date(calendar: MarketCalendar, now_ist: datetime) -> date:
+    """
+    Determines the exact date of the latest COMPLETED trading session.
+    - Before 15:30 IST on a trading day: Previous trading day (today is incomplete).
+    - At or after 15:30 IST on a trading day: Today's finalized session.
+    - Weekends or NSE Holidays: Previous trading day.
+    """
+    today = now_ist.date()
+    current_time = now_ist.time()
+
+    if calendar.is_trading_day(today):
+        if current_time < MARKET_CLOSE_TIME:
+            return calendar.get_previous_trading_day(today)
+        return today
+    return calendar.get_previous_trading_day(today)
 
 
 def _normalize_to_iso_date(val) -> str:
-    """Safely converts timestamps, dates, or non-ISO strings (e.g. 08.09.2026) to YYYY-MM-DD."""
+    """Converts timestamps, dates, or non-ISO strings to YYYY-MM-DD."""
     if val is None or pd.isna(val):
         return ""
     if isinstance(val, (date, datetime)):
         return val.strftime("%Y-%m-%d")
 
     s = str(val).strip()
-    if not s or s.lower() == "nan":
+    if not s or s.lower() in ("nan", "nat", "none"):
         return ""
 
-    for fmt in ("%Y-%m-%d", "%d.%m.%Y", "%d-%m-%Y", "%Y.%m.%d", "%d/%m/%Y"):
+    for fmt in ("%Y-%m-%d", "%d.%m.%Y", "%d-%m-%Y", "%Y/%m/%d", "%d/%m/%Y"):
         try:
             return datetime.strptime(s, fmt).strftime("%Y-%m-%d")
         except ValueError:
@@ -63,33 +69,41 @@ def _normalize_to_iso_date(val) -> str:
     except Exception:
         pass
 
-    return s
+    return ""
 
 
-def _get_expected_latest_date(calendar: MarketCalendar, now_ist: datetime) -> date:
-    """Calculates the date of the latest fully finalized market session."""
-    today = now_ist.date()
-    if calendar.is_trading_day(today):
-        status, _ = calendar.get_market_status(now_ist)
-        if status in ("LIVE", "PRE_OPEN"):
-            return calendar.get_previous_trading_day(today)
-        return today
-    return calendar.get_previous_trading_day(today)
+def _clean_price(val) -> float | None:
+    """Validates numeric price, rejects NaN/Inf/zero/negative values."""
+    try:
+        if val is None or pd.isna(val):
+            return None
+        f = float(val)
+        if math.isnan(f) or math.isinf(f) or f <= 0:
+            return None
+        return round(f, 2)
+    except (ValueError, TypeError):
+        return None
 
 
-def _audit_vendor_freshness(records: list[dict], expected_date_str: str) -> bool:
-    """Checks whether the newest record matches the expected completed date."""
-    if not records:
-        return False
-    return records[0].get("date") == expected_date_str
+def _clean_volume(val) -> int:
+    """Safely parses volume to integer, defaulting to 0 on NaN/corrupt input."""
+    try:
+        if val is None or pd.isna(val):
+            return 0
+        f = float(val)
+        if math.isnan(f) or math.isinf(f) or f < 0:
+            return 0
+        return int(f)
+    except (ValueError, TypeError):
+        return 0
 
 
 def _parse_firebase_historical_records(raw_data) -> list[dict]:
-    """Extracts only historical keys starting at HISTORICAL_START_INDEX up to TARGET_OHLC_COUNT, discarding '0'."""
+    """Extracts only keys '1' through '250', ignoring Index 0."""
     if not raw_data or not isinstance(raw_data, dict):
         return []
     records = []
-    for i in range(HISTORICAL_START_INDEX, HISTORICAL_START_INDEX + TARGET_OHLC_COUNT):
+    for i in range(HISTORICAL_START_INDEX, TARGET_OHLC_COUNT + 1):
         k = str(i)
         if k in raw_data and isinstance(raw_data[k], dict) and "date" in raw_data[k]:
             records.append(raw_data[k])
@@ -99,45 +113,25 @@ def _parse_firebase_historical_records(raw_data) -> list[dict]:
 def _merge_and_sort_records(
     existing_records: list[dict],
     df: pd.DataFrame,
-    calendar: MarketCalendar,
-    now_ist: datetime,
+    expected_latest_date: date,
 ) -> list[dict]:
-    """Combines existing records with downloaded dataframe, deduplicating strictly by normalized YYYY-MM-DD date."""
+    """
+    Merges existing records with incoming DataFrame, drops NaN/corrupt prices,
+    and strips any candle newer than expected_latest_date so Index 1 is
+    strictly the last completed market session.
+    """
     date_map = {}
+    expected_latest_str = expected_latest_date.strftime("%Y-%m-%d")
 
     # 1. Ingest existing Firebase historical records
     for r in existing_records:
-        raw_d = r.get("date")
-        iso_d = _normalize_to_iso_date(raw_d)
-        if iso_d:
-            o = _clean_price(r.get("open"))
-            h = _clean_price(r.get("high"))
-            l = _clean_price(r.get("low"))
-            c = _clean_price(r.get("close"))
+        iso_d = _normalize_to_iso_date(r.get("date"))
+        if iso_d and iso_d <= expected_latest_str:
+            r_copy = dict(r)
+            r_copy["date"] = iso_d
+            date_map[iso_d] = r_copy
 
-            if o <= 0 or h <= 0 or l <= 0 or c <= 0 or h < l:
-                continue
-
-            vol_raw = r.get("volume", 0)
-            try:
-                if pd.notnull(vol_raw):
-                    vol_float = float(vol_raw)
-                    volume_val = 0 if (math.isnan(vol_float) or math.isinf(vol_float)) else int(vol_float)
-                else:
-                    volume_val = 0
-            except (ValueError, TypeError):
-                volume_val = 0
-
-            date_map[iso_d] = {
-                "date": iso_d,
-                "open": o,
-                "high": max(h, o, c),
-                "low": min(l, o, c),
-                "close": c,
-                "volume": volume_val,
-            }
-
-    # 2. Ingest, sanitize, and validate downloaded Yahoo DataFrame
+    # 2. Ingest and sanitize new rows from Yahoo Finance
     if df is not None and not df.empty:
         df_clean = df.copy()
         if isinstance(df_clean.columns, pd.MultiIndex):
@@ -145,10 +139,12 @@ def _merge_and_sort_records(
         df_clean.columns = [str(c).strip().lower() for c in df_clean.columns]
 
         for _, row in df_clean.iterrows():
-            row_date = row.get("date")
-            d_str = _normalize_to_iso_date(row_date)
-
+            d_str = _normalize_to_iso_date(row.get("date"))
             if not d_str:
+                continue
+
+            # Hard filter: Never admit today's in-progress or future sessions into historical DB
+            if d_str > expected_latest_str:
                 continue
 
             o = _clean_price(row.get("open"))
@@ -156,45 +152,30 @@ def _merge_and_sort_records(
             l = _clean_price(row.get("low"))
             c = _clean_price(row.get("close"))
 
-            # Skip incomplete, zero-price, or corrupted boundary bars
-            if o <= 0 or h <= 0 or l <= 0 or c <= 0 or h < l:
+            # Discard incomplete or NaN candle bars
+            if o is None or h is None or l is None or c is None:
                 continue
 
-            vol_raw = row.get("volume", 0)
-            try:
-                if pd.notnull(vol_raw):
-                    vol_float = float(vol_raw)
-                    volume_val = 0 if (math.isnan(vol_float) or math.isinf(vol_float)) else int(vol_float)
-                else:
-                    volume_val = 0
-            except (ValueError, TypeError):
-                volume_val = 0
+            # Candlestick boundary check
+            if (h < l) or (h < max(o, c) - 0.05) or (l > min(o, c) + 0.05):
+                continue
 
             date_map[d_str] = {
                 "date": d_str,
                 "open": o,
-                "high": max(h, o, c),
-                "low": min(l, o, c),
+                "high": h,
+                "low": l,
                 "close": c,
-                "volume": volume_val,
+                "volume": _clean_volume(row.get("volume")),
             }
 
-    # 3. Exclude ongoing session from historical series (1-250) during live market hours
-    today_date = now_ist.date()
-    if calendar.is_trading_day(today_date):
-        status, _ = calendar.get_market_status(now_ist)
-        if status in ("LIVE", "PRE_OPEN"):
-            today_str = today_date.strftime("%Y-%m-%d")
-            if today_str in date_map:
-                del date_map[today_str]
-
-    # 4. Strictly sort newest to oldest by ISO YYYY-MM-DD
+    # 3. Sort strictly descending (newest completed date first)
     sorted_dates = sorted(date_map.keys(), reverse=True)
     return [date_map[d] for d in sorted_dates]
 
 
 def validate_historical_payload(payload: dict[str, dict]) -> tuple[bool, str]:
-    """Validates sequential keys starting at HISTORICAL_START_INDEX, price integrity, and descending dates."""
+    """Validates contiguous keys starting at 1, price integrity, and descending dates."""
     count = len(payload)
     if count == 0:
         return False, "Historical payload is completely empty"
@@ -202,10 +183,10 @@ def validate_historical_payload(payload: dict[str, dict]) -> tuple[bool, str]:
         return False, f"Payload count {count} exceeds limit {TARGET_OHLC_COUNT}"
 
     dates_seen = []
-    for i in range(HISTORICAL_START_INDEX, HISTORICAL_START_INDEX + count):
+    for i in range(1, count + 1):
         k = str(i)
         if k not in payload:
-            return False, f"Missing contiguous historical sequential index '{k}'"
+            return False, f"Missing contiguous historical index '{k}'"
 
         bar = payload[k]
         for field in ("date", "open", "high", "low", "close"):
@@ -214,13 +195,11 @@ def validate_historical_payload(payload: dict[str, dict]) -> tuple[bool, str]:
 
         try:
             o, h, l, c = float(bar["open"]), float(bar["high"]), float(bar["low"]), float(bar["close"])
-            if any(math.isnan(x) or math.isinf(x) for x in (o, h, l, c)):
-                return False, f"Index {k} contains NaN or Infinity values"
         except (ValueError, TypeError):
             return False, f"Index {k} contains non-numeric values"
 
-        if o <= 0 or h <= 0 or l <= 0 or c <= 0:
-            return False, f"Index {k} has non-positive price (O={o}, H={h}, L={l}, C={c})"
+        if o <= 0 or h <= 0 or l <= 0 or c <= 0 or math.isnan(o) or math.isnan(h) or math.isnan(l) or math.isnan(c):
+            return False, f"Index {k} has non-positive or NaN price (O={o}, H={h}, L={l}, C={c})"
 
         if (h < l) or (h < max(o, c) - 0.05) or (l > min(o, c) + 0.05):
             return False, f"Index {k} OHLC boundary violation (O={o}, H={h}, L={l}, C={c})"
@@ -241,16 +220,23 @@ def validate_historical_payload(payload: dict[str, dict]) -> tuple[bool, str]:
 
 def sync_historical_script(
     display_name: str,
-    ticker: str,
+    ticker: str = None,
     gap_trading_days: int = 0,
     calendar: MarketCalendar = None,
 ) -> tuple[bool, str]:
     """
     Coordinates historical catch-up and returns live-readiness status:
-    - Returns (True, msg) if stock is safe for live updates (VERIFIED or VENDOR_LAG with valid baseline).
-    - Returns (False, msg) only if baseline is completely missing or structurally invalid.
+    - Guarantees Index 1 matches the latest completed market session.
+    - Prevents vendor lag from blocking live updates if a valid baseline exists.
     """
     try:
+        # Defensive argument resolution
+        if isinstance(ticker, int):
+            gap_trading_days = ticker
+            ticker = display_name
+        elif ticker is None:
+            ticker = display_name
+
         if calendar is None:
             calendar = MarketCalendar()
 
@@ -261,15 +247,11 @@ def sync_historical_script(
         existing_ohlc = get_stock_ohlc(display_name)
         existing_records = _parse_firebase_historical_records(existing_ohlc)
 
-        # ---------------------------------------------------------------------
-        # 1. Inspect Current Firebase Baseline
-        # ---------------------------------------------------------------------
-        if _audit_vendor_freshness(existing_records, expected_latest_str):
+        # 1. Quick Bypass: Baseline already current
+        if existing_records and existing_records[0].get("date") == expected_latest_str:
             return True, f"VERIFIED: Firebase baseline already current at {expected_latest_str}"
 
-        # ---------------------------------------------------------------------
-        # 2. Determine Fetch Depth & Query Vendor
-        # ---------------------------------------------------------------------
+        # 2. Determine Fetch Depth
         is_empty_bootstrap = not existing_records
         if is_empty_bootstrap:
             days_needed = TARGET_OHLC_COUNT + DEFAULT_SAFETY_MARGIN
@@ -282,87 +264,60 @@ def sync_historical_script(
                 actual_gap = 10
             days_needed = min(max(gap_trading_days, actual_gap) + DEFAULT_SAFETY_MARGIN, 30)
 
+        # 3. Query Vendor & Normalize
         df = download_historical_daily(ticker, days_needed=days_needed)
-        merged_records = _merge_and_sort_records(existing_records, df, calendar, now_ist)
+        merged_records = _merge_and_sort_records(existing_records, df, expected_latest_date)
 
-        sync_state = "UNKNOWN"
-
-        # ---------------------------------------------------------------------
-        # 3. Check Freshness & Attempt Capped Deep-Fetch Retry (Max 30 Days)
-        # ---------------------------------------------------------------------
-        if _audit_vendor_freshness(merged_records, expected_latest_str):
-            sync_state = "VERIFIED"
-        else:
-            if not is_empty_bootstrap:
-                logger.warning(
-                    f"[{display_name}] Vendor lagging (Got: {merged_records[0]['date'] if merged_records else 'None'}, "
-                    f"Expected: {expected_latest_str}). Retrying with 30-day fetch..."
-                )
-                df_deep = download_historical_daily(ticker, days_needed=30)
-                merged_records = _merge_and_sort_records(existing_records, df_deep, calendar, now_ist)
-
-                if _audit_vendor_freshness(merged_records, expected_latest_str):
-                    sync_state = "RECOVERED"
-                else:
-                    sync_state = "VENDOR_LAG"
-            else:
-                sync_state = "VENDOR_LAG"
-
-        # ---------------------------------------------------------------------
-        # 4. Commit Fresh Records (VERIFIED / RECOVERED)
-        # ---------------------------------------------------------------------
-        if sync_state in ("VERIFIED", "RECOVERED"):
-            final_candles = merged_records[:TARGET_OHLC_COUNT]
-            indexed_db = {str(idx + HISTORICAL_START_INDEX): c for idx, c in enumerate(final_candles)}
-
-            valid, err_msg = validate_historical_payload(indexed_db)
-            if not valid:
-                logger.error(f"[{display_name}] Sanity validation rejected: {err_msg}. Firebase untouched.")
-                return False, f"Validation Rejected: {err_msg}"
-
-            if write_full_ohlc(display_name, indexed_db):
-                return True, f"{sync_state}: {len(indexed_db)} bars committed (Index 1: {expected_latest_str})"
-            return False, "Firebase write failed"
-
-        # ---------------------------------------------------------------------
-        # 5. Handle VENDOR_LAG: Decouple Live Permission & Support Initial Bootstrap
-        # ---------------------------------------------------------------------
-        valid_existing, _ = (
-            validate_historical_payload(
-                {str(idx + HISTORICAL_START_INDEX): c for idx, c in enumerate(existing_records)}
-            )
-            if existing_records
-            else (False, "No records")
-        )
-
-        # Condition A: Preserved valid baseline exists in Firebase
-        if valid_existing:
-            stale_date = existing_records[0].get("date")
+        # 4. Freshness Check & Capped Retry (30 Days)
+        if merged_records and merged_records[0]["date"] != expected_latest_str and not is_empty_bootstrap:
             logger.warning(
-                f"[{display_name}] VENDOR_LAG: Session {expected_latest_str} omitted by Yahoo. "
-                f"Firebase untouched (retaining baseline from {stale_date}). CHILD-2 live tracking permitted."
+                f"[{display_name}] Stale data detected (Got: {merged_records[0]['date']}, Expected: {expected_latest_str}). "
+                f"Executing capped retry (30 days)..."
             )
-            return True, f"VENDOR_LAG: Baseline preserved at {stale_date}; Live tracking allowed"
+            df_retry = download_historical_daily(ticker, days_needed=30)
+            merged_records = _merge_and_sort_records(existing_records, df_retry, expected_latest_date)
 
-        # Condition B: Firebase node was empty; seed with available historical bars
-        if is_empty_bootstrap and merged_records:
-            final_candles = merged_records[:TARGET_OHLC_COUNT]
-            indexed_db = {str(idx + HISTORICAL_START_INDEX): c for idx, c in enumerate(final_candles)}
-            valid, err_msg = validate_historical_payload(indexed_db)
-            if not valid:
-                logger.warning(f"[{display_name}] Bootstrap validation failed: {err_msg}")
-            elif write_full_ohlc(display_name, indexed_db):
-                seeded_date = indexed_db[str(HISTORICAL_START_INDEX)]["date"]
+        # 5. Handle Vendor Lag Without Blocking CHILD-2
+        actual_latest = merged_records[0]["date"] if merged_records else ""
+        if actual_latest != expected_latest_str:
+            if existing_records:
                 logger.warning(
-                    f"[{display_name}] VENDOR_LAG_BOOTSTRAP: Initial baseline seeded with {len(indexed_db)} bars "
-                    f"(Latest available: {seeded_date}). CHILD-2 live tracking permitted."
+                    f"[{display_name}] Vendor lag: Latest available is {actual_latest}, expected {expected_latest_str}. "
+                    f"Preserving existing Firebase baseline ({len(existing_records)} bars). Live update permitted."
                 )
-                return True, f"VENDOR_LAG: Bootstrapped at {seeded_date}; Live tracking allowed"
+                return True, f"VENDOR_LAG: Baseline preserved at {existing_records[0].get('date')}; Live tracking allowed"
 
-        # Hard failure: vendor returned nothing usable and no prior baseline exists
-        msg = f"INITIAL_SYNC_FAILED: Yahoo missing {expected_latest_str} and no usable baseline could be constructed."
-        logger.error(f"[{display_name}] {msg}. Firebase untouched.")
-        return False, msg
+            if not merged_records:
+                msg = f"INITIAL_SYNC_FAILED: Yahoo returned no valid data for {ticker}"
+                logger.error(f"[{display_name}] {msg}. Firebase untouched.")
+                return False, msg
+
+            # Bootstrapping with available historical records
+            logger.warning(
+                f"[{display_name}] VENDOR_LAG_BOOTSTRAP: Baseline seeded with {len(merged_records)} bars "
+                f"(Latest available: {actual_latest}). Live update permitted."
+            )
+
+        # 6. Build Contiguous Payload (Keys '1' to 'N')
+        final_candles = merged_records[:TARGET_OHLC_COUNT]
+        indexed_db = {}
+        for idx, candle in enumerate(final_candles):
+            indexed_db[str(idx + HISTORICAL_START_INDEX)] = candle
+
+        # 7. Validate Payload
+        valid, err_msg = validate_historical_payload(indexed_db)
+        if not valid:
+            msg = f"Sanity validation rejected: {err_msg}"
+            logger.error(f"[{display_name}] {msg}. Firebase left untouched.")
+            return False, msg
+
+        # 8. Write to Firebase
+        write_ok = write_full_ohlc(display_name, indexed_db)
+        if write_ok:
+            rec_count = len(indexed_db)
+            latest_dt = indexed_db["1"]["date"]
+            return True, f"OK ({rec_count} historical bars, Index 1: {latest_dt})"
+        return False, "Firebase Realtime DB rejected write payload"
 
     except Exception as e:
         logger.error(f"[{display_name}] Internal sync exception: {e}", exc_info=True)
