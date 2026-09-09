@@ -5,17 +5,67 @@ CHILD-1: Historical Synchronization Engine.
 - Never fabricates synthetic OHLC prices.
 - Handles vendor publication lag gracefully by preserving valid baselines.
 - Seeds initial bootstrap from best available data if Firebase is uninitialized.
+- Sanitizes NaN, Infinity, and non-ISO dates to guarantee Firebase JSON compliance.
 """
+import math
 from datetime import datetime, date
 import pandas as pd
 import pytz
 
-from config import TARGET_OHLC_COUNT, HISTORICAL_START_INDEX, DEFAULT_SAFETY_MARGIN, TIMEZONE, logger
+from config import (
+    TARGET_OHLC_COUNT,
+    HISTORICAL_START_INDEX,
+    DEFAULT_SAFETY_MARGIN,
+    TIMEZONE,
+    logger,
+)
 from firebase_manager import get_stock_ohlc, write_full_ohlc
 from yahoo_manager import download_historical_daily
 from market_calendar import MarketCalendar
 
 IST = pytz.timezone(TIMEZONE)
+
+
+def _clean_price(val) -> float:
+    """Guards against NaN, Inf, and non-numeric values before Firebase JSON serialization."""
+    if val is None or pd.isna(val):
+        return 0.0
+    try:
+        f_val = float(val)
+        if math.isnan(f_val) or math.isinf(f_val):
+            return 0.0
+        return round(f_val, 2)
+    except (ValueError, TypeError):
+        return 0.0
+
+
+def _normalize_to_iso_date(val) -> str:
+    """Safely converts timestamps, dates, or non-ISO strings (e.g. 08.09.2026) to YYYY-MM-DD."""
+    if val is None or pd.isna(val):
+        return ""
+    if isinstance(val, (date, datetime)):
+        return val.strftime("%Y-%m-%d")
+
+    s = str(val).strip()
+    if not s or s.lower() == "nan":
+        return ""
+
+    # Common date formats returned across Pandas/yfinance versions
+    for fmt in ("%Y-%m-%d", "%d.%m.%Y", "%d-%m-%Y", "%Y.%m.%d", "%d/%m/%Y"):
+        try:
+            return datetime.strptime(s, fmt).strftime("%Y-%m-%d")
+        except ValueError:
+            continue
+
+    # Fallback to pandas date parser if string pattern is non-standard
+    try:
+        parsed = pd.to_datetime(s, errors="coerce")
+        if pd.notnull(parsed):
+            return parsed.strftime("%Y-%m-%d")
+    except Exception:
+        pass
+
+    return s
 
 
 def _get_expected_latest_date(calendar: MarketCalendar, now_ist: datetime) -> date:
@@ -36,7 +86,150 @@ def _audit_vendor_freshness(records: list[dict], expected_date_str: str) -> bool
     return records[0].get("date") == expected_date_str
 
 
-def sync_historical_script(display_name: str, ticker: str, gap_trading_days: int = 0, calendar: MarketCalendar = None) -> tuple[bool, str]:
+def _parse_firebase_historical_records(raw_data) -> list[dict]:
+    """Extracts only historical keys starting at HISTORICAL_START_INDEX up to TARGET_OHLC_COUNT, discarding '0'."""
+    if not raw_data or not isinstance(raw_data, dict):
+        return []
+    records = []
+    for i in range(HISTORICAL_START_INDEX, HISTORICAL_START_INDEX + TARGET_OHLC_COUNT):
+        k = str(i)
+        if k in raw_data and isinstance(raw_data[k], dict) and "date" in raw_data[k]:
+            records.append(raw_data[k])
+    return records
+
+
+def _merge_and_sort_records(
+    existing_records: list[dict],
+    df: pd.DataFrame,
+    calendar: MarketCalendar,
+    now_ist: datetime,
+) -> list[dict]:
+    """Combines existing records with downloaded dataframe, deduplicating strictly by normalized YYYY-MM-DD date."""
+    date_map = {}
+
+    # 1. Ingest existing Firebase historical records
+    for r in existing_records:
+        raw_d = r.get("date")
+        iso_d = _normalize_to_iso_date(raw_d)
+        if iso_d:
+            r_copy = dict(r)
+            r_copy["date"] = iso_d
+            r_copy["open"] = _clean_price(r_copy.get("open"))
+            r_copy["high"] = _clean_price(r_copy.get("high"))
+            r_copy["low"] = _clean_price(r_copy.get("low"))
+            r_copy["close"] = _clean_price(r_copy.get("close"))
+
+            vol_raw = r_copy.get("volume", 0)
+            try:
+                if pd.notnull(vol_raw):
+                    vol_float = float(vol_raw)
+                    r_copy["volume"] = 0 if (math.isnan(vol_float) or math.isinf(vol_float)) else int(vol_float)
+                else:
+                    r_copy["volume"] = 0
+            except (ValueError, TypeError):
+                r_copy["volume"] = 0
+
+            date_map[iso_d] = r_copy
+
+    # 2. Ingest and normalize new rows from Yahoo DataFrame
+    if df is not None and not df.empty:
+        df_clean = df.copy()
+        if isinstance(df_clean.columns, pd.MultiIndex):
+            df_clean.columns = df_clean.columns.get_level_values(0)
+        df_clean.columns = [str(c).strip().lower() for c in df_clean.columns]
+
+        for _, row in df_clean.iterrows():
+            row_date = row.get("date")
+            d_str = _normalize_to_iso_date(row_date)
+
+            if not d_str:
+                continue
+
+            vol_raw = row.get("volume", 0)
+            try:
+                if pd.notnull(vol_raw):
+                    vol_float = float(vol_raw)
+                    volume_val = 0 if (math.isnan(vol_float) or math.isinf(vol_float)) else int(vol_float)
+                else:
+                    volume_val = 0
+            except (ValueError, TypeError):
+                volume_val = 0
+
+            date_map[d_str] = {
+                "date": d_str,
+                "open": _clean_price(row.get("open")),
+                "high": _clean_price(row.get("high")),
+                "low": _clean_price(row.get("low")),
+                "close": _clean_price(row.get("close")),
+                "volume": volume_val,
+            }
+
+    # 3. Exclude ongoing session from historical series (1-250) during live market hours
+    today_date = now_ist.date()
+    if calendar.is_trading_day(today_date):
+        status, _ = calendar.get_market_status(now_ist)
+        if status in ("LIVE", "PRE_OPEN"):
+            today_str = today_date.strftime("%Y-%m-%d")
+            if today_str in date_map:
+                del date_map[today_str]
+
+    # 4. Strictly sort newest to oldest by ISO YYYY-MM-DD
+    sorted_dates = sorted(date_map.keys(), reverse=True)
+    return [date_map[d] for d in sorted_dates]
+
+
+def validate_historical_payload(payload: dict[str, dict]) -> tuple[bool, str]:
+    """Validates sequential keys starting at HISTORICAL_START_INDEX, price integrity, and descending dates."""
+    count = len(payload)
+    if count == 0:
+        return False, "Historical payload is completely empty"
+    if count > TARGET_OHLC_COUNT:
+        return False, f"Payload count {count} exceeds limit {TARGET_OHLC_COUNT}"
+
+    dates_seen = []
+    for i in range(HISTORICAL_START_INDEX, HISTORICAL_START_INDEX + count):
+        k = str(i)
+        if k not in payload:
+            return False, f"Missing contiguous historical sequential index '{k}'"
+
+        bar = payload[k]
+        for field in ("date", "open", "high", "low", "close"):
+            if field not in bar or bar[field] is None:
+                return False, f"Index {k} missing required field '{field}'"
+
+        try:
+            o, h, l, c = float(bar["open"]), float(bar["high"]), float(bar["low"]), float(bar["close"])
+            if any(math.isnan(x) or math.isinf(x) for x in (o, h, l, c)):
+                return False, f"Index {k} contains NaN or Infinity values"
+        except (ValueError, TypeError):
+            return False, f"Index {k} contains non-numeric values"
+
+        if o <= 0 or h <= 0 or l <= 0 or c <= 0:
+            return False, f"Index {k} has non-positive price (O={o}, H={h}, L={l}, C={c})"
+
+        if (h < l) or (h < max(o, c) - 0.05) or (l > min(o, c) + 0.05):
+            return False, f"Index {k} OHLC boundary violation (O={o}, H={h}, L={l}, C={c})"
+
+        d_str = str(bar["date"])
+        try:
+            d_val = datetime.strptime(d_str, "%Y-%m-%d").date()
+        except ValueError:
+            return False, f"Index {k} has invalid date format: {d_str}"
+
+        if dates_seen and d_val >= dates_seen[-1]:
+            return False, f"Index {k} date {d_val} is not strictly older than {dates_seen[-1]}"
+
+        dates_seen.append(d_val)
+
+    return True, "Valid"
+
+
+def sync_historical_script(
+    display_name: str,
+    ticker: str,
+    gap_trading_days: int = 0,
+    calendar: MarketCalendar = None,
+) -> tuple[bool, str]:
     """
     Coordinates historical catch-up and returns live-readiness status:
     - Returns (True, msg) if stock is safe for live updates (VERIFIED or VENDOR_LAG with valid baseline).
@@ -119,9 +312,13 @@ def sync_historical_script(display_name: str, ticker: str, gap_trading_days: int
         # ---------------------------------------------------------------------
         # 5. Handle VENDOR_LAG: Decouple Live Permission & Support Initial Bootstrap
         # ---------------------------------------------------------------------
-        valid_existing, _ = validate_historical_payload(
-            {str(idx + HISTORICAL_START_INDEX): c for idx, c in enumerate(existing_records)}
-        ) if existing_records else (False, "No records")
+        valid_existing, _ = (
+            validate_historical_payload(
+                {str(idx + HISTORICAL_START_INDEX): c for idx, c in enumerate(existing_records)}
+            )
+            if existing_records
+            else (False, "No records")
+        )
 
         # Condition A: Preserved valid baseline exists in Firebase
         if valid_existing:
@@ -153,142 +350,3 @@ def sync_historical_script(display_name: str, ticker: str, gap_trading_days: int
     except Exception as e:
         logger.error(f"[{display_name}] Internal sync exception: {e}", exc_info=True)
         return False, f"Exception: {str(e)}"
-
-
-def _parse_firebase_historical_records(raw_data) -> list[dict]:
-    """Extracts only historical keys starting at HISTORICAL_START_INDEX up to TARGET_OHLC_COUNT, discarding '0'."""
-    if not raw_data or not isinstance(raw_data, dict):
-        return []
-    records = []
-    for i in range(HISTORICAL_START_INDEX, HISTORICAL_START_INDEX + TARGET_OHLC_COUNT):
-        k = str(i)
-        if k in raw_data and isinstance(raw_data[k], dict) and "date" in raw_data[k]:
-            records.append(raw_data[k])
-    return records
-
-def _normalize_to_iso_date(val) -> str:
-    """Safely converts timestamps, dates, or non-ISO strings (e.g. 08.09.2026) to YYYY-MM-DD."""
-    if val is None or pd.isna(val):
-        return ""
-    if isinstance(val, (date, datetime)):
-        return val.strftime("%Y-%m-%d")
-    
-    s = str(val).strip()
-    if not s or s.lower() == "nan":
-        return ""
-
-    # Common date formats returned across Pandas/yfinance versions
-    for fmt in ("%Y-%m-%d", "%d.%m.%Y", "%d-%m-%Y", "%Y.%m.%d", "%d/%m/%Y"):
-        try:
-            return datetime.strptime(s, fmt).strftime("%Y-%m-%d")
-        except ValueError:
-            continue
-
-    # Fallback to pandas date parser if string pattern is non-standard
-    try:
-        parsed = pd.to_datetime(s, errors="coerce")
-        if pd.notnull(parsed):
-            return parsed.strftime("%Y-%m-%d")
-    except Exception:
-        pass
-
-    return s
-
-
-def _merge_and_sort_records(existing_records: list[dict], df: pd.DataFrame, calendar: MarketCalendar, now_ist: datetime) -> list[dict]:
-    """Combines existing records with downloaded dataframe, deduplicating strictly by normalized YYYY-MM-DD date."""
-    date_map = {}
-    
-    # 1. Ingest existing Firebase historical records
-    for r in existing_records:
-        raw_d = r.get("date")
-        iso_d = _normalize_to_iso_date(raw_d)
-        if iso_d:
-            r_copy = dict(r)
-            r_copy["date"] = iso_d
-            date_map[iso_d] = r_copy
-
-    # 2. Ingest and normalize new rows from Yahoo DataFrame
-    if df is not None and not df.empty:
-        df_clean = df.copy()
-        if isinstance(df_clean.columns, pd.MultiIndex):
-            df_clean.columns = df_clean.columns.get_level_values(0)
-        df_clean.columns = [str(c).strip().lower() for c in df_clean.columns]
-
-        for _, row in df_clean.iterrows():
-            row_date = row.get("date")
-            d_str = _normalize_to_iso_date(row_date)
-
-            if not d_str:
-                continue
-
-            vol_raw = row.get("volume", 0)
-            try:
-                volume_val = int(vol_raw) if pd.notnull(vol_raw) else 0
-            except (ValueError, TypeError):
-                volume_val = 0
-
-            date_map[d_str] = {
-                "date": d_str,
-                "open": round(float(row.get("open", 0.0)), 2),
-                "high": round(float(row.get("high", 0.0)), 2),
-                "low": round(float(row.get("low", 0.0)), 2),
-                "close": round(float(row.get("close", 0.0)), 2),
-                "volume": volume_val
-            }
-
-    # 3. Exclude ongoing session from historical series (1-250) during live market hours
-    today_date = now_ist.date()
-    if calendar.is_trading_day(today_date):
-        status, _ = calendar.get_market_status(now_ist)
-        if status in ("LIVE", "PRE_OPEN"):
-            today_str = today_date.strftime("%Y-%m-%d")
-            if today_str in date_map:
-                del date_map[today_str]
-
-    # 4. Strictly sort newest to oldest by ISO YYYY-MM-DD
-    sorted_dates = sorted(date_map.keys(), reverse=True)
-    return [date_map[d] for d in sorted_dates]
-
-def validate_historical_payload(payload: dict[str, dict]) -> tuple[bool, str]:
-    """Validates sequential keys starting at HISTORICAL_START_INDEX, price integrity, and descending dates."""
-    count = len(payload)
-    if count == 0:
-        return False, "Historical payload is completely empty"
-    if count > TARGET_OHLC_COUNT:
-        return False, f"Payload count {count} exceeds limit {TARGET_OHLC_COUNT}"
-
-    dates_seen = []
-    for i in range(HISTORICAL_START_INDEX, HISTORICAL_START_INDEX + count):
-        k = str(i)
-        if k not in payload:
-            return False, f"Missing contiguous historical sequential index '{k}'"
-
-        bar = payload[k]
-        for field in ("date", "open", "high", "low", "close"):
-            if field not in bar or bar[field] is None:
-                return False, f"Index {k} missing required field '{field}'"
-
-        try:
-            o, h, l, c = float(bar["open"]), float(bar["high"]), float(bar["low"]), float(bar["close"])
-        except (ValueError, TypeError):
-            return False, f"Index {k} contains non-numeric values"
-
-        if o <= 0 or h <= 0 or l <= 0 or c <= 0:
-            return False, f"Index {k} has non-positive price (O={o}, H={h}, L={l}, C={c})"
-
-        if (h < l) or (h < max(o, c) - 0.05) or (l > min(o, c) + 0.05):
-            return False, f"Index {k} OHLC boundary violation (O={o}, H={h}, L={l}, C={c})"
-
-        d_str = str(bar["date"])
-        try:
-            d_val = datetime.strptime(d_str, "%Y-%m-%d").date()
-        except ValueError:
-            return False, f"Index {k} has invalid date format: {d_str}"
-
-        if dates_seen and d_val >= dates_seen[-1]:
-            return False, f"Index {k} date {d_val} is not strictly older than {dates_seen[-1]}"
-
-        dates_seen.append(d_val)
-
-    return True, "Valid"
