@@ -5,12 +5,11 @@ MASTER ORCHESTRATOR
 - SR Flip-Flop Power Latch (Default: ON).
 - Handles external 30-second pulse commands: /start, /stop, /sync.
 - Embedded HTTP Server on $PORT with minimal /health, GET, and HEAD handling for Render & cron-job.org.
-- State-driven date planning (auto-adjusts if restarted or offline at midnight).
 - Pre-market sync window (08:00–08:30 IST) with 5-minute retry intervals.
-- Index-0 Persistence: Index 0 is never cleared; it retains its final closing value overnight.
+- Index-0 Persistence: Index 0 retains its final closing value overnight.
 - Per-script live quarantine: Unsynced stocks are isolated by Child-2.
-- Parameter Engine: Computes indicators every 15 minutes during LIVE sessions.
-- Market Close Snapshot: Executes final parameter calculation at 15:30 IST.
+- 15:30 IST Market Close Engine: Forces final closing live tick to Index 0, 
+  followed immediately by closing parameter calculation.
 """
 import os
 import sys
@@ -21,7 +20,6 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 from datetime import datetime, date, time as dt_time
 import pytz
 
-# Resolve PORT directly from the cloud environment (Render defaults to 10000)
 PORT = int(os.environ.get("PORT", 10000))
 
 from config import (
@@ -59,7 +57,6 @@ from parameter import update_all_parameters
 IST = pytz.timezone(TIMEZONE)
 _keep_running = True
 
-# Static fallback map in case detailedDb network lookup encounters an empty node
 FALLBACK_TICKER_MAP = {
     "Bharat Electron": "BEL.NS",
     "Caplin Point Lab": "CAPLIPOINT.NS",
@@ -87,7 +84,7 @@ FALLBACK_TICKER_MAP = {
 class SystemStateBus:
     def __init__(self):
         self.lock = threading.Lock()
-        self.power_latched_on = True  # Default state: ON
+        self.power_latched_on = True
         self.pulse_sync_time = 0.0
 
     def trigger_pulse(self, command: str):
@@ -107,7 +104,7 @@ class SystemStateBus:
         now = time.time()
         with self.lock:
             if (now - self.pulse_sync_time) <= PULSE_VALIDITY_SEC:
-                self.pulse_sync_time = 0.0  # Clear momentary pulse
+                self.pulse_sync_time = 0.0
                 return True
         return False
 
@@ -155,7 +152,6 @@ class PulseCommandServer(BaseHTTPRequestHandler):
         self.wfile.write(payload)
 
     def log_message(self, format, *args):
-        # Suppress standard ping spam in Render application logs
         pass
 
 
@@ -207,15 +203,12 @@ class MasterOrchestrator:
         with fallback to /param/<stock_name>/TICKER and local map.
         """
         try:
-            # 1. Inspect the detailedDb record for the specific stock
             stock_info = db.reference(f"watchlist/detailedDb/{stock_name}").get() or {}
 
-            # Check explicit TICKER field first (e.g., "BEL.NS")
             ticker = stock_info.get("TICKER") or stock_info.get("ticker")
             if ticker:
                 return str(ticker).strip()
 
-            # Check NSE code (e.g., "BEL") or general CODE
             nse_code = stock_info.get("NSE") or stock_info.get("CODE") or stock_info.get("code")
             if nse_code:
                 clean_code = str(nse_code).strip().upper()
@@ -224,7 +217,6 @@ class MasterOrchestrator:
         except Exception as e:
             logger.warning(f"[{stock_name}] detailedDb ticker lookup warning: {e}")
 
-        # 2. Check /param node in Firebase as second dynamic source
         try:
             stored_ticker = db.reference(f"param/{stock_name}/TICKER").get()
             if stored_ticker:
@@ -232,14 +224,12 @@ class MasterOrchestrator:
         except Exception:
             pass
 
-        # 3. Static fallback map
         if stock_name in FALLBACK_TICKER_MAP:
             return FALLBACK_TICKER_MAP[stock_name]
 
         return stock_name if ("." in stock_name or "^" in stock_name) else f"{stock_name.replace(' ', '')}.NS"
 
     def _purge_stocks_garbage(self, active_stock_set: set):
-        """Purges orphaned keys in /stocks that no longer exist in watchlist."""
         try:
             stocks_node = db.reference("stocks").get() or {}
             if isinstance(stocks_node, dict):
@@ -251,7 +241,6 @@ class MasterOrchestrator:
             logger.error(f"[PURGE-STOCKS] Error clearing /stocks node: {e}", exc_info=True)
 
     def _purge_param_garbage(self, active_stock_set: set):
-        """Purges orphaned keys in /param that no longer exist in watchlist."""
         try:
             param_node = db.reference("param").get() or {}
             if isinstance(param_node, dict):
@@ -264,15 +253,13 @@ class MasterOrchestrator:
             logger.error(f"[PURGE-PARAM] Error clearing /param node: {e}", exc_info=True)
 
     def purge_all_garbage(self, active_stock_set: set):
-        """Coordinates instant dual-node cleanup across /stocks and /param."""
         if not active_stock_set:
-            logger.warning("[SAFETY LOCK] Active stock set is empty. Skipping purge to prevent data loss.")
+            logger.warning("[SAFETY LOCK] Active stock set is empty. Skipping purge.")
             return
         self._purge_stocks_garbage(active_stock_set)
         self._purge_param_garbage(active_stock_set)
 
     def replan_daily_routine(self):
-        """Synchronizes stocklist with watchlist, executes garbage purges, and resolves tickers."""
         now_ist = datetime.now(IST)
         today = now_ist.date()
         self.calendar.refresh_calendar()
@@ -280,16 +267,14 @@ class MasterOrchestrator:
         self.is_today_trading_day = self.calendar.is_trading_day(today)
         self.last_planned_date = today
         self.sync_audit_reported_today = False
-        self.final_param_calculated_today = False  # Reset daily market close latch
+        self.final_param_calculated_today = False
 
-        # Reconcile stocklist using watchlist as absolute master
         _, active_map = reconcile_stocklist_with_watchlist()
         if not active_map:
             logger.warning("[PLANNER] Watchlist reconciliation returned 0 active stocks.")
         else:
             self.purge_all_garbage(set(active_map.keys()))
 
-        # Rebuild per-script tracking status using detailedDb resolved tickers
         new_status = {}
         for name in active_map.keys():
             ticker = self.resolve_ticker_for_stock(name)
@@ -309,7 +294,6 @@ class MasterOrchestrator:
         logger.info(f"[PLANNER] Day plan for {today} IST initialized: {status_label} ({len(self.script_status)} stocks)")
 
     def _calculate_script_gap(self, name: str, ticker: str) -> int:
-        """Determines missing historical trading sessions."""
         existing = get_stock_ohlc(name)
         if not existing:
             return TARGET_OHLC_COUNT
@@ -330,9 +314,8 @@ class MasterOrchestrator:
         return self.calendar.get_trading_day_gap(fb_date, latest_yahoo)
 
     def execute_historical_sync(self, is_manual: bool = False):
-        """Runs CHILD-1 historical sync under mutex lock to avoid duplicate workers."""
         if not self.sync_lock.acquire(blocking=False):
-            logger.info("[CHILD-1] Historical sync already in progress. Skipping duplicate execution.")
+            logger.info("[CHILD-1] Historical sync already in progress. Skipping duplicate.")
             return
 
         try:
@@ -390,7 +373,6 @@ class MasterOrchestrator:
                 logger.error(f"[CHILD-2] Live tick failed for [{name}]: {e}", exc_info=True)
 
     def log_detailed_sync_audit(self):
-        """Outputs pre-market verification results."""
         synced = [k for k, v in self.script_status.items() if v.get("synced")]
         unsynced = [k for k, v in self.script_status.items() if not v.get("synced")]
 
@@ -419,13 +401,11 @@ class MasterOrchestrator:
         logger.info("NSE EQUITY OHLC DATABASE MAINTENANCE ACTIVE")
         logger.info("==================================================")
 
-        # 1. Initial boot planning and baseline stocklist reconciliation
         try:
             self.replan_daily_routine()
         except Exception as e:
             logger.error(f"[STARTUP] Initial plan error: {e}", exc_info=True)
 
-        # 2. Autonomous Boot Worker
         def boot_worker():
             logger.info("[STARTUP] Running initial historical sync...")
             try:
@@ -441,7 +421,6 @@ class MasterOrchestrator:
 
         threading.Thread(target=boot_worker, daemon=True).start()
 
-        # 3. Main Operational Dispatch Loop
         while _keep_running:
             try:
                 if not STATE_BUS.is_power_on():
@@ -452,11 +431,11 @@ class MasterOrchestrator:
                 today_date = now_ist.date()
                 now_time = now_ist.time()
 
-                # Priority 0: Difference Detection (Watchlist vs Stocklist) & Instant Sweep
+                # Priority 0: Difference Detection
                 try:
                     was_updated, active_map = reconcile_stocklist_with_watchlist()
                     if was_updated:
-                        logger.info("[HEARTBEAT] Watchlist change detected. Purging garbage & reconciling...")
+                        logger.info("[HEARTBEAT] Watchlist change detected. Reconciling...")
                         self.purge_all_garbage(set(active_map.keys()))
                         self.replan_daily_routine()
                         self.execute_historical_sync(is_manual=False)
@@ -488,7 +467,6 @@ class MasterOrchestrator:
                         self.execute_historical_sync(is_manual=False)
                         self.last_sync_attempt_time = time.time()
 
-                # Audit Report at or after 08:30 IST
                 if now_time >= sync_cutoff and not self.sync_audit_reported_today:
                     self.log_detailed_sync_audit()
                     self.sync_audit_reported_today = True
@@ -511,7 +489,9 @@ class MasterOrchestrator:
                             update_all_parameters(active_synced)
                         self.last_param_calc_time = time.time()
 
-                # Priority 5: Post-Market Parameter Calculation (15:30 IST Closing Snapshot)
+                # Priority 5: Post-Market Final Closing Sweep (15:30 IST)
+                # 1. Pulls final closing tick to Index 0
+                # 2. Immediately computes and saves closing parameters
                 if (
                     self.is_today_trading_day
                     and now_time >= dt_time(15, 30)
@@ -520,17 +500,23 @@ class MasterOrchestrator:
                 ):
                     active_synced = [name for name, meta in self.script_status.items() if meta["synced"]]
                     if active_synced:
-                        logger.info(
-                            f"[MARKET CLOSE 15:30] Market closed. Executing final post-closing "
-                            f"parameter calculation across {len(active_synced)} stocks..."
-                        )
+                        logger.info("[MARKET CLOSE 15:30] Executing final closing live update to seal Index 0...")
                         try:
+                            # 1. Update Index 0 with final 15:30 closing tick
+                            self.execute_live_updates()
+                            self.last_live_update_time = time.time()
+                            logger.info("[MARKET CLOSE 15:30] Final Index 0 update complete.")
+
+                            # 2. Immediately run parameters on finalized Index 0
+                            logger.info(f"[MARKET CLOSE 15:30] Executing final parameter calculation across {len(active_synced)} stocks...")
                             update_all_parameters(active_synced)
+                            
+                            # 3. Latch complete for the day
                             self.final_param_calculated_today = True
                             self.last_param_calc_time = time.time()
-                            logger.info("[MARKET CLOSE 15:30] Final parameters calculated successfully.")
+                            logger.info("[MARKET CLOSE 15:30] Final parameters calculated and saved successfully.")
                         except Exception as e:
-                            logger.error(f"[MARKET CLOSE 15:30] Error during final parameter calculation: {e}", exc_info=True)
+                            logger.error(f"[MARKET CLOSE 15:30] Error during closing sweep: {e}", exc_info=True)
 
                 time.sleep(HEARTBEAT_TICK_SEC)
 
