@@ -10,6 +10,8 @@ MASTER ORCHESTRATOR
 - Per-script live quarantine: Unsynced stocks are isolated by Child-2.
 - 15:30 IST Market Close Engine: Forces final closing live tick to Index 0, 
   followed immediately by closing parameter calculation.
+- Reactive Watchlist Ingestion: When a new script is detected, /stocklist updates,
+  OHLC data (/stocks) is fetched, and technical parameters (/param) are calculated immediately.
 """
 import os
 import sys
@@ -313,20 +315,31 @@ class MasterOrchestrator:
 
         return self.calendar.get_trading_day_gap(fb_date, latest_yahoo)
 
-    def execute_historical_sync(self, is_manual: bool = False):
+    def execute_historical_sync(self, is_manual: bool = False, target_scripts: list[str] = None) -> list[str]:
+        """
+        Runs CHILD-1 historical sync under mutex lock.
+        Returns a list of script names that successfully synchronized during this run.
+        """
         if not self.sync_lock.acquire(blocking=False):
             logger.info("[CHILD-1] Historical sync already in progress. Skipping duplicate.")
-            return
+            return []
 
+        synced_in_this_pass = []
         try:
             now_str = datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S")
+            candidates = target_scripts if target_scripts is not None else list(self.script_status.keys())
 
-            for name, meta in list(self.script_status.items()):
+            for name in candidates:
                 if not _keep_running:
                     break
                 if not STATE_BUS.is_power_on() and not is_manual:
                     break
-                if meta["synced"] and not is_manual:
+
+                meta = self.script_status.get(name)
+                if not meta:
+                    continue
+
+                if meta["synced"] and not is_manual and target_scripts is None:
                     continue
 
                 meta["last_attempt_at"] = now_str
@@ -338,6 +351,7 @@ class MasterOrchestrator:
                         meta["synced"] = True
                         meta["error"] = None
                         logger.info(f"[{name}] Index 1 matches latest exchange session (Gap=0). Synced.")
+                        synced_in_this_pass.append(name)
                         continue
 
                     success, msg = sync_historical_script(name, ticker, gap_trading_days=gap, calendar=self.calendar)
@@ -345,6 +359,7 @@ class MasterOrchestrator:
                         meta["synced"] = True
                         meta["error"] = None
                         logger.info(f"[{name}] Sync successful: {msg}")
+                        synced_in_this_pass.append(name)
                     else:
                         meta["synced"] = False
                         meta["error"] = msg
@@ -356,6 +371,8 @@ class MasterOrchestrator:
                     logger.error(f"Fault isolation caught error for [{name}]: {e}", exc_info=True)
         finally:
             self.sync_lock.release()
+
+        return synced_in_this_pass
 
     def execute_live_updates(self):
         """Runs CHILD-2 intraday candle updater for synchronized stocks."""
@@ -409,11 +426,10 @@ class MasterOrchestrator:
         def boot_worker():
             logger.info("[STARTUP] Running initial historical sync...")
             try:
-                self.execute_historical_sync(is_manual=False)
-                synced = [name for name, meta in self.script_status.items() if meta.get("synced")]
-                if synced:
-                    logger.info(f"[STARTUP] Calculating technical parameters for {len(synced)} synced stocks...")
-                    update_all_parameters(synced)
+                synced_scripts = self.execute_historical_sync(is_manual=False)
+                if synced_scripts:
+                    logger.info(f"[STARTUP] Calculating technical parameters for {len(synced_scripts)} synced stocks...")
+                    update_all_parameters(synced_scripts)
                     self.last_param_calc_time = time.time()
                     logger.info("[STARTUP] Initial parameters calculated successfully.")
             except Exception as e:
@@ -431,21 +447,40 @@ class MasterOrchestrator:
                 today_date = now_ist.date()
                 now_time = now_ist.time()
 
-                # Priority 0: Difference Detection
+                # Priority 0: Difference Detection (Watchlist vs Stocklist)
                 try:
                     was_updated, active_map = reconcile_stocklist_with_watchlist()
                     if was_updated:
                         logger.info("[HEARTBEAT] Watchlist change detected. Reconciling...")
-                        self.purge_all_garbage(set(active_map.keys()))
+                        old_scripts = set(self.script_status.keys())
+                        current_scripts = set(active_map.keys())
+                        newly_added_scripts = list(current_scripts - old_scripts)
+
+                        self.purge_all_garbage(current_scripts)
                         self.replan_daily_routine()
-                        self.execute_historical_sync(is_manual=False)
+
+                        # If new scripts were added, sync their OHLC and immediately compute parameters
+                        if newly_added_scripts:
+                            logger.info(f"[RECONCILE] Discovered {len(newly_added_scripts)} newly added scripts: {newly_added_scripts}")
+                            synced_new = self.execute_historical_sync(is_manual=True, target_scripts=newly_added_scripts)
+                            
+                            if synced_new:
+                                logger.info(f"[PARAM ENGINE] Immediately computing technical parameters for newly added scripts: {synced_new}")
+                                update_all_parameters(synced_new)
+                                logger.info(f"[PARAM ENGINE] Successfully populated /param for {synced_new}.")
+                        else:
+                            # Standard historical catch-up
+                            self.execute_historical_sync(is_manual=False)
                 except Exception as e:
                     logger.error(f"[HEARTBEAT] Watchlist reconciliation error: {e}")
 
                 # Priority 1: External Manual Sync Pulse Override
                 if STATE_BUS.check_and_clear_manual_sync():
                     logger.info("[OVERRIDE PULSE] Immediate sync commanded. Running CHILD-1...")
-                    self.execute_historical_sync(is_manual=True)
+                    synced_all = self.execute_historical_sync(is_manual=True)
+                    if synced_all:
+                        logger.info(f"[PARAM ENGINE] Updating parameters post-manual sync for: {synced_all}")
+                        update_all_parameters(synced_all)
                     continue
 
                 # Priority 2: Midnight / State-Driven Date Catch-Up
@@ -464,7 +499,9 @@ class MasterOrchestrator:
                     has_unsynced = any(not s["synced"] for s in self.script_status.values())
                     if has_unsynced and (time.time() - self.last_sync_attempt_time >= SYNC_RETRY_INTERVAL_SEC):
                         logger.info("[SCHEDULE] Pre-market sync window active. Retrying unsynced stocks...")
-                        self.execute_historical_sync(is_manual=False)
+                        synced_retries = self.execute_historical_sync(is_manual=False)
+                        if synced_retries:
+                            update_all_parameters(synced_retries)
                         self.last_sync_attempt_time = time.time()
 
                 if now_time >= sync_cutoff and not self.sync_audit_reported_today:
@@ -490,8 +527,6 @@ class MasterOrchestrator:
                         self.last_param_calc_time = time.time()
 
                 # Priority 5: Post-Market Final Closing Sweep (15:30 IST)
-                # 1. Pulls final closing tick to Index 0
-                # 2. Immediately computes and saves closing parameters
                 if (
                     self.is_today_trading_day
                     and now_time >= dt_time(15, 30)
