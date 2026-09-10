@@ -190,6 +190,15 @@ class MasterOrchestrator:
         # Per-script dictionary holding operational state
         self.script_status = {}
 
+    def _get_reconciled_stock_map(self) -> dict:
+        """Helper to unpack reconcile_stocklist_with_watchlist safely whether it returns dict or tuple."""
+        result = reconcile_stocklist_with_watchlist()
+        if isinstance(result, tuple):
+            return result[0] if len(result) > 0 and isinstance(result[0], dict) else {}
+        elif isinstance(result, dict):
+            return result
+        return {}
+
     def run(self):
         logger.info("==================================================")
         logger.info("NSE EQUITY OHLC DATABASE MAINTENANCE ACTIVE")
@@ -289,8 +298,8 @@ class MasterOrchestrator:
         self.sync_audit_reported_today = False
         self.post_market_calc_done = False
 
-        # Reconcile /stocklist directly from /watchlist (Read-only on master)
-        stock_map = reconcile_stocklist_with_watchlist()
+        # Safe unpack of reconciled stock dictionary
+        stock_map = self._get_reconciled_stock_map()
         if not stock_map:
             logger.warning("[SAFETY] Watchlist reconciliation returned 0 stocks. Historical data preserved.")
             return
@@ -315,7 +324,7 @@ class MasterOrchestrator:
     def execute_historical_sync(self, is_manual: bool = False):
         """Executes CHILD-1 historical sync across registered stocks."""
         logger.info(f"[SYNC] Starting historical sync cycle (Manual={is_manual})...")
-        stock_map = reconcile_stocklist_with_watchlist()
+        stock_map = self._get_reconciled_stock_map()
 
         for name, ticker in stock_map.items():
             if not _keep_running:
@@ -325,7 +334,6 @@ class MasterOrchestrator:
                 gap = TARGET_OHLC_COUNT
 
                 if existing_ohlc:
-                    # Check gap between Firebase index 1 (completed historical) and Yahoo
                     idx1 = existing_ohlc.get("1") if isinstance(existing_ohlc, dict) else None
                     if idx1 and "date" in idx1:
                         fb_date = datetime.strptime(str(idx1["date"]), "%Y-%m-%d").date()
