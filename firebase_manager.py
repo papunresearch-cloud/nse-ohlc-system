@@ -19,6 +19,96 @@ from config import (
     TARGET_OHLC_COUNT
 )
 
+# ==========================================
+# PERMANENT MASTER INDICES (Immune to deletion)
+# ==========================================
+FIXED_INDICES = {
+    "NIFTY50": "^NSEI",
+    "NIFTY100": "^CNX100",
+    "NIFTY MIDCAP 150": "NIFTYMIDCAP150.NS",
+    "NIFTY SMALLCAP 250": "NIFTYSMLCAP250.NS"
+}
+```[cite: 5, 7]
+
+---
+
+### Step 2: Replace `get_stocklist_mapping()`
+Locate `def get_stocklist_mapping()` in `firebase_manager.py` and **replace the entire function** with the following code[cite: 1]:
+
+```python
+def get_stocklist_mapping() -> dict[str, str]:
+    """
+    Returns the active target dictionary:
+    1. Permanently anchors the 4 core indices (never deleted).
+    2. Dynamically pulls active stocks from /watchlist and /detailedDb.
+    """
+    init_firebase()
+    
+    # 1. Start with the permanent, immutable indices
+    mapping = dict(FIXED_INDICES)
+
+    try:
+        watchlist_root = db.reference("watchlist").get() or {}
+
+        # Extract active stock names
+        raw_names = []
+        detailed_db = {}
+        if isinstance(watchlist_root, dict):
+            raw_names = watchlist_root.get("watchlist", [])
+            detailed_db = watchlist_root.get("detailedDb", {})
+        elif isinstance(watchlist_root, list):
+            raw_names = watchlist_root
+
+        if not detailed_db:
+            detailed_db = db.reference("detailedDb").get() or {}
+
+        active_names = []
+        if isinstance(raw_names, dict):
+            active_names = [str(v).strip() for v in raw_names.values() if v]
+        elif isinstance(raw_names, list):
+            active_names = [str(v).strip() for v in raw_names if v]
+
+        param_db = db.reference("param").get() or {}
+
+        # Resolve tickers for watchlist stocks
+        for name in active_names:
+            sanitized_name = name.replace(".", "_")
+            stock_info = detailed_db.get(name) or detailed_db.get(sanitized_name) or param_db.get(name) or {}
+            ticker = stock_info.get("TICKER") or stock_info.get("ticker") or stock_info.get("Ticker")
+
+            if not ticker:
+                code_val = stock_info.get("CODE") or stock_info.get("NSE") or stock_info.get("code") or stock_info.get("nse")
+                if code_val:
+                    ticker = f"{str(code_val).strip()}.NS"
+
+            if ticker:
+                t = str(ticker).strip()
+                if t.upper() == "^NESI":
+                    t = "^NSEI"
+                mapping[name] = t
+            else:
+                logger.warning(f"[DISCOVERY] No TICKER found for '{name}'")
+
+        logger.info(f"[DISCOVERY] Active targets loaded: {len(mapping)} (4 permanent indices + {len(mapping) - 4} stocks)")
+        return mapping
+
+    except Exception as e:
+        logger.error(f"[DISCOVERY] Error building target mapping: {e}", exc_info=True)
+        # Even on Firebase watchlist failure, return the 4 indices so they continue running
+        return mapping
+```[cite: 1]
+
+---
+
+### Step 3: Modify the Garbage Collector (Immunity Protection)
+In the same file (`firebase_manager.py`), locate `_purge_stocks_garbage` and/or `_purge_param_garbage` (or wherever node deletion occurs)[cite: 6]. 
+
+**Modify** the active set check so the 4 indices are never marked as orphaned or deleted[cite: 3, 6]:
+
+* **Find:**
+  ```python
+  active_stocks = set(get_stocklist_mapping().keys())
+
 # =====================================================================
 # 1. CENTRALIZED FIREBASE INITIALIZATION
 # =====================================================================
