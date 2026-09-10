@@ -3,9 +3,9 @@ MASTER / MOTHER PROGRAM (nse_ohlc_system)
 - Priority 0: Watchlist is absolute master. Stocklist is continuously synchronized.
 - Never mutates or deletes from /watchlist or /watchlist/detailedDb.
 - Guarded OHLC protection: Stocks present in /watchlist are never purged.
-- SR Flip-Flop Power Latch (Default: ON).
-- External pulse commands: /start, /stop, /sync.
-- Embedded HTTP Server with full CORS, /health status reporting, and HEAD handling.
+- Always ON autonomous state (runs autonomously during pre-market and market hours).
+- External pulse commands: /sync (for manual historical catchup).
+- Embedded HTTP Server for Render port binding, CORS, and uptime keep-alive pings.
 - Pre-market sync window (08:00–08:30 IST) with retry intervals.
 - Index 0 remains safe overnight (Never deleted).
 - Parameter Engine: Computes indicators every 15 minutes during LIVE sessions.
@@ -58,49 +58,35 @@ _keep_running = True
 
 
 # =====================================================================
-# HARDWARE-STYLE FLIP-FLOP & PULSE BUS
+# SYNC PULSE BUS
 # =====================================================================
 class SystemStateBus:
     def __init__(self):
         self.lock = threading.Lock()
-        self.power_latched_on = True  # Default: ON
         self.pulse_sync_time = 0.0
 
-    def trigger_pulse(self, command: str):
-        now = time.time()
+    def trigger_sync_pulse(self):
         with self.lock:
-            if command == "START":
-                self.power_latched_on = True
-                logger.info("[SIGNAL] START pulse captured -> Flip-flop latched ON.")
-            elif command == "STOP":
-                self.power_latched_on = False
-                logger.warning("[SIGNAL] STOP pulse captured -> Flip-flop latched OFF. Core loop idle.")
-            elif command == "SYNC":
-                self.pulse_sync_time = now
-                logger.info("[SIGNAL] MANUAL SYNC pulse captured -> Immediate sync scheduled.")
+            self.pulse_sync_time = time.time()
+            logger.info("[SIGNAL] MANUAL SYNC pulse captured -> Immediate sync scheduled.")
 
     def check_and_clear_manual_sync(self) -> bool:
         now = time.time()
         with self.lock:
             if (now - self.pulse_sync_time) <= PULSE_VALIDITY_SEC:
-                self.pulse_sync_time = 0.0  # Clear momentary pulse
+                self.pulse_sync_time = 0.0
                 return True
         return False
-
-    def is_power_on(self) -> bool:
-        with self.lock:
-            return self.power_latched_on
 
 
 STATE_BUS = SystemStateBus()
 
 
 # =====================================================================
-# HTTP PULSE RECEIVER & HEALTH SERVER (WITH CORS & STATUS MONITORING)
+# HTTP PULSE RECEIVER & HEALTH SERVER (PORT BINDING & CRON-JOB COMPATIBLE)
 # =====================================================================
 class PulseCommandServer(BaseHTTPRequestHandler):
     def do_OPTIONS(self):
-        """Handles CORS preflight requests from the React browser frontend."""
         self.send_response(200)
         self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Access-Control-Allow-Methods", "GET, HEAD, OPTIONS")
@@ -108,7 +94,6 @@ class PulseCommandServer(BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_HEAD(self):
-        """Satisfies HEAD requests with 0 body bytes for uptime monitors."""
         self.send_response(200)
         self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Content-Type", "text/plain; charset=utf-8")
@@ -116,44 +101,32 @@ class PulseCommandServer(BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_GET(self):
-        """Handles incoming pulse commands and keep-alive health pings."""
-        path = self.path.lower().strip()
-        state_str = "ON" if STATE_BUS.is_power_on() else "OFF"
+        path = self.path.lower().split("?")[0].strip()
 
         if path in ("/health", "/ping"):
-            self._send_resp(200, f"OK - State: {state_str}\n")
-        elif path in ("/start", "/api/start"):
-            STATE_BUS.trigger_pulse("START")
-            self._send_resp(200, "START latched ON.\n")
-        elif path in ("/stop", "/api/stop"):
-            STATE_BUS.trigger_pulse("STOP")
-            self._send_resp(200, "STOP latched OFF.\n")
+            self._send_resp(200, "OK - SYSTEM RUNNING\n")
         elif path in ("/sync", "/api/sync"):
-            STATE_BUS.trigger_pulse("SYNC")
+            STATE_BUS.trigger_sync_pulse()
             self._send_resp(200, "MANUAL SYNC triggered.\n")
         else:
-            self._send_resp(200, f"State: {state_str}\n")
+            self._send_resp(200, "OK\n")
 
     def _send_resp(self, code: int, message: str):
         payload = message.encode("utf-8")
         self.send_response(code)
         self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Access-Control-Allow-Methods", "GET, HEAD, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "*")
-        # Prevent browser and proxy caching of dynamic commands and status
         self.send_header("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
-        self.send_header("Pragma", "no-cache")
         self.send_header("Content-Type", "text/plain; charset=utf-8")
         self.send_header("Content-Length", str(len(payload)))
         self.end_headers()
-        self.wfile.write(payload)	
+        self.wfile.write(payload)
 
     def log_message(self, format, *args):
-        return  # Suppress HTTP access logging in stdout to prevent log flooding
+        return
 
 
 def start_http_listener():
-    """Starts the HTTP server on Render's designated port in a daemon thread."""
     port = int(os.environ.get("PORT", 10000))
     server = HTTPServer(("0.0.0.0", port), PulseCommandServer)
     logger.info(f"[HTTP] Command server listening on 0.0.0.0:{port}")
@@ -191,11 +164,9 @@ class MasterOrchestrator:
         self.last_live_update_time = 0.0
         self.last_param_calc_time = 0.0
 
-        # Per-script dictionary holding operational state
         self.script_status = {}
 
     def _get_reconciled_stock_map(self) -> dict:
-        """Helper to unpack reconcile_stocklist_with_watchlist safely whether it returns dict or tuple."""
         result = reconcile_stocklist_with_watchlist()
         if isinstance(result, tuple):
             return result[0] if len(result) > 0 and isinstance(result[0], dict) else {}
@@ -208,10 +179,8 @@ class MasterOrchestrator:
         logger.info("NSE EQUITY OHLC DATABASE MAINTENANCE ACTIVE")
         logger.info("==================================================")
 
-        # 1. Startup initialization and schedule planning
         self.replan_daily_routine()
 
-        # 2. Run initial historical sync in background thread so HTTP is responsive immediately
         threading.Thread(
             target=self.execute_historical_sync, 
             kwargs={"is_manual": False}, 
@@ -220,31 +189,26 @@ class MasterOrchestrator:
 
         while _keep_running:
             try:
-                # 1. Flip-Flop Power Check
-                if not STATE_BUS.is_power_on():
-                    time.sleep(HEARTBEAT_TICK_SEC)
-                    continue
-
                 now_ist = datetime.now(IST)
                 today_date = now_ist.date()
                 now_time = now_ist.time()
 
-                # Priority 0: Manual Sync Trigger (Instant Interruption)
+                # Manual Sync Trigger
                 if STATE_BUS.check_and_clear_manual_sync():
                     logger.info("[MANUAL OVERRIDE] Immediate resync commanded. Processing all scripts...")
                     self.execute_historical_sync(is_manual=True)
                     continue
 
-                # Priority 1: State-Driven Date Catch-Up (crossing midnight)
+                # State-Driven Date Catch-Up
                 if self.last_planned_date != today_date:
                     self.replan_daily_routine()
 
-                # If today is a weekend or NSE holiday, sleep and wait for next calendar date
+                # If non-trading day, idle loop
                 if not self.is_today_trading_day:
                     time.sleep(HEARTBEAT_TICK_SEC * 5)
                     continue
 
-                # Priority 2: Pre-Market Historical Sync Window (08:00 – 08:30 IST)
+                # Pre-Market Historical Sync Window (08:00 – 08:30 IST)
                 sync_start = datetime.strptime(f"{SYNC_WINDOW_START_HOUR}:{SYNC_WINDOW_START_MIN}", "%H:%M").time()
                 sync_cutoff = datetime.strptime(f"{SYNC_WINDOW_DEADLINE_HOUR}:{SYNC_WINDOW_DEADLINE_MIN}", "%H:%M").time()
 
@@ -255,34 +219,31 @@ class MasterOrchestrator:
                         self.execute_historical_sync(is_manual=False)
                         self.last_sync_attempt_time = time.time()
 
-                # Audit Report Check at or after 08:30 IST
+                # 08:30 IST Audit Report
                 if now_time >= sync_cutoff and not self.sync_audit_reported_today:
                     self.log_detailed_sync_audit()
                     self.sync_audit_reported_today = True
 
-                # Priority 3: Live Market Hours Execution (09:15 – 15:30 IST)
+                # Live Market Hours Execution (09:15 – 15:30 IST)
                 self.calendar.refresh_calendar()
                 market_status, _ = self.calendar.get_market_status()
 
                 if market_status == "LIVE":
-                    # 5-minute live intraday candle updates (Index 0)
                     if (time.time() - self.last_live_update_time) >= LIVE_UPDATE_INTERVAL_SEC:
                         self.execute_live_updates()
                         self.last_live_update_time = time.time()
 
-                    # 15-minute parameter engine calculations
                     if (time.time() - self.last_param_calc_time) >= PARAM_UPDATE_INTERVAL_SEC:
                         self.execute_parameter_calculations()
                         self.last_param_calc_time = time.time()
 
-                # Priority 4: Post-Market Indicator Computation (At 15:30 IST)
+                # Post-Market Indicator Computation (At 15:30 IST)
                 if (now_time.hour == 15 and now_time.minute >= 30) or now_time.hour >= 16:
                     if not self.post_market_calc_done:
                         logger.info("[POST-MARKET] Market session concluded. Running final daily parameter computation...")
                         self.execute_parameter_calculations()
                         self.post_market_calc_done = True
 
-                # Fast heartbeat rest
                 time.sleep(HEARTBEAT_TICK_SEC)
 
             except Exception as e:
@@ -292,7 +253,6 @@ class MasterOrchestrator:
         logger.info("Master orchestrator stopped safely.")
 
     def replan_daily_routine(self):
-        """Generates or updates today's plan, rebuilds script status, and reconciles stocklist."""
         now_ist = datetime.now(IST)
         today = now_ist.date()
         self.calendar.refresh_calendar()
@@ -302,13 +262,11 @@ class MasterOrchestrator:
         self.sync_audit_reported_today = False
         self.post_market_calc_done = False
 
-        # Safe unpack of reconciled stock dictionary
         stock_map = self._get_reconciled_stock_map()
         if not stock_map:
             logger.warning("[SAFETY] Watchlist reconciliation returned 0 stocks. Historical data preserved.")
             return
 
-        # Rebuild script status dictionary
         new_status = {}
         for name, ticker in stock_map.items():
             if name in self.script_status:
@@ -326,7 +284,6 @@ class MasterOrchestrator:
         logger.info(f"[PLANNER] Day plan for {today} IST refreshed: {status_label} ({len(self.script_status)} stocks)")
 
     def execute_historical_sync(self, is_manual: bool = False):
-        """Executes CHILD-1 historical sync across registered stocks."""
         logger.info(f"[SYNC] Starting historical sync cycle (Manual={is_manual})...")
         stock_map = self._get_reconciled_stock_map()
 
@@ -367,7 +324,6 @@ class MasterOrchestrator:
                 }
 
     def execute_live_updates(self):
-        """Executes CHILD-2 live intraday candle updates on Index 0."""
         for name, meta in list(self.script_status.items()):
             if not _keep_running:
                 break
@@ -378,7 +334,6 @@ class MasterOrchestrator:
                 logger.error(f"[LIVE] Error updating live candle for {name}: {e}")
 
     def execute_parameter_calculations(self):
-        """Executes parameter calculation across all active stocks."""
         active_symbols = list(self.script_status.keys())
         if active_symbols:
             logger.info(f"[PARAM] Running indicator recalculation for {len(active_symbols)} stocks...")
@@ -388,7 +343,6 @@ class MasterOrchestrator:
                 logger.error(f"[PARAM] Error during parameter execution: {e}", exc_info=True)
 
     def log_detailed_sync_audit(self):
-        """Outputs a clean audit report of pre-market sync."""
         synced = [k for k, v in self.script_status.items() if v.get("synced")]
         unsynced = [k for k, v in self.script_status.items() if not v.get("synced")]
 
@@ -413,9 +367,6 @@ class MasterOrchestrator:
 # PROGRAM ENTRY POINT
 # =====================================================================
 if __name__ == "__main__":
-    # 1. Bind port immediately so Render web service health check passes
     start_http_listener()
-
-    # 2. Run master orchestrator
     orchestrator = MasterOrchestrator()
     orchestrator.run()
