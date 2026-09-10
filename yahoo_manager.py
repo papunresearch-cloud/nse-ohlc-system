@@ -2,7 +2,8 @@
 yahoo_manager.py - Data Vendor Client & Normalizer
 Guarantees a clean DataFrame with explicit columns:
 ['date', 'open', 'high', 'low', 'close', 'volume']
-Includes intraday fetching for CHILD-2 and exchange date lookups.
+Includes intraday fetching for CHILD-2, exchange date lookups,
+and automatic ticker normalization/translation for market indices.
 """
 import time
 import math
@@ -23,6 +24,44 @@ from config import (
 IST = pytz.timezone(TIMEZONE)
 
 
+def get_yahoo_ticker(script: str) -> str:
+    """
+    Translates script identifiers or keys to valid Yahoo Finance tickers.
+    Indexes starting with '^' or ending in exchange suffixes are preserved.
+    """
+    if not script:
+        return ""
+    cleaned = str(script).strip()
+    if cleaned.startswith("^"):
+        return cleaned
+
+    # Exact overrides for standard indices and space-separated keys
+    custom_map = {
+        "NIFTY50": "^NSEI",
+        "NIFTY 50": "^NSEI",
+        "NIFTY100": "^CNX100",
+        "NIFTY 100": "^CNX100",
+        "NIFTY MIDCAP 150": "NIFTYMIDCAP150.NS",
+        "NIFTY_MIDCAP_150": "NIFTYMIDCAP150.NS",
+        "NIFTYMIDCAP150": "NIFTYMIDCAP150.NS",
+        "NIFTY SMALLCAP 250": "^CNXSC",
+        "NIFTY_SMALLCAP_250": "^CNXSC",
+        "NIFTYSMALLCAP250": "^CNXSC",
+        "NIFTYSMLCAP250": "^CNXSC",
+        "BANKNIFTY": "^NSEBANK",
+        "SENSEX": "^BSESN"
+    }
+
+    if cleaned in custom_map:
+        return custom_map[cleaned]
+    if cleaned.upper() in custom_map:
+        return custom_map[cleaned.upper()]
+
+    if not cleaned.endswith(".NS") and not cleaned.endswith(".BO"):
+        return f"{cleaned.replace(' ', '')}.NS"
+    return cleaned
+
+
 def download_historical_daily(ticker: str, days_needed: int) -> pd.DataFrame:
     """
     Downloads daily historical candles from Yahoo Finance and returns a normalized
@@ -32,6 +71,7 @@ def download_historical_daily(ticker: str, days_needed: int) -> pd.DataFrame:
         pd.DataFrame with columns ['date', 'open', 'high', 'low', 'close', 'volume'],
         or an empty DataFrame on failure.
     """
+    actual_ticker = get_yahoo_ticker(ticker)
     calendar_days = math.ceil(days_needed * 1.5 + 15)
     end_dt = datetime.now(IST)
     start_dt = end_dt - timedelta(days=calendar_days)
@@ -45,7 +85,7 @@ def download_historical_daily(ticker: str, days_needed: int) -> pd.DataFrame:
             time.sleep(REQUEST_DELAY_SEC)
             
             df_raw = yf.download(
-                tickers=ticker,
+                tickers=actual_ticker,
                 start=start_str,
                 end=end_str,
                 interval="1d",
@@ -58,16 +98,16 @@ def download_historical_daily(ticker: str, days_needed: int) -> pd.DataFrame:
                 if not normalized.empty:
                     return normalized
 
-            logger.warning(f"[{ticker}] Attempt {attempt}: Received empty or invalid historical payload.")
+            logger.warning(f"[{actual_ticker}] Attempt {attempt}: Received empty or invalid historical payload.")
 
         except Exception as e:
             err_str = str(e).lower()
             if "429" in err_str or "too many requests" in err_str:
-                logger.warning(f"[{ticker}] HTTP 429 encountered. Cooling down for {COOLDOWN_ON_429_SEC}s...")
+                logger.warning(f"[{actual_ticker}] HTTP 429 encountered. Cooling down for {COOLDOWN_ON_429_SEC}s...")
                 time.sleep(COOLDOWN_ON_429_SEC)
             else:
                 backoff = BACKOFF_FACTOR ** attempt
-                logger.warning(f"[{ticker}] Attempt {attempt} failed: {e}. Backing off {backoff:.1f}s...")
+                logger.warning(f"[{actual_ticker}] Attempt {attempt} failed: {e}. Backing off {backoff:.1f}s...")
                 time.sleep(backoff)
 
     return pd.DataFrame()
@@ -78,10 +118,11 @@ def download_intraday_today(ticker: str) -> dict:
     Fetches the active live market candle for ticker (CHILD-2 / Index 0).
     Returns dict: {'date': 'YYYY-MM-DD', 'open': float, 'high': float, 'low': float, 'close': float, 'volume': int}
     """
+    actual_ticker = get_yahoo_ticker(ticker)
     for attempt in range(1, MAX_RETRIES + 1):
         try:
             time.sleep(REQUEST_DELAY_SEC)
-            t = yf.Ticker(ticker)
+            t = yf.Ticker(actual_ticker)
             df = t.history(period="1d", interval="1m")
             
             if df is None or df.empty:
@@ -114,7 +155,7 @@ def download_intraday_today(ticker: str) -> dict:
                 }
 
         except Exception as e:
-            logger.warning(f"[{ticker}] Intraday fetch attempt {attempt} failed: {e}")
+            logger.warning(f"[{actual_ticker}] Intraday fetch attempt {attempt} failed: {e}")
             time.sleep(1)
 
     return {}
@@ -124,8 +165,9 @@ def get_latest_available_trading_date(ticker: str) -> date:
     """
     Interrogates Yahoo Finance to discover the latest completed daily session date.
     """
+    actual_ticker = get_yahoo_ticker(ticker)
     try:
-        t = yf.Ticker(ticker)
+        t = yf.Ticker(actual_ticker)
         df = t.history(period="5d", interval="1d")
         if df is not None and not df.empty:
             last_dt = df.index[-1]
@@ -133,7 +175,7 @@ def get_latest_available_trading_date(ticker: str) -> date:
                 return last_dt.date()
             return datetime.strptime(str(last_dt)[:10], "%Y-%m-%d").date()
     except Exception as e:
-        logger.warning(f"[{ticker}] Failed to detect latest vendor date: {e}")
+        logger.warning(f"[{actual_ticker}] Failed to detect latest vendor date: {e}")
     return None
 
 
