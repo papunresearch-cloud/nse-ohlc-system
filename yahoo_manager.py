@@ -43,8 +43,8 @@ def get_yahoo_ticker(script: str) -> str:
         "NIFTY50": "^NSEI",
         "NIFTY100": "^CNX100",
         "NIFTYMIDCAP150": "NIFTYMIDCAP150.NS",
-        "NIFTYSMALLCAP250": "^CNXSC",
-        "NIFTYSMLCAP250": "^CNXSC",
+        "NIFTYSMALLCAP250": "NIFTYSMLCAP250.NS",
+        "NIFTYSMLCAP250": "NIFTYSMLCAP250.NS",
         "BANKNIFTY": "^NSEBANK",
         "SENSEX": "^BSESN"
     }
