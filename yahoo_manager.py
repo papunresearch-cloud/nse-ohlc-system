@@ -27,7 +27,7 @@ IST = pytz.timezone(TIMEZONE)
 def get_yahoo_ticker(script: str) -> str:
     """
     Translates script identifiers or keys to valid Yahoo Finance tickers.
-    Indexes starting with '^' or ending in exchange suffixes are preserved.
+    Intercepts and cleans accidental .NS additions on index benchmarks.
     """
     if not script:
         return ""
@@ -35,30 +35,27 @@ def get_yahoo_ticker(script: str) -> str:
     if cleaned.startswith("^"):
         return cleaned
 
-    # Exact overrides for standard indices and space-separated keys
-    custom_map = {
+    # 1. Normalize: strip accidental .NS / .BO and spaces to inspect the core symbol
+    bare = cleaned.upper().replace(".NS", "").replace(".BO", "").replace(" ", "").replace("_", "")
+
+    # 2. Benchmark Index Map
+    index_map = {
         "NIFTY50": "^NSEI",
-        "NIFTY 50": "^NSEI",
         "NIFTY100": "^CNX100",
-        "NIFTY 100": "^CNX100",
-        "NIFTY MIDCAP 150": "NIFTYMIDCAP150.NS",
-        "NIFTY_MIDCAP_150": "NIFTYMIDCAP150.NS",
         "NIFTYMIDCAP150": "NIFTYMIDCAP150.NS",
-        "NIFTY SMALLCAP 250": "^CNXSC",
-        "NIFTY_SMALLCAP_250": "^CNXSC",
         "NIFTYSMALLCAP250": "^CNXSC",
         "NIFTYSMLCAP250": "^CNXSC",
         "BANKNIFTY": "^NSEBANK",
         "SENSEX": "^BSESN"
     }
 
-    if cleaned in custom_map:
-        return custom_map[cleaned]
-    if cleaned.upper() in custom_map:
-        return custom_map[cleaned.upper()]
+    if bare in index_map:
+        return index_map[bare]
 
+    # 3. Standard equity fallback
     if not cleaned.endswith(".NS") and not cleaned.endswith(".BO"):
         return f"{cleaned.replace(' ', '')}.NS"
+        
     return cleaned
 
 
