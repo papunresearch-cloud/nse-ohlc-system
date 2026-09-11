@@ -1,16 +1,13 @@
 """
 FIREBASE MANAGER
-- Centralized Firebase Admin SDK connection and lifecycle management[cite: 1, 4].
-- Dynamic stock discovery pulling tickers from /param, /detailedDb, and /watchlist[cite: 2, 4].
-- Safely handles stringified lists and nested nodes.
-- Permanent anchoring of 4 master market indices (immune to purging/deletion)[cite: 4].
-- In-memory calendar caching and urllib3 warning suppression.
-- Guarded OHLC access for Child-1 (1 to 250) and Child-2 (index 0)[cite: 1, 4].
+- Centralized Firebase Admin SDK connection and lifecycle management.
+- Dynamic stock discovery and reconciliation for /stocklist.
+- Permanent anchoring of 4 master market indices (immune to purging/deletion).
+- Pure read-only access to master nodes: /watchlist and /detailedDb.
+- Guarded OHLC access for Child-1 (1 to 250) and Child-2 (index 0).
 """
 import os
-import ast
 import json
-import logging
 import firebase_admin
 from firebase_admin import credentials, db
 from config import (
@@ -22,12 +19,9 @@ from config import (
     TARGET_OHLC_COUNT
 )
 
-# 1. Suppress connection pool drop warnings
-logging.getLogger("urllib3.connectionpool").setLevel(logging.ERROR)
-
-_CALENDAR_CACHE = None
-
-# Permanent master indices (immune to deletion)[cite: 4]
+# =====================================================================
+# PERMANENT MASTER INDICES (Immune to deletion)
+# =====================================================================
 FIXED_INDICES = {
     "NIFTY50": "^NSEI",
     "NIFTY100": "^CNX100",
@@ -35,40 +29,12 @@ FIXED_INDICES = {
     "NIFTY SMALLCAP 250": "NIFTYSMLCAP250.NS"
 }
 
-# Known ticker directory for NSE stocks[cite: 8]
-KNOWN_TICKERS = {
-    "Bank of Maha": "MAHABANK.NS",
-    "Bharat Electron": "BEL.NS",
-    "Black Box": "BBOX.NS",
-    "Caplin Point Lab": "CAPLIPOINT.NS",
-    "Coal India": "COALINDIA.NS",
-    "Dixon Technolog_": "DIXON.NS",
-    "Dixon Technolog.": "DIXON.NS",
-    "Dixon Technologies": "DIXON.NS",
-    "Gokul Agro": "GOKULAGRO.NS",
-    "Gravita India": "GRAVITA.NS",
-    "HCL Technologies": "HCLTECH.NS",
-    "REC Ltd": "RECLTD.NS",
-    "Suzlon Energy": "SUZLON.NS",
-    "Transport Corp.": "TCI.NS",
-    "Transport Corp": "TCI.NS",
-    "Va Tech Wabag": "WABAG.NS",
-    "Abbott India": "ABBOTINDIA.NS",
-    "Infosys": "INFY.NS",
-    "Reliance Industries": "RELIANCE.NS",
-    "TCS": "TCS.NS",
-    "Vedanta": "VEDL.NS",
-    "Wipro": "WIPRO.NS",
-    "Kaynes Tech": "KAYNES.NS",
-    "NMDC": "NMDC.NS"
-}
-
 
 # =====================================================================
 # 1. CENTRALIZED FIREBASE INITIALIZATION
 # =====================================================================
-def init_firebase() -> None:
-    """Idempotently initializes Firebase Admin SDK[cite: 1, 4]."""
+def init_firebase():
+    """Idempotently initializes Firebase Admin SDK."""
     if not firebase_admin._apps:
         try:
             logger.info("Initializing Firebase Admin SDK connection...")
@@ -95,7 +61,7 @@ def init_firebase() -> None:
 
 
 def sanitize_key(key: str) -> str:
-    """Sanitizes script name string for Firebase path safety[cite: 1, 4]."""
+    """Sanitizes script name string for Firebase path safety."""
     if not key:
         return ""
     return (
@@ -111,33 +77,26 @@ def sanitize_key(key: str) -> str:
 
 
 # =====================================================================
-# 2. CALENDAR CONFIG ACCESS (WITH IN-MEMORY CACHE)
+# 2. CALENDAR CONFIG ACCESS (FOR MARKET_CALENDAR.PY)
 # =====================================================================
-def get_calendar_config(force_reload: bool = False) -> dict:
-    """Reads custom calendar overrides with in-memory caching[cite: 1]."""
-    global _CALENDAR_CACHE
-    if _CALENDAR_CACHE is not None and not force_reload:
-        return _CALENDAR_CACHE
-
+def get_calendar_config() -> dict:
+    """Reads custom calendar overrides / holidays from Firebase."""
     init_firebase()
     try:
         ref = db.reference("config/nse_calendar")
         data = ref.get()
-        _CALENDAR_CACHE = data if isinstance(data, dict) else {}
-        return _CALENDAR_CACHE
+        return data if isinstance(data, dict) else {}
     except Exception as e:
         logger.error(f"Error fetching calendar config: {e}")
-        return _CALENDAR_CACHE or {}
+        return {}
 
 
 def set_calendar_config(payload: dict) -> bool:
-    """Saves calendar data in Firebase and updates the local cache[cite: 1]."""
-    global _CALENDAR_CACHE
+    """Saves or seeds custom calendar data in Firebase."""
     init_firebase()
     try:
         ref = db.reference("config/nse_calendar")
         ref.set(payload)
-        _CALENDAR_CACHE = payload
         return True
     except Exception as e:
         logger.error(f"Error setting calendar config: {e}")
@@ -145,97 +104,83 @@ def set_calendar_config(payload: dict) -> bool:
 
 
 # =====================================================================
-# 3. ROBUST WATCHLIST & TICKER DISCOVERY
+# 3. MASTER WATCHLIST READ-ONLY QUERIES & STOCKLIST SYNCHRONIZER
 # =====================================================================
 def get_master_watchlist_mapping() -> dict[str, str]:
     """
-    Reads active stocks from /watchlist, /param, and /detailedDb[cite: 2, 4],
-    resolving authentic tickers for all valid equities and indices[cite: 2, 4].
-    Always returns exact display names as keys (matching master.py expectations)[cite: 1].
+    STRICT READ-ONLY:
+    1. Anchors the 4 permanent master indices.
+    2. Reads active stocks from /watchlist and /detailedDb.
+    Returns: { Clean Sanitized Name: Yahoo Ticker }
     """
     init_firebase()
-    master_mapping = {k: v for k, v in FIXED_INDICES.items()}
+    
+    # 1. Start with the permanent, immutable indices
+    master_mapping = {sanitize_key(k): v for k, v in FIXED_INDICES.items()}
 
     try:
         watchlist_root = db.reference("watchlist").get() or {}
+
+        raw_names = []
+        detailed_db = {}
+        if isinstance(watchlist_root, dict):
+            raw_names = watchlist_root.get("watchlist", [])
+            detailed_db = watchlist_root.get("detailedDb", {})
+        elif isinstance(watchlist_root, list):
+            raw_names = watchlist_root
+
+        if not detailed_db:
+            detailed_db = db.reference("detailedDb").get() or {}
+
+        active_names = []
+        if isinstance(raw_names, dict):
+            active_names = [str(v).strip() for v in raw_names.values() if v]
+        elif isinstance(raw_names, list):
+            active_names = [str(v).strip() for v in raw_names if v]
+
         param_db = db.reference("param").get() or {}
-        detailed_db = db.reference("detailedDb").get() or {}
-        display_list = db.reference("display_list").get() or {}
 
-        combined_db = {}
-        if isinstance(detailed_db, dict):
-            combined_db.update(detailed_db)
-        if isinstance(param_db, dict):
-            combined_db.update(param_db)
+        # 2. Extract tickers and sanitize dictionary keys for Firebase safety
+        for name in active_names:
+            sanitized_name = sanitize_key(name)
+            stock_info = (
+                detailed_db.get(name) or 
+                detailed_db.get(sanitized_name) or 
+                detailed_db.get(name.replace(".", "_")) or 
+                param_db.get(name) or 
+                param_db.get(sanitized_name) or 
+                {}
+            )
 
-        def extract_items(raw_val):
-            extracted = set()
-            if not raw_val:
-                return extracted
-            if isinstance(raw_val, str):
-                s = raw_val.strip()
-                if s.startswith("[") and s.endswith("]"):
-                    try:
-                        parsed = ast.literal_eval(s)
-                        if isinstance(parsed, list):
-                            for p in parsed:
-                                extracted.update(extract_items(p))
-                            return extracted
-                    except Exception:
-                        pass
-                if s not in ("Group", "Mkt Cap Rank inc."):
-                    extracted.add(s)
-            elif isinstance(raw_val, list):
-                for item in raw_val:
-                    extracted.update(extract_items(item))
-            elif isinstance(raw_val, dict):
-                for k, v in raw_val.items():
-                    if k not in ("watchlist", "detailedDb", "lastSync"):
-                        extracted.update(extract_items(k))
-                    extracted.update(extract_items(v))
-            return extracted
+            ticker = stock_info.get("TICKER") or stock_info.get("ticker") or stock_info.get("Ticker")
 
-        candidate_names = extract_items(watchlist_root)
-        candidate_names.update(extract_items(display_list))
-
-        if not candidate_names and isinstance(param_db, dict):
-            for k in param_db.keys():
-                candidate_names.update(extract_items(k))
-
-        for name in candidate_names:
-            if not name or name in ("Group", "Mkt Cap Rank inc."):
-                continue
-
-            clean_name = str(name).strip()
-            dot_name = clean_name.replace(".", "_")
-
-            ticker = KNOWN_TICKERS.get(clean_name) or KNOWN_TICKERS.get(dot_name)
-
+            # Fallback to CODE or NSE if TICKER key is missing
             if not ticker:
-                info = (
-                    combined_db.get(clean_name) or 
-                    combined_db.get(dot_name) or 
-                    {}
+                code_val = (
+                    stock_info.get("CODE") or 
+                    stock_info.get("NSE") or 
+                    stock_info.get("code") or 
+                    stock_info.get("nse")
                 )
-                ticker = info.get("TICKER") or info.get("ticker") or info.get("Ticker")
-                if not ticker:
-                    code = info.get("CODE") or info.get("code") or info.get("NSE") or info.get("nse")
-                    if code:
-                        ticker = f"{str(code).strip()}.NS"
+                if code_val:
+                    ticker = f"{str(code_val).strip()}.NS"
 
             if ticker:
-                master_mapping[clean_name] = str(ticker).strip()
+                t = str(ticker).strip()
+                if t.upper() == "^NESI":
+                    t = "^NSEI"
+                master_mapping[sanitized_name] = t
+            else:
+                logger.warning(f"[MASTER-WATCHLIST] Stock '{name}' has no TICKER or CODE in detailedDb/param.")
 
-        logger.info(f"[MASTER-WATCHLIST] Successfully resolved {len(master_mapping)} total targets.")
         return master_mapping
-
     except Exception as e:
         logger.error(f"[MASTER-WATCHLIST] Failed to read master watchlist: {e}", exc_info=True)
         return master_mapping
 
 
 def get_current_stocklist() -> dict[str, str]:
-    """Reads current node at /stocklist[cite: 2, 4]."""
+    """Reads current node at /stocklist."""
     init_firebase()
     try:
         data = db.reference(PATH_SCRIPTS).get() or {}
@@ -249,16 +194,22 @@ def get_current_stocklist() -> dict[str, str]:
 
 def reconcile_stocklist_with_watchlist() -> tuple[bool, dict[str, str]]:
     """
-    Synchronizes /stocklist with resolved watchlist targets[cite: 2, 4].
-    Returns (was_updated, active_map) where active_map contains all indices + equities[cite: 2, 4].
+    Compares /stocklist against the master /watchlist and FIXED_INDICES.
+    Synchronizes /stocklist if discrepancies are detected.
+    Returns: (was_changed: bool, active_stock_mapping: dict)
     """
     init_firebase()
     master_map = get_master_watchlist_mapping()
     current_stocklist = get_current_stocklist()
 
-    # Create sanitized mapping for Firebase storage
+    # Safety Guard: Never clear stocklist if master watchlist returns empty
+    if not master_map:
+        logger.warning("[RECONCILE] Target map returned empty. Skipping sync to prevent accidental data loss.")
+        return False, current_stocklist
+
     safe_master_map = {sanitize_key(k): v for k, v in master_map.items()}
 
+    # Check for discrepancies
     diff_detected = False
     if set(safe_master_map.keys()) != set(current_stocklist.keys()):
         diff_detected = True
@@ -268,38 +219,48 @@ def reconcile_stocklist_with_watchlist() -> tuple[bool, dict[str, str]]:
                 diff_detected = True
                 break
 
-    if diff_detected or not current_stocklist:
-        logger.info(f"[RECONCILE] Updating /stocklist ({len(safe_master_map)} targets) in Firebase...")
+    if diff_detected:
+        logger.info(
+            f"[RECONCILE] Discrepancy detected between target map ({len(safe_master_map)}) "
+            f"and stocklist ({len(current_stocklist)})."
+        )
         try:
             db.reference(PATH_SCRIPTS).set(safe_master_map)
+            logger.info(f"[RECONCILE] /stocklist successfully synchronized with {len(safe_master_map)} targets.")
+            return True, safe_master_map
         except Exception as e:
-            logger.error(f"[RECONCILE] Failed to write /stocklist: {e}", exc_info=True)
+            logger.error(f"[RECONCILE] Failed to write synchronized /stocklist: {e}", exc_info=True)
+            return False, current_stocklist
 
-    # Return master_map directly so master.py can see equities like 'Bank of Maha'
-    return diff_detected, master_map
+    return False, current_stocklist
 
 
 def get_stocklist_mapping() -> dict[str, str]:
-    """Returns active target dictionary[cite: 4]."""
-    init_firebase()
-    master_map = get_master_watchlist_mapping()
-    return master_map
+    """
+    Returns the active target dictionary:
+    Always includes the 4 permanent indices merged with /stocklist.
+    """
+    mapping = get_current_stocklist()
+    if not mapping:
+        _, mapping = reconcile_stocklist_with_watchlist()
+    
+    # Ensure permanent indices are present even if /stocklist was incomplete
+    for k, v in FIXED_INDICES.items():
+        mapping.setdefault(sanitize_key(k), v)
+        
+    return mapping
 
 
 def get_stocklist() -> list:
-    """Returns list of active target names[cite: 2, 4]."""
+    """Returns active target names list."""
     return list(get_stocklist_mapping().keys())
 
 
-def get_scripts_list() -> list[str]:
-    return get_stocklist()
-
-
 # =====================================================================
-# 4. OHLC DATABASE ACCESS
+# 4. OHLC DATABASE ACCESS (CHILD-1 & CHILD-2)
 # =====================================================================
 def get_stock_ohlc(display_name: str) -> dict:
-    """Reads complete OHLC records from /stocks/<display_name>[cite: 1, 4]."""
+    """Reads complete OHLC records from /stocks/<display_name>."""
     init_firebase()
     try:
         safe_key = sanitize_key(display_name)
@@ -312,7 +273,7 @@ def get_stock_ohlc(display_name: str) -> dict:
 
 
 def save_stock_ohlc(display_name: str, payload: dict) -> bool:
-    """Saves complete OHLC dataset into /stocks/<display_name>[cite: 1, 4]."""
+    """Saves entire OHLC payload to /stocks/<display_name>."""
     init_firebase()
     try:
         safe_key = sanitize_key(display_name)
@@ -325,7 +286,7 @@ def save_stock_ohlc(display_name: str, payload: dict) -> bool:
 
 
 def write_full_ohlc(display_name: str, ohlc_dict: dict) -> bool:
-    """Updates historical records under /stocks/<display_name>[cite: 1, 4]."""
+    """Writes or updates historical records under /stocks/<display_name>."""
     init_firebase()
     try:
         safe_key = sanitize_key(display_name)
@@ -341,7 +302,7 @@ write_historical_ohlc = write_full_ohlc
 
 
 def update_live_candle(display_name: str, live_candle: dict) -> bool:
-    """Writes intraday candle strictly to index 0[cite: 1, 4]."""
+    """Updates live intraday candle strictly to index 0."""
     init_firebase()
     try:
         safe_key = sanitize_key(display_name)
@@ -357,7 +318,7 @@ write_live_ohlc = update_live_candle
 
 
 def clear_live_candle(display_name: str) -> bool:
-    """Purges live index 0 using .delete()[cite: 1, 4]."""
+    """Safely purges live index 0 using .delete()."""
     init_firebase()
     try:
         safe_key = sanitize_key(display_name)
