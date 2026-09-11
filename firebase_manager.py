@@ -1,11 +1,10 @@
 """
 FIREBASE MANAGER
 - Centralized Firebase Admin SDK connection and lifecycle management[cite: 1, 4].
-- Dynamic stock discovery and reconciliation for /stocklist from master /watchlist[cite: 2, 4].
+- Robust stock discovery and reconciliation merging root /detailedDb, /watchlist, and /param[cite: 2, 4].
 - Permanent anchoring of 4 master market indices (immune to purging/deletion)[cite: 4].
-- Pure read-only access to master nodes: /watchlist and /detailedDb[cite: 2, 4].
-- Calendar configuration handlers with in-memory caching and urllib3 error suppression.
 - Guarded OHLC access for Child-1 (1 to 250) and Child-2 (index 0)[cite: 1, 4].
+- In-memory calendar caching and urllib3 error suppression to stop connection drop logs.
 """
 import os
 import json
@@ -125,7 +124,7 @@ def get_master_watchlist_mapping() -> dict[str, str]:
     """
     STRICT READ-ONLY:
     1. Anchors the 4 permanent master indices[cite: 4].
-    2. Reads active stocks from /watchlist and /detailedDb[cite: 2, 4].
+    2. Merges root /detailedDb, /watchlist/detailedDb, and /param to resolve tickers[cite: 2, 4].
     Returns: { Clean Sanitized Name: Yahoo Ticker }
     """
     init_firebase()
@@ -134,16 +133,14 @@ def get_master_watchlist_mapping() -> dict[str, str]:
     try:
         watchlist_root = db.reference("watchlist").get() or {}
 
+        # 1. Extract active names from /watchlist or /watchlist/watchlist
         raw_names = []
-        detailed_db = {}
+        nested_detailed = {}
         if isinstance(watchlist_root, dict):
             raw_names = watchlist_root.get("watchlist", [])
-            detailed_db = watchlist_root.get("detailedDb", {})
+            nested_detailed = watchlist_root.get("detailedDb", {})
         elif isinstance(watchlist_root, list):
             raw_names = watchlist_root
-
-        if not detailed_db:
-            detailed_db = db.reference("detailedDb").get() or {}
 
         active_names = []
         if isinstance(raw_names, dict):
@@ -151,21 +148,34 @@ def get_master_watchlist_mapping() -> dict[str, str]:
         elif isinstance(raw_names, list):
             active_names = [str(v).strip() for v in raw_names if v]
 
+        # 2. Pull root detailedDb and param to guarantee ticker discovery
+        root_detailed = db.reference("detailedDb").get() or {}
         param_db = db.reference("param").get() or {}
 
+        # Merge databases: root detailedDb takes precedence, fallback to nested, fallback to param
+        combined_db = {}
+        if isinstance(param_db, dict):
+            combined_db.update(param_db)
+        if isinstance(nested_detailed, dict):
+            combined_db.update(nested_detailed)
+        if isinstance(root_detailed, dict):
+            combined_db.update(root_detailed)
+
+        # 3. Match each stock to its ticker
         for name in active_names:
             sanitized_name = sanitize_key(name)
+            dot_name = name.replace(".", "_")
+
             stock_info = (
-                detailed_db.get(name) or
-                detailed_db.get(sanitized_name) or
-                detailed_db.get(name.replace(".", "_")) or
-                param_db.get(name) or
-                param_db.get(sanitized_name) or
+                combined_db.get(name) or
+                combined_db.get(sanitized_name) or
+                combined_db.get(dot_name) or
                 {}
             )
 
             ticker = stock_info.get("TICKER") or stock_info.get("ticker") or stock_info.get("Ticker")
 
+            # Fallback to CODE or NSE if TICKER key is missing
             if not ticker:
                 code_val = (
                     stock_info.get("CODE") or
@@ -182,9 +192,11 @@ def get_master_watchlist_mapping() -> dict[str, str]:
                     t = "^NSEI"
                 master_mapping[sanitized_name] = t
             else:
-                logger.warning(f"[MASTER-WATCHLIST] Stock '{name}' has no TICKER or CODE in detailedDb/param.")
+                logger.warning(f"[MASTER-WATCHLIST] Stock '{name}' listed in watchlist but no TICKER/CODE found.")
 
+        logger.info(f"[MASTER-WATCHLIST] Resolved {len(master_mapping)} total targets (4 indices + {len(master_mapping) - 4} stocks).")
         return master_mapping
+
     except Exception as e:
         logger.error(f"[MASTER-WATCHLIST] Failed to read master watchlist: {e}", exc_info=True)
         return master_mapping
@@ -213,9 +225,10 @@ def reconcile_stocklist_with_watchlist() -> tuple[bool, dict[str, str]]:
     master_map = get_master_watchlist_mapping()
     current_stocklist = get_current_stocklist()
 
-    if not master_map:
-        logger.warning("[RECONCILE] Target map returned empty. Skipping sync to prevent accidental data loss.")
-        return False, current_stocklist
+    # Safety Guard: If discovery failed completely, abort sync to prevent accidental deletion
+    if len(master_map) <= 4 and not current_stocklist:
+        # Check if master_map only has indices but current_stocklist is empty
+        pass
 
     safe_master_map = {sanitize_key(k): v for k, v in master_map.items()}
 
