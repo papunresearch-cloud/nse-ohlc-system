@@ -1,14 +1,13 @@
 """
 NSE Market Calendar logic.
 Evaluates current market status against weekends, holidays, special sessions,
-and manual overrides dynamically loaded from Firebase.
+and manual overrides loaded from Firebase[cite: 4].
 """
 from datetime import datetime, date, time as dt_time, timedelta
 import pytz
 from config import TIMEZONE, TEST_MODE, SIMULATED_TIME, logger
 from firebase_manager import get_calendar_config, set_calendar_config
 
-# Baseline 2026 Calendar fallback seed
 INITIAL_2026_CALENDAR = {
     "market": "NSE_EQUITY",
     "timezone": "Asia/Kolkata",
@@ -66,11 +65,12 @@ class MarketCalendar:
     def __init__(self):
         self.tz = pytz.timezone(TIMEZONE)
         self.config = {}
-        self.refresh_calendar()
+        self.last_sync_date = None
+        self.refresh_calendar(force=True)
 
-    def refresh_calendar(self) -> None:
-        """Loads or seeds calendar configurations from Firebase."""
-        cfg = get_calendar_config()
+    def refresh_calendar(self, force: bool = False) -> None:
+        """Loads or seeds calendar configurations from Firebase[cite: 4]."""
+        cfg = get_calendar_config(force_reload=force)
         if not cfg or "regular_market" not in cfg:
             logger.warning("NSE Calendar not found in Firebase. Seeding defaults...")
             set_calendar_config(INITIAL_2026_CALENDAR)
@@ -79,7 +79,7 @@ class MarketCalendar:
             self.config = cfg
 
     def get_current_time(self) -> datetime:
-        """Returns localized datetime, supporting simulation in test mode."""
+        """Returns localized datetime, supporting simulation in test mode[cite: 4]."""
         if TEST_MODE and SIMULATED_TIME:
             try:
                 dt = datetime.strptime(SIMULATED_TIME, "%Y-%m-%d %H:%M")
@@ -96,7 +96,7 @@ class MarketCalendar:
         return False, ""
 
     def is_weekend(self, check_date: date) -> bool:
-        return check_date.weekday() in (5, 6)  # 5=Saturday, 6=Sunday
+        return check_date.weekday() in (5, 6)
 
     def get_special_trading(self, check_date: date) -> dict | None:
         date_str = check_date.strftime("%Y-%m-%d")
@@ -108,14 +108,9 @@ class MarketCalendar:
 
     def is_trading_day(self, check_date: date) -> bool:
         """
-        Calculates if date is a valid trading session based on strict priority:
-        1. Manual Override
-        2. Special Trading Session
-        3. Holiday
-        4. Weekend
-        5. Normal Weekday
+        Calculates if date is a valid trading session:
+        1. Manual Override -> 2. Special Trading Day -> 3. Holiday -> 4. Weekend -> 5. Regular Day[cite: 4]
         """
-        # 1. Manual Override
         override = self.get_manual_override(check_date)
         if override:
             status = override.get("status", "").upper()
@@ -124,35 +119,32 @@ class MarketCalendar:
             if status in ("HOLIDAY", "CLOSED"):
                 return False
 
-        # 2. Special Trading Day
         special = self.get_special_trading(check_date)
         if special and special.get("status") == "SPECIAL_TRADING":
             return True
 
-        # 3. Holiday
         is_hol, _ = self.is_holiday(check_date)
         if is_hol:
             return False
 
-        # 4. Weekend
         if self.is_weekend(check_date):
             return False
 
-        # 5. Regular Trading Day
         return True
 
     def get_market_status(self, now: datetime | None = None) -> tuple[str, str]:
-        """
-        Determines current state: LIVE, CLOSED, PRE_OPEN, CLOSING_AUCTION, etc.
-        Returns: (STATUS, REASON)
-        """
+        """Determines current state: LIVE, CLOSED, PRE_OPEN[cite: 4]."""
         if now is None:
             now = self.get_current_time()
 
         curr_date = now.date()
         curr_time = now.time()
 
-        # 1. Manual Override
+        # Check if midnight rolled over to force-refresh calendar cache once per day
+        if self.last_sync_date != curr_date:
+            self.refresh_calendar(force=True)
+            self.last_sync_date = curr_date
+
         override = self.get_manual_override(curr_date)
         if override:
             status = override.get("status", "").upper()
@@ -165,7 +157,6 @@ class MarketCalendar:
                     return "LIVE", f"Manual Override Session: {override.get('name')}"
                 return "CLOSED", "Outside Manual Override Session"
 
-        # 2. Special Trading Day (e.g. Muhurat)
         special = self.get_special_trading(curr_date)
         if special and special.get("status") == "SPECIAL_TRADING":
             start_str = special.get("start")
@@ -178,16 +169,13 @@ class MarketCalendar:
                 return "LIVE", f"Special Trading: {special.get('name')}"
             return "CLOSED", f"Outside Special Trading Window ({start_str}-{end_str})"
 
-        # 3. Holiday Check
         is_hol, hol_name = self.is_holiday(curr_date)
         if is_hol:
             return "CLOSED", f"NSE Holiday: {hol_name}"
 
-        # 4. Weekend Check
         if self.is_weekend(curr_date):
             return "CLOSED", "Weekend (Market Closed)"
 
-        # 5. Regular Session Windows
         reg = self.config.get("regular_market", {"start": "09:15", "end": "15:30"})
         reg_start = self._parse_time(reg["start"])
         reg_end = self._parse_time(reg["end"])
@@ -209,17 +197,14 @@ class MarketCalendar:
         return status == "LIVE"
 
     def get_previous_trading_day(self, ref_date: date) -> date:
-        """Finds the immediately preceding valid trading date."""
+        """Finds the preceding valid trading date[cite: 4]."""
         target = ref_date - timedelta(days=1)
         while not self.is_trading_day(target):
             target -= timedelta(days=1)
         return target
 
     def get_trading_day_gap(self, start_date: date, end_date: date) -> int:
-        """
-        Calculates missing trading days between start_date (exclusive) and end_date (inclusive).
-        Returns 0 if end_date <= start_date.
-        """
+        """Calculates missing trading days between start_date (exclusive) and end_date (inclusive)[cite: 4]."""
         if end_date <= start_date:
             return 0
         gap = 0
