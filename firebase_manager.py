@@ -1,10 +1,11 @@
 """
 FIREBASE MANAGER
 - Centralized Firebase Admin SDK connection and lifecycle management.
-- Dynamic stock discovery with automated NSE ticker symbol resolution.
-- Parses stringified and nested watchlist data structures safely.
-- In-memory calendar caching and urllib3 error suppression.
-- Complete read/write access for OHLC records (Index 0 live, Index 1-250 historical).
+- Dynamic stock discovery pulling tickers from /param, /detailedDb, and /watchlist.
+- Safely handles stringified lists and nested nodes.
+- Permanent anchoring of 4 master market indices (immune to purging/deletion).
+- In-memory calendar caching and urllib3 warning suppression.
+- Guarded OHLC access for Child-1 (1 to 250) and Child-2 (index 0).
 """
 import os
 import ast
@@ -148,12 +149,11 @@ def set_calendar_config(payload: dict) -> bool:
 # =====================================================================
 def get_master_watchlist_mapping() -> dict[str, str]:
     """
-    STRICT READ-ONLY:
-    Discovers active stocks from /watchlist, /param, and /display_list,
-    and maps them to valid Yahoo Finance tickers.
+    Reads active stocks from /watchlist, /param, and /detailedDb,
+    resolving authentic tickers for all valid equities and indices.
     """
     init_firebase()
-    master_mapping = {sanitize_key(k): v for k, v in FIXED_INDICES.items()}
+    master_mapping = {k: v for k, v in FIXED_INDICES.items()}
 
     try:
         watchlist_root = db.reference("watchlist").get() or {}
@@ -161,14 +161,12 @@ def get_master_watchlist_mapping() -> dict[str, str]:
         detailed_db = db.reference("detailedDb").get() or {}
         display_list = db.reference("display_list").get() or {}
 
-        # Merge metadata lookups
         combined_db = {}
         if isinstance(detailed_db, dict):
             combined_db.update(detailed_db)
         if isinstance(param_db, dict):
             combined_db.update(param_db)
 
-        # Helper to unpack raw stringified lists or nested items
         def extract_items(raw_val):
             extracted = set()
             if not raw_val:
@@ -199,7 +197,6 @@ def get_master_watchlist_mapping() -> dict[str, str]:
         candidate_names = extract_items(watchlist_root)
         candidate_names.update(extract_items(display_list))
 
-        # Fallback to keys in /param if watchlist yields nothing
         if not candidate_names and isinstance(param_db, dict):
             for k in param_db.keys():
                 candidate_names.update(extract_items(k))
@@ -208,17 +205,14 @@ def get_master_watchlist_mapping() -> dict[str, str]:
             if not name or name in ("Group", "Mkt Cap Rank inc."):
                 continue
 
-            sanitized_name = sanitize_key(name)
-            dot_name = name.replace(".", "_")
+            clean_name = str(name).strip()
+            dot_name = clean_name.replace(".", "_")
 
-            # Check known stock mappings first
-            ticker = KNOWN_TICKERS.get(name) or KNOWN_TICKERS.get(sanitized_name)
+            ticker = KNOWN_TICKERS.get(clean_name) or KNOWN_TICKERS.get(dot_name)
 
-            # Look inside combined metadata
             if not ticker:
                 info = (
-                    combined_db.get(name) or 
-                    combined_db.get(sanitized_name) or 
+                    combined_db.get(clean_name) or 
                     combined_db.get(dot_name) or 
                     {}
                 )
@@ -229,9 +223,7 @@ def get_master_watchlist_mapping() -> dict[str, str]:
                         ticker = f"{str(code).strip()}.NS"
 
             if ticker:
-                master_mapping[sanitized_name] = str(ticker).strip()
-            else:
-                logger.warning(f"[MASTER-WATCHLIST] Stock '{name}' found but could not resolve TICKER.")
+                master_mapping[clean_name] = str(ticker).strip()
 
         logger.info(f"[MASTER-WATCHLIST] Successfully resolved {len(master_mapping)} total targets.")
         return master_mapping
@@ -256,45 +248,45 @@ def get_current_stocklist() -> dict[str, str]:
 
 def reconcile_stocklist_with_watchlist() -> tuple[bool, dict[str, str]]:
     """
-    Synchronizes /stocklist with resolved watchlist equities.
-    Always returns the master map so master.py never starves or triggers safety locks.
+    Synchronizes /stocklist with resolved watchlist targets.
+    Guarantees a two-item tuple (was_updated: bool, active_map: dict) is returned
+    to preserve exact compatibility with master.py.
     """
     init_firebase()
     master_map = get_master_watchlist_mapping()
     current_stocklist = get_current_stocklist()
 
-    safe_master_map = {sanitize_key(k): v for k, v in master_map.items()}
-
-    # Check if /stocklist is out of sync
     diff_detected = False
-    if set(safe_master_map.keys()) != set(current_stocklist.keys()):
+    if set(master_map.keys()) != set(current_stocklist.keys()):
         diff_detected = True
     else:
-        for stock, ticker in safe_master_map.items():
+        for stock, ticker in master_map.items():
             if current_stocklist.get(stock) != ticker:
                 diff_detected = True
                 break
 
     if diff_detected or not current_stocklist:
-        logger.info(f"[RECONCILE] Updating /stocklist ({len(safe_master_map)} targets)...")
+        logger.info(f"[RECONCILE] Updating /stocklist ({len(master_map)} targets) in Firebase...")
         try:
-            db.reference(PATH_SCRIPTS).set(safe_master_map)
-            return True, safe_master_map
+            # Write sanitized keys to stocklist path
+            safe_payload = {sanitize_key(k): v for k, v in master_map.items()}
+            db.reference(PATH_SCRIPTS).set(safe_payload)
+            return True, master_map
         except Exception as e:
             logger.error(f"[RECONCILE] Failed to write /stocklist: {e}", exc_info=True)
-            return False, safe_master_map
+            return False, master_map
 
-    return False, safe_master_map
+    return False, master_map
 
 
 def get_stocklist_mapping() -> dict[str, str]:
-    """Returns the active target dictionary (Fixed Indices + Equities)."""
+    """Returns active target dictionary."""
     mapping = get_current_stocklist()
     if not mapping or len(mapping) <= 4:
         _, mapping = reconcile_stocklist_with_watchlist()
 
     for k, v in FIXED_INDICES.items():
-        mapping.setdefault(sanitize_key(k), v)
+        mapping.setdefault(k, v)
 
     return mapping
 
