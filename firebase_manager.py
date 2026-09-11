@@ -1,10 +1,11 @@
 """
 FIREBASE MANAGER
 - Centralized Firebase Admin SDK connection and lifecycle management[cite: 1, 4].
-- Robust stock discovery and reconciliation merging root /detailedDb, /watchlist, and /param[cite: 2, 4].
+- Dynamic stock discovery and reconciliation for /stocklist from master /watchlist[cite: 2, 4].
 - Permanent anchoring of 4 master market indices (immune to purging/deletion)[cite: 4].
+- Pure read-only access to master nodes: /watchlist and /detailedDb[cite: 2, 4].
+- In-memory calendar caching and urllib3 error suppression.
 - Guarded OHLC access for Child-1 (1 to 250) and Child-2 (index 0)[cite: 1, 4].
-- In-memory calendar caching and urllib3 error suppression to stop connection drop logs.
 """
 import os
 import json
@@ -133,7 +134,6 @@ def get_master_watchlist_mapping() -> dict[str, str]:
     try:
         watchlist_root = db.reference("watchlist").get() or {}
 
-        # 1. Extract active names from /watchlist or /watchlist/watchlist
         raw_names = []
         nested_detailed = {}
         if isinstance(watchlist_root, dict):
@@ -148,11 +148,9 @@ def get_master_watchlist_mapping() -> dict[str, str]:
         elif isinstance(raw_names, list):
             active_names = [str(v).strip() for v in raw_names if v]
 
-        # 2. Pull root detailedDb and param to guarantee ticker discovery
         root_detailed = db.reference("detailedDb").get() or {}
         param_db = db.reference("param").get() or {}
 
-        # Merge databases: root detailedDb takes precedence, fallback to nested, fallback to param
         combined_db = {}
         if isinstance(param_db, dict):
             combined_db.update(param_db)
@@ -161,7 +159,6 @@ def get_master_watchlist_mapping() -> dict[str, str]:
         if isinstance(root_detailed, dict):
             combined_db.update(root_detailed)
 
-        # 3. Match each stock to its ticker
         for name in active_names:
             sanitized_name = sanitize_key(name)
             dot_name = name.replace(".", "_")
@@ -175,7 +172,6 @@ def get_master_watchlist_mapping() -> dict[str, str]:
 
             ticker = stock_info.get("TICKER") or stock_info.get("ticker") or stock_info.get("Ticker")
 
-            # Fallback to CODE or NSE if TICKER key is missing
             if not ticker:
                 code_val = (
                     stock_info.get("CODE") or
@@ -218,20 +214,15 @@ def get_current_stocklist() -> dict[str, str]:
 def reconcile_stocklist_with_watchlist() -> tuple[bool, dict[str, str]]:
     """
     Compares /stocklist against the master /watchlist and FIXED_INDICES[cite: 2, 4].
-    Synchronizes /stocklist if discrepancies are detected[cite: 2, 4].
-    Returns: (was_changed: bool, active_stock_mapping: dict)[cite: 2, 4]
+    Always returns the valid master map dictionary so master.py never starves[cite: 1].
     """
     init_firebase()
     master_map = get_master_watchlist_mapping()
     current_stocklist = get_current_stocklist()
 
-    # Safety Guard: If discovery failed completely, abort sync to prevent accidental deletion
-    if len(master_map) <= 4 and not current_stocklist:
-        # Check if master_map only has indices but current_stocklist is empty
-        pass
-
     safe_master_map = {sanitize_key(k): v for k, v in master_map.items()}
 
+    # Check for discrepancies
     diff_detected = False
     if set(safe_master_map.keys()) != set(current_stocklist.keys()):
         diff_detected = True
@@ -241,7 +232,7 @@ def reconcile_stocklist_with_watchlist() -> tuple[bool, dict[str, str]]:
                 diff_detected = True
                 break
 
-    if diff_detected:
+    if diff_detected or not current_stocklist:
         logger.info(
             f"[RECONCILE] Discrepancy detected between target map ({len(safe_master_map)}) "
             f"and stocklist ({len(current_stocklist)})."
@@ -252,9 +243,10 @@ def reconcile_stocklist_with_watchlist() -> tuple[bool, dict[str, str]]:
             return True, safe_master_map
         except Exception as e:
             logger.error(f"[RECONCILE] Failed to write synchronized /stocklist: {e}", exc_info=True)
-            return False, current_stocklist
+            return False, safe_master_map
 
-    return False, current_stocklist
+    # Discrepancy false, but return the master map so master.py has the full target set
+    return False, safe_master_map
 
 
 def get_stocklist_mapping() -> dict[str, str]:
