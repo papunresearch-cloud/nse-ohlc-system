@@ -208,7 +208,7 @@ class MasterOrchestrator:
         """Initializes state when the calendar date rolls over at midnight."""
         today = now_ist.date()
         self.current_plan_date = today
-        self.calendar.refresh_calendar(force=True)
+        self.calendar.refresh_calendar()
         self.is_today_trading_day = self.calendar.is_trading_day(today)
         self.audit_logged_today = False
 
