@@ -8,11 +8,14 @@ from datetime import datetime
 import pytz
 from firebase_admin import db
 from config import TIMEZONE, logger
+from firebase_manager import init_firebase
 
 IST = pytz.timezone(TIMEZONE)
 
 class SystemHealthManager:
     def __init__(self):
+        # Guarantee Firebase connection is active before requesting database reference
+        init_firebase()
         self.status_ref = db.reference("system_status")
         self.state = {
             "backend_power": "RUNNING",
@@ -64,6 +67,9 @@ class SystemHealthManager:
 
     def publish(self):
         try:
+            if not self.status_ref:
+                init_firebase()
+                self.status_ref = db.reference("system_status")
             self.status_ref.set(self.state)
         except Exception as e:
             logger.warning(f"[HEALTH] Failed to update /system_status node: {e}")
