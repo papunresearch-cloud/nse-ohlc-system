@@ -21,6 +21,7 @@ import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from datetime import datetime, date, time as dt_time
 import pytz
+from health import HEALTH_MONITOR
 
 PORT = int(os.environ.get("PORT", 10000))
 
@@ -320,6 +321,8 @@ class MasterOrchestrator:
         Runs CHILD-1 historical sync under mutex lock.
         Returns a list of script names that successfully synchronized during this run.
         """
+        HEALTH_MONITOR.record_sync_start()
+
         if not self.sync_lock.acquire(blocking=False):
             logger.info("[CHILD-1] Historical sync already in progress. Skipping duplicate.")
             return []
@@ -389,6 +392,8 @@ class MasterOrchestrator:
             except Exception as e:
                 logger.error(f"[CHILD-2] Live tick failed for [{name}]: {e}", exc_info=True)
 
+        HEALTH_MONITOR.record_live_update(updated_count=len(valid_tickers), is_market_open=is_live)        
+
     def log_detailed_sync_audit(self):
         synced = [k for k, v in self.script_status.items() if v.get("synced")]
         unsynced = [k for k, v in self.script_status.items() if not v.get("synced")]
@@ -397,6 +402,12 @@ class MasterOrchestrator:
         logger.info("                   SCRIPT-WISE SYNCHRONIZATION AUDIT REPORT")
         logger.info("=" * 85)
         logger.info(f"Total: {len(self.script_status)} | Synced: {len(synced)} | Failed/Unsynced: {len(unsynced)}")
+
+        HEALTH_MONITOR.record_sync_finish(
+            total=len(self.script_status),
+            synced=synced,
+            unsynced=unsynced
+        )
 
         if synced:
             logger.info("[ACTIVE / SYNCHRONIZED SCRIPTS]")
@@ -446,6 +457,8 @@ class MasterOrchestrator:
                 now_ist = datetime.now(IST)
                 today_date = now_ist.date()
                 now_time = now_ist.time()
+
+                HEALTH_MONITOR.record_heartbeat(is_power_on=STATE_BUS.is_power_on())
 
                 # Priority 0: Difference Detection (Watchlist vs Stocklist)
                 try:
