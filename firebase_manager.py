@@ -1,11 +1,11 @@
 """
 FIREBASE MANAGER
-- Centralized Firebase Admin SDK connection and lifecycle management.
-- Dynamic stock discovery pulling tickers from /param, /detailedDb, and /watchlist.
+- Centralized Firebase Admin SDK connection and lifecycle management[cite: 1, 4].
+- Dynamic stock discovery pulling tickers from /param, /detailedDb, and /watchlist[cite: 2, 4].
 - Safely handles stringified lists and nested nodes.
-- Permanent anchoring of 4 master market indices (immune to purging/deletion).
+- Permanent anchoring of 4 master market indices (immune to purging/deletion)[cite: 4].
 - In-memory calendar caching and urllib3 warning suppression.
-- Guarded OHLC access for Child-1 (1 to 250) and Child-2 (index 0).
+- Guarded OHLC access for Child-1 (1 to 250) and Child-2 (index 0)[cite: 1, 4].
 """
 import os
 import ast
@@ -27,7 +27,7 @@ logging.getLogger("urllib3.connectionpool").setLevel(logging.ERROR)
 
 _CALENDAR_CACHE = None
 
-# Permanent master indices (immune to deletion)
+# Permanent master indices (immune to deletion)[cite: 4]
 FIXED_INDICES = {
     "NIFTY50": "^NSEI",
     "NIFTY100": "^CNX100",
@@ -35,7 +35,7 @@ FIXED_INDICES = {
     "NIFTY SMALLCAP 250": "NIFTYSMLCAP250.NS"
 }
 
-# Known ticker directory for NSE stocks
+# Known ticker directory for NSE stocks[cite: 8]
 KNOWN_TICKERS = {
     "Bank of Maha": "MAHABANK.NS",
     "Bharat Electron": "BEL.NS",
@@ -68,7 +68,7 @@ KNOWN_TICKERS = {
 # 1. CENTRALIZED FIREBASE INITIALIZATION
 # =====================================================================
 def init_firebase() -> None:
-    """Idempotently initializes Firebase Admin SDK."""
+    """Idempotently initializes Firebase Admin SDK[cite: 1, 4]."""
     if not firebase_admin._apps:
         try:
             logger.info("Initializing Firebase Admin SDK connection...")
@@ -95,7 +95,7 @@ def init_firebase() -> None:
 
 
 def sanitize_key(key: str) -> str:
-    """Sanitizes script name string for Firebase path safety."""
+    """Sanitizes script name string for Firebase path safety[cite: 1, 4]."""
     if not key:
         return ""
     return (
@@ -114,7 +114,7 @@ def sanitize_key(key: str) -> str:
 # 2. CALENDAR CONFIG ACCESS (WITH IN-MEMORY CACHE)
 # =====================================================================
 def get_calendar_config(force_reload: bool = False) -> dict:
-    """Reads custom calendar overrides with in-memory caching."""
+    """Reads custom calendar overrides with in-memory caching[cite: 1]."""
     global _CALENDAR_CACHE
     if _CALENDAR_CACHE is not None and not force_reload:
         return _CALENDAR_CACHE
@@ -131,7 +131,7 @@ def get_calendar_config(force_reload: bool = False) -> dict:
 
 
 def set_calendar_config(payload: dict) -> bool:
-    """Saves calendar data in Firebase and updates the local cache."""
+    """Saves calendar data in Firebase and updates the local cache[cite: 1]."""
     global _CALENDAR_CACHE
     init_firebase()
     try:
@@ -149,8 +149,9 @@ def set_calendar_config(payload: dict) -> bool:
 # =====================================================================
 def get_master_watchlist_mapping() -> dict[str, str]:
     """
-    Reads active stocks from /watchlist, /param, and /detailedDb,
-    resolving authentic tickers for all valid equities and indices.
+    Reads active stocks from /watchlist, /param, and /detailedDb[cite: 2, 4],
+    resolving authentic tickers for all valid equities and indices[cite: 2, 4].
+    Always returns exact display names as keys (matching master.py expectations)[cite: 1].
     """
     init_firebase()
     master_mapping = {k: v for k, v in FIXED_INDICES.items()}
@@ -234,7 +235,7 @@ def get_master_watchlist_mapping() -> dict[str, str]:
 
 
 def get_current_stocklist() -> dict[str, str]:
-    """Reads current node at /stocklist."""
+    """Reads current node at /stocklist[cite: 2, 4]."""
     init_firebase()
     try:
         data = db.reference(PATH_SCRIPTS).get() or {}
@@ -248,51 +249,45 @@ def get_current_stocklist() -> dict[str, str]:
 
 def reconcile_stocklist_with_watchlist() -> tuple[bool, dict[str, str]]:
     """
-    Synchronizes /stocklist with resolved watchlist targets.
-    Guarantees a two-item tuple (was_updated: bool, active_map: dict) is returned
-    to preserve exact compatibility with master.py.
+    Synchronizes /stocklist with resolved watchlist targets[cite: 2, 4].
+    Returns (was_updated, active_map) where active_map contains all indices + equities[cite: 2, 4].
     """
     init_firebase()
     master_map = get_master_watchlist_mapping()
     current_stocklist = get_current_stocklist()
 
+    # Create sanitized mapping for Firebase storage
+    safe_master_map = {sanitize_key(k): v for k, v in master_map.items()}
+
     diff_detected = False
-    if set(master_map.keys()) != set(current_stocklist.keys()):
+    if set(safe_master_map.keys()) != set(current_stocklist.keys()):
         diff_detected = True
     else:
-        for stock, ticker in master_map.items():
+        for stock, ticker in safe_master_map.items():
             if current_stocklist.get(stock) != ticker:
                 diff_detected = True
                 break
 
     if diff_detected or not current_stocklist:
-        logger.info(f"[RECONCILE] Updating /stocklist ({len(master_map)} targets) in Firebase...")
+        logger.info(f"[RECONCILE] Updating /stocklist ({len(safe_master_map)} targets) in Firebase...")
         try:
-            # Write sanitized keys to stocklist path
-            safe_payload = {sanitize_key(k): v for k, v in master_map.items()}
-            db.reference(PATH_SCRIPTS).set(safe_payload)
-            return True, master_map
+            db.reference(PATH_SCRIPTS).set(safe_master_map)
         except Exception as e:
             logger.error(f"[RECONCILE] Failed to write /stocklist: {e}", exc_info=True)
-            return False, master_map
 
-    return False, master_map
+    # Return master_map directly so master.py can see equities like 'Bank of Maha'
+    return diff_detected, master_map
 
 
 def get_stocklist_mapping() -> dict[str, str]:
-    """Returns active target dictionary."""
-    mapping = get_current_stocklist()
-    if not mapping or len(mapping) <= 4:
-        _, mapping = reconcile_stocklist_with_watchlist()
-
-    for k, v in FIXED_INDICES.items():
-        mapping.setdefault(k, v)
-
-    return mapping
+    """Returns active target dictionary[cite: 4]."""
+    init_firebase()
+    master_map = get_master_watchlist_mapping()
+    return master_map
 
 
 def get_stocklist() -> list:
-    """Returns list of active target names."""
+    """Returns list of active target names[cite: 2, 4]."""
     return list(get_stocklist_mapping().keys())
 
 
@@ -304,7 +299,7 @@ def get_scripts_list() -> list[str]:
 # 4. OHLC DATABASE ACCESS
 # =====================================================================
 def get_stock_ohlc(display_name: str) -> dict:
-    """Reads complete OHLC records from /stocks/<display_name>."""
+    """Reads complete OHLC records from /stocks/<display_name>[cite: 1, 4]."""
     init_firebase()
     try:
         safe_key = sanitize_key(display_name)
@@ -317,7 +312,7 @@ def get_stock_ohlc(display_name: str) -> dict:
 
 
 def save_stock_ohlc(display_name: str, payload: dict) -> bool:
-    """Saves complete OHLC dataset into /stocks/<display_name>."""
+    """Saves complete OHLC dataset into /stocks/<display_name>[cite: 1, 4]."""
     init_firebase()
     try:
         safe_key = sanitize_key(display_name)
@@ -330,7 +325,7 @@ def save_stock_ohlc(display_name: str, payload: dict) -> bool:
 
 
 def write_full_ohlc(display_name: str, ohlc_dict: dict) -> bool:
-    """Updates historical records under /stocks/<display_name>."""
+    """Updates historical records under /stocks/<display_name>[cite: 1, 4]."""
     init_firebase()
     try:
         safe_key = sanitize_key(display_name)
@@ -346,7 +341,7 @@ write_historical_ohlc = write_full_ohlc
 
 
 def update_live_candle(display_name: str, live_candle: dict) -> bool:
-    """Writes intraday candle strictly to index 0."""
+    """Writes intraday candle strictly to index 0[cite: 1, 4]."""
     init_firebase()
     try:
         safe_key = sanitize_key(display_name)
@@ -362,7 +357,7 @@ write_live_ohlc = update_live_candle
 
 
 def clear_live_candle(display_name: str) -> bool:
-    """Purges live index 0 using .delete()."""
+    """Purges live index 0 using .delete()[cite: 1, 4]."""
     init_firebase()
     try:
         safe_key = sanitize_key(display_name)
