@@ -1,11 +1,10 @@
 """
 FIREBASE MANAGER
 - Centralized Firebase Admin SDK connection and lifecycle management[cite: 1, 4].
-- Dynamic stock discovery and reconciliation for /stocklist from master /watchlist[cite: 2, 4].
+- Dynamic stock discovery pulling tickers from /param, /detailedDb, and /display_list[cite: 2, 4].
 - Permanent anchoring of 4 master market indices (immune to purging/deletion)[cite: 4].
-- Pure read-only access to master nodes: /watchlist and /detailedDb[cite: 2, 4].
-- In-memory calendar caching and urllib3 error suppression.
-- Guarded OHLC access for Child-1 (1 to 250) and Child-2 (index 0)[cite: 1, 4].
+- In-memory calendar caching and urllib3 warning suppression.
+- Complete read/write access for OHLC records (Index 0 live, Index 1-250 historical)[cite: 1, 4].
 """
 import os
 import json
@@ -21,15 +20,13 @@ from config import (
     TARGET_OHLC_COUNT
 )
 
-# 1. Suppress noisy remote connection-drop warnings from urllib3
+# 1. Mute noisy connection pool disconnect warnings
 logging.getLogger("urllib3.connectionpool").setLevel(logging.ERROR)
 
-# In-memory calendar cache to avoid polling Firebase on every tick
+# In-memory calendar cache
 _CALENDAR_CACHE = None
 
-# =====================================================================
-# PERMANENT MASTER INDICES (Immune to deletion)
-# =====================================================================
+# Permanent master indices[cite: 4]
 FIXED_INDICES = {
     "NIFTY50": "^NSEI",
     "NIFTY100": "^CNX100",
@@ -88,7 +85,7 @@ def sanitize_key(key: str) -> str:
 # 2. CALENDAR CONFIG ACCESS (WITH IN-MEMORY CACHE)
 # =====================================================================
 def get_calendar_config(force_reload: bool = False) -> dict:
-    """Reads custom calendar overrides / holidays with in-memory caching."""
+    """Reads custom calendar overrides / holidays with in-memory caching[cite: 1]."""
     global _CALENDAR_CACHE
     if _CALENDAR_CACHE is not None and not force_reload:
         return _CALENDAR_CACHE
@@ -105,7 +102,7 @@ def get_calendar_config(force_reload: bool = False) -> dict:
 
 
 def set_calendar_config(payload: dict) -> bool:
-    """Saves or seeds custom calendar data in Firebase and updates cache."""
+    """Saves or seeds custom calendar data in Firebase and updates cache[cite: 1]."""
     global _CALENDAR_CACHE
     init_firebase()
     try:
@@ -119,47 +116,60 @@ def set_calendar_config(payload: dict) -> bool:
 
 
 # =====================================================================
-# 3. MASTER WATCHLIST READS & RECONCILIATION
+# 3. ROBUST WATCHLIST & TICKER DISCOVERY
 # =====================================================================
 def get_master_watchlist_mapping() -> dict[str, str]:
     """
     STRICT READ-ONLY:
     1. Anchors the 4 permanent master indices[cite: 4].
-    2. Merges root /detailedDb, /watchlist/detailedDb, and /param to resolve tickers[cite: 2, 4].
+    2. Inspects /param, /detailedDb, /display_list, and /watchlist to discover all equities[cite: 2, 4].
     Returns: { Clean Sanitized Name: Yahoo Ticker }
     """
     init_firebase()
     master_mapping = {sanitize_key(k): v for k, v in FIXED_INDICES.items()}
 
     try:
+        # 1. Fetch metadata nodes
+        param_db = db.reference("param").get() or {}
+        detailed_db = db.reference("detailedDb").get() or {}
+        display_list = db.reference("display_list").get() or {}
         watchlist_root = db.reference("watchlist").get() or {}
 
-        raw_names = []
-        nested_detailed = {}
-        if isinstance(watchlist_root, dict):
-            raw_names = watchlist_root.get("watchlist", [])
-            nested_detailed = watchlist_root.get("detailedDb", {})
-        elif isinstance(watchlist_root, list):
-            raw_names = watchlist_root
-
-        active_names = []
-        if isinstance(raw_names, dict):
-            active_names = [str(v).strip() for v in raw_names.values() if v]
-        elif isinstance(raw_names, list):
-            active_names = [str(v).strip() for v in raw_names if v]
-
-        root_detailed = db.reference("detailedDb").get() or {}
-        param_db = db.reference("param").get() or {}
-
+        # Merge metadata sources
         combined_db = {}
+        if isinstance(detailed_db, dict):
+            combined_db.update(detailed_db)
         if isinstance(param_db, dict):
             combined_db.update(param_db)
-        if isinstance(nested_detailed, dict):
-            combined_db.update(nested_detailed)
-        if isinstance(root_detailed, dict):
-            combined_db.update(root_detailed)
 
-        for name in active_names:
+        # 2. Extract active script names from all available registries
+        candidate_names = set()
+
+        if isinstance(watchlist_root, dict):
+            wl = watchlist_root.get("watchlist", [])
+            if isinstance(wl, (list, dict)):
+                items = wl.values() if isinstance(wl, dict) else wl
+                candidate_names.update(str(x).strip() for x in items if x)
+            for k in watchlist_root.keys():
+                if k not in ("watchlist", "detailedDb", "lastSync"):
+                    candidate_names.add(str(k).strip())
+        elif isinstance(watchlist_root, list):
+            candidate_names.update(str(x).strip() for x in watchlist_root if x)
+
+        if isinstance(display_list, list):
+            candidate_names.update(str(x).strip() for x in display_list if x)
+        elif isinstance(display_list, dict):
+            candidate_names.update(str(x).strip() for x in display_list.values() if x)
+
+        # If watchlist is empty, fall back directly to keys in param
+        if not candidate_names and isinstance(param_db, dict):
+            candidate_names.update(param_db.keys())
+
+        # 3. Match candidate names to tickers
+        for name in candidate_names:
+            if not name:
+                continue
+
             sanitized_name = sanitize_key(name)
             dot_name = name.replace(".", "_")
 
@@ -170,17 +180,36 @@ def get_master_watchlist_mapping() -> dict[str, str]:
                 {}
             )
 
-            ticker = stock_info.get("TICKER") or stock_info.get("ticker") or stock_info.get("Ticker")
+            ticker = (
+                stock_info.get("TICKER") or
+                stock_info.get("ticker") or
+                stock_info.get("Ticker")
+            )
 
+            # Fallback to CODE or NSE field if TICKER key is missing[cite: 2]
             if not ticker:
                 code_val = (
                     stock_info.get("CODE") or
-                    stock_info.get("NSE") or
                     stock_info.get("code") or
+                    stock_info.get("NSE") or
                     stock_info.get("nse")
                 )
                 if code_val:
                     ticker = f"{str(code_val).strip()}.NS"
+
+            # Auto-generate ticker from common NSE conventions if missing
+            if not ticker:
+                # Specific ticker overrides for common stock names[cite: 8]
+                overrides = {
+                    "Bank of Maha": "MAHABANK.NS",
+                    "Bharat Electron": "BEL.NS",
+                    "Black Box": "BBOX.NS",
+                    "Caplin Point Lab": "CAPLIPOINT.NS",
+                    "Coal India": "COALINDIA.NS",
+                    "Dixon Technolog_": "DIXON.NS",
+                    "Dixon Technolog.": "DIXON.NS"
+                }
+                ticker = overrides.get(name) or overrides.get(sanitized_name)
 
             if ticker:
                 t = str(ticker).strip()
@@ -188,7 +217,7 @@ def get_master_watchlist_mapping() -> dict[str, str]:
                     t = "^NSEI"
                 master_mapping[sanitized_name] = t
             else:
-                logger.warning(f"[MASTER-WATCHLIST] Stock '{name}' listed in watchlist but no TICKER/CODE found.")
+                logger.warning(f"[MASTER-WATCHLIST] Stock '{name}' found but could not resolve TICKER.")
 
         logger.info(f"[MASTER-WATCHLIST] Resolved {len(master_mapping)} total targets (4 indices + {len(master_mapping) - 4} stocks).")
         return master_mapping
@@ -213,8 +242,8 @@ def get_current_stocklist() -> dict[str, str]:
 
 def reconcile_stocklist_with_watchlist() -> tuple[bool, dict[str, str]]:
     """
-    Compares /stocklist against the master /watchlist and FIXED_INDICES[cite: 2, 4].
-    Always returns the valid master map dictionary so master.py never starves[cite: 1].
+    Compares /stocklist against master targets and FIXED_INDICES[cite: 2, 4].
+    Guarantees active stocks are always returned so master.py never starves[cite: 1].
     """
     init_firebase()
     master_map = get_master_watchlist_mapping()
@@ -234,18 +263,15 @@ def reconcile_stocklist_with_watchlist() -> tuple[bool, dict[str, str]]:
 
     if diff_detected or not current_stocklist:
         logger.info(
-            f"[RECONCILE] Discrepancy detected between target map ({len(safe_master_map)}) "
-            f"and stocklist ({len(current_stocklist)})."
+            f"[RECONCILE] Updating /stocklist ({len(safe_master_map)} targets) to reflect master targets."
         )
         try:
             db.reference(PATH_SCRIPTS).set(safe_master_map)
-            logger.info(f"[RECONCILE] /stocklist successfully synchronized with {len(safe_master_map)} targets.")
             return True, safe_master_map
         except Exception as e:
             logger.error(f"[RECONCILE] Failed to write synchronized /stocklist: {e}", exc_info=True)
             return False, safe_master_map
 
-    # Discrepancy false, but return the master map so master.py has the full target set
     return False, safe_master_map
 
 
