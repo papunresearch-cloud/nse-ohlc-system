@@ -12,9 +12,10 @@ from firebase_manager import init_firebase
 
 IST = pytz.timezone(TIMEZONE)
 
+
 class SystemHealthManager:
     def __init__(self):
-        # Guarantee Firebase connection is active before requesting database reference
+        # Ensure Firebase Admin SDK is initialized before requesting database reference
         init_firebase()
         self.status_ref = db.reference("system_status")
         self.state = {
@@ -28,7 +29,7 @@ class SystemHealthManager:
             },
             "sync_data": {
                 "last_sync_time": "Never",
-                "status": "NOT_RUNNED",
+                "status": "IDLE",
                 "total_registered": 0,
                 "synced_count": 0,
                 "failed_count": 0,
@@ -57,12 +58,37 @@ class SystemHealthManager:
         self.publish()
 
     def record_sync_finish(self, total: int, synced: list, unsynced: list):
+        """
+        Records the outcome of a synchronization run.
+        Filters out queued/pending entries so newly booted or waiting stocks
+        do not falsely trigger a SYNC_ERROR state.
+        """
         self.state["sync_data"]["last_sync_time"] = self._get_timestamp()
         self.state["sync_data"]["total_registered"] = total
         self.state["sync_data"]["synced_count"] = len(synced)
-        self.state["sync_data"]["failed_count"] = len(unsynced)
-        self.state["sync_data"]["failed_scripts"] = unsynced
-        self.state["sync_data"]["status"] = "VERIFIED" if len(unsynced) == 0 else "SYNC_ERROR"
+
+        # Distinguish genuine vendor/validation errors from unattempted/pending entries
+        true_failed_names = []
+        for item in unsynced:
+            if isinstance(item, dict):
+                err = str(item.get("error", ""))
+                # Stocks with no error or still awaiting initial sync are not genuine failures
+                if err and "Awaiting" not in err:
+                    true_failed_names.append(item.get("name", "Unknown"))
+            elif isinstance(item, str):
+                true_failed_names.append(item)
+
+        self.state["sync_data"]["failed_count"] = len(true_failed_names)
+        self.state["sync_data"]["failed_scripts"] = true_failed_names
+
+        # Evaluate engine status accurately
+        if total > 0 and len(synced) == total:
+            self.state["sync_data"]["status"] = "VERIFIED"
+        elif len(true_failed_names) > 0:
+            self.state["sync_data"]["status"] = "SYNC_ERROR"
+        else:
+            self.state["sync_data"]["status"] = "IDLE"
+
         self.publish()
 
     def publish(self):
@@ -74,5 +100,6 @@ class SystemHealthManager:
         except Exception as e:
             logger.warning(f"[HEALTH] Failed to update /system_status node: {e}")
 
-# Global singleton
+
+# Global singleton instance
 HEALTH_MONITOR = SystemHealthManager()
