@@ -1,7 +1,7 @@
 """
-HEALTH & DIAGNOSTIC REPORTER MODULE (health.py)
-Tracks backend state, live update timestamps, historical sync health, 
-and publishes real-time diagnostics to Firebase Realtime Database.
+DISPUTE-AWARE HEALTH & AUDIT ENGINE (health.py)
+Measures database distance from the ideal exchange trading date instead of
+raising binary SYNC_ERROR panics.
 """
 import time
 from datetime import datetime
@@ -15,7 +15,6 @@ IST = pytz.timezone(TIMEZONE)
 
 class SystemHealthManager:
     def __init__(self):
-        # Ensure Firebase Admin SDK is initialized before requesting database reference
         init_firebase()
         self.status_ref = db.reference("system_status")
         self.state = {
@@ -29,11 +28,13 @@ class SystemHealthManager:
             },
             "sync_data": {
                 "last_sync_time": "Never",
-                "status": "IDLE",
+                "status": "IDLE",            # IDLE | AUDITING | HEALTHY | DISPUTED | DEGRADED
+                "target_date": "Unknown",
                 "total_registered": 0,
-                "synced_count": 0,
-                "failed_count": 0,
-                "failed_scripts": []
+                "ideal_count": 0,
+                "disputed_count": 0,
+                "broken_count": 0,
+                "disputes": []              # [{name, stored_date, lag_days, status}]
             }
         }
         self.publish()
@@ -53,42 +54,66 @@ class SystemHealthManager:
         self.state["live_data"]["status"] = "STREAMING" if is_market_open else "MARKET_CLOSED"
         self.publish()
 
-    def record_sync_start(self):
-        self.state["sync_data"]["status"] = "SYNCING"
+    def record_audit_start(self):
+        self.state["sync_data"]["status"] = "AUDITING"
         self.publish()
 
-    def record_sync_finish(self, total: int, synced: list, unsynced: list):
+    def record_dispute_audit(self, target_date_str: str, stock_audits: list):
         """
-        Records the outcome of a synchronization run.
-        Filters out queued/pending entries so newly booted or waiting stocks
-        do not falsely trigger a SYNC_ERROR state.
+        Evaluates stocks against the target exchange date.
+        stock_audits: list of dicts:
+          [{"name": "Coal India", "stored_date": "2026-09-11", "gap": 0, "broken": False}, ...]
         """
-        self.state["sync_data"]["last_sync_time"] = self._get_timestamp()
-        self.state["sync_data"]["total_registered"] = total
-        self.state["sync_data"]["synced_count"] = len(synced)
+        total = len(stock_audits)
+        ideal_count = 0
+        broken_count = 0
+        disputes = []
 
-        # Distinguish genuine vendor/validation errors from unattempted/pending entries
-        true_failed_names = []
-        for item in unsynced:
-            if isinstance(item, dict):
-                err = str(item.get("error", ""))
-                # Stocks with no error or still awaiting initial sync are not genuine failures
-                if err and "Awaiting" not in err:
-                    true_failed_names.append(item.get("name", "Unknown"))
-            elif isinstance(item, str):
-                true_failed_names.append(item)
+        for item in stock_audits:
+            name = item.get("name", "Unknown")
+            gap = item.get("gap", 0)
+            is_broken = item.get("broken", False)
+            stored_date = item.get("stored_date", "None")
 
-        self.state["sync_data"]["failed_count"] = len(true_failed_names)
-        self.state["sync_data"]["failed_scripts"] = true_failed_names
+            if is_broken:
+                broken_count += 1
+                disputes.append({
+                    "name": name,
+                    "stored_date": stored_date,
+                    "lag_days": gap,
+                    "status": "CORRUPTED_OR_EMPTY"
+                })
+            elif gap > 0:
+                disputes.append({
+                    "name": name,
+                    "stored_date": stored_date,
+                    "lag_days": gap,
+                    "status": f"LAGGING ({gap}d)"
+                })
+            else:
+                ideal_count += 1
 
-        # Evaluate engine status accurately
-        if total > 0 and len(synced) == total:
-            self.state["sync_data"]["status"] = "VERIFIED"
-        elif len(true_failed_names) > 0:
-            self.state["sync_data"]["status"] = "SYNC_ERROR"
+        disputed_count = len(disputes) - broken_count
+
+        if total == 0:
+            overall_status = "IDLE"
+        elif broken_count > 0:
+            overall_status = "DEGRADED"
+        elif disputed_count > 0:
+            overall_status = "DISPUTED"
         else:
-            self.state["sync_data"]["status"] = "IDLE"
+            overall_status = "HEALTHY"
 
+        self.state["sync_data"] = {
+            "last_sync_time": self._get_timestamp(),
+            "status": overall_status,
+            "target_date": target_date_str,
+            "total_registered": total,
+            "ideal_count": ideal_count,
+            "disputed_count": disputed_count,
+            "broken_count": broken_count,
+            "disputes": disputes
+        }
         self.publish()
 
     def publish(self):
@@ -98,8 +123,7 @@ class SystemHealthManager:
                 self.status_ref = db.reference("system_status")
             self.status_ref.set(self.state)
         except Exception as e:
-            logger.warning(f"[HEALTH] Failed to update /system_status node: {e}")
+            logger.warning(f"[HEALTH] Failed to publish /system_status: {e}")
 
 
-# Global singleton instance
 HEALTH_MONITOR = SystemHealthManager()
