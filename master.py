@@ -1,16 +1,17 @@
 """
-MASTER / MOTHER PROGRAM (nse_ohlc_system)
-- Priority 0: Watchlist is absolute master. Stocklist is continuously synchronized.
-- Never mutates or deletes from /watchlist or /watchlist/detailedDb.
-- Guarded OHLC protection: Stocks present in /watchlist are never purged.
+MASTER ORCHESTRATOR
 - SR Flip-Flop Power Latch (Default: ON).
-- External pulse commands: /start, /stop, /sync.
-- Embedded HTTP Server with full CORS, /health status reporting, and HEAD handling.
-- Pre-market sync window (08:00–08:30 IST) with retry intervals.
-- Index 0 remains safe overnight (Never deleted).
+- Handles 30-second pulse commands: /start, /stop, /sync.
+- Embedded HTTP Server with minimal /health, GET, and HEAD handling for cron-job.org.
+- Real-time /system_status heartbeat telemetry to Firebase (every 300s).
+- State-driven date planning (auto-adjusts if restarted or offline at midnight).
+- Pre-market sync window (08:00–08:30 IST) with 5-minute retry intervals.
+- 08:30 IST synchronization audit log with script-by-script diagnostic reporting.
+- Index 0 live sanitization: Clears index 0 at 09:00 IST and 16:00 IST.
+- Per-script live quarantine: Unsynced stocks are skipped by Child-2.
+- Index 1 vs Index 0 alignment: Sync reads Index 1; Live updates Index 0.
 - Parameter Engine: Computes indicators every 15 minutes during LIVE sessions.
 """
-
 import os
 import sys
 import time
@@ -35,6 +36,7 @@ from config import (
     logger
 )
 
+# Defensive fallback in case PARAM_UPDATE_INTERVAL_SEC is not defined in config.py
 try:
     from config import PARAM_UPDATE_INTERVAL_SEC
 except ImportError:
@@ -42,17 +44,17 @@ except ImportError:
 
 from firebase_admin import db
 from firebase_manager import (
-    init_firebase,
-    reconcile_stocklist_with_watchlist,
-    get_stock_ohlc,
-    clear_live_candle
+    init_firebase, 
+    get_stocklist_mapping, 
+    get_stock_ohlc, 
+    clear_live_candle,
+    reconcile_stocklist_with_watchlist
 )
 from market_calendar import MarketCalendar
 from sync_child import sync_historical_script
 from live_child import update_live_script
 from yahoo_manager import get_latest_available_trading_date
 from parameter import update_all_parameters
-from health import HEALTH_MONITOR
 
 IST = pytz.timezone(TIMEZONE)
 _keep_running = True
@@ -64,7 +66,7 @@ _keep_running = True
 class SystemStateBus:
     def __init__(self):
         self.lock = threading.Lock()
-        self.power_latched_on = True  # Default: ON
+        self.power_latched_on = True  # Default state: ON
         self.pulse_sync_time = 0.0
 
     def trigger_pulse(self, command: str):
@@ -97,22 +99,14 @@ STATE_BUS = SystemStateBus()
 
 
 # =====================================================================
-# HTTP PULSE RECEIVER & HEALTH SERVER (WITH CORS & STATUS MONITORING)
+# HTTP PULSE RECEIVER & HEALTH SERVER (CRON-JOB COMPATIBLE)
 # =====================================================================
 class PulseCommandServer(BaseHTTPRequestHandler):
-    def do_OPTIONS(self):
-        """Handles CORS preflight requests from the React browser frontend."""
-        self.send_response(200)
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "GET, HEAD, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "*")
-        self.end_headers()
-
     def do_HEAD(self):
-        """Satisfies HEAD requests with 0 body bytes for uptime monitors."""
+        """Satisfies HEAD requests with 0 body bytes to pass keep-alive checks."""
         self.send_response(200)
         self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-type", "text/plain; charset=utf-8")
         self.send_header("Content-Length", "0")
         self.end_headers()
 
@@ -120,7 +114,8 @@ class PulseCommandServer(BaseHTTPRequestHandler):
         """Handles incoming pulse commands and keep-alive health pings."""
         path = self.path.lower().strip()
         state_str = "ON" if STATE_BUS.is_power_on() else "OFF"
-
+        
+        # Dedicated keep-alive route for cron-job.org and frontend checks
         if path in ("/health", "/ping"):
             self._send_resp(200, f"OK - State: {state_str}\n")
         elif path in ("/start", "/api/start"):
@@ -139,36 +134,37 @@ class PulseCommandServer(BaseHTTPRequestHandler):
         payload = message.encode("utf-8")
         self.send_response(code)
         self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "GET, HEAD, OPTIONS")
-        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-type", "text/plain; charset=utf-8")
         self.send_header("Content-Length", str(len(payload)))
         self.end_headers()
         self.wfile.write(payload)
 
     def log_message(self, format, *args):
-        return  # Suppress HTTP access logging in stdout to prevent log flooding
+        return  # Suppress HTTP access logging in stdout
 
 
 def start_http_listener():
-    """Starts the HTTP server on Render's designated port in a daemon thread."""
-    port = int(os.environ.get("PORT", 10000))
-    server = HTTPServer(("0.0.0.0", port), PulseCommandServer)
-    logger.info(f"[HTTP] Command server listening on 0.0.0.0:{port}")
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
+    port_str = os.environ.get("PORT", "10000")
+    try:
+        port = int(port_str)
+        server = HTTPServer(("0.0.0.0", port), PulseCommandServer)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        logger.info(f"Command listener & Render health check bound to 0.0.0.0:{port}")
+    except Exception as e:
+        logger.error(f"Failed to start pulse listener on port {port_str}: {e}")
 
 
 # =====================================================================
 # SIGNAL HANDLING
 # =====================================================================
-def signal_handler(signum, frame):
+def handle_shutdown(signum, frame):
     global _keep_running
-    logger.info(f"Shutdown signal ({signum}) received. Stopping Master gracefully...")
+    logger.info(f"Signal ({signum}) caught. Terminating gracefully...")
     _keep_running = False
 
 
-signal.signal(signal.SIGINT, signal_handler)
-signal.signal(signal.SIGTERM, signal_handler)
+signal.signal(signal.SIGINT, handle_shutdown)
+signal.signal(signal.SIGTERM, handle_shutdown)
 
 
 # =====================================================================
@@ -182,117 +178,133 @@ class MasterOrchestrator:
         self.last_planned_date = None
         self.is_today_trading_day = False
         self.sync_audit_reported_today = False
-        self.post_market_calc_done = False
+        self.preopen_cleared_today = False
+        self.postclose_cleared_today = False
 
         self.last_sync_attempt_time = 0.0
         self.last_live_update_time = 0.0
         self.last_param_calc_time = 0.0
+        self.last_heartbeat_write_time = 0.0
 
-        # Per-script dictionary holding operational state
+        # Per-script dictionary holding independent operational state
         self.script_status = {}
-
-    def _get_reconciled_stock_map(self) -> dict:
-        """Helper to unpack reconcile_stocklist_with_watchlist safely whether it returns dict or tuple."""
-        result = reconcile_stocklist_with_watchlist()
-        if isinstance(result, tuple):
-            return result[0] if len(result) > 0 and isinstance(result[0], dict) else {}
-        elif isinstance(result, dict):
-            return result
-        return {}
 
     def run(self):
         logger.info("==================================================")
         logger.info("NSE EQUITY OHLC DATABASE MAINTENANCE ACTIVE")
         logger.info("==================================================")
 
-        # 1. Startup initialization and schedule planning
+        # Startup initialization
         self.replan_daily_routine()
+        
+        # Fire immediate startup heartbeat
+        self.write_heartbeat()
 
-        # 2. Run initial historical sync in background thread so HTTP is responsive immediately
-        threading.Thread(
-            target=self.execute_historical_sync, 
-            kwargs={"is_manual": False}, 
-            daemon=True
-        ).start()
+        # Run startup sync in background thread
+        threading.Thread(target=self.execute_historical_sync, kwargs={"is_manual": False}, daemon=True).start()
 
         while _keep_running:
             try:
-                # 1. Push heartbeat diagnostic to Firebase
-                HEALTH_MONITOR.record_heartbeat(is_power_on=STATE_BUS.is_power_on())
-
-                # 2. Flip-Flop Power Check
-                if not STATE_BUS.is_power_on():
-                    time.sleep(HEARTBEAT_TICK_SEC)
-                    continue
-
+                now_epoch = time.time()
                 now_ist = datetime.now(IST)
                 today_date = now_ist.date()
                 now_time = now_ist.time()
 
-                # Priority 0: Manual Sync Trigger (Instant Interruption)
+                # --- 1. System Heartbeat Telemetry (Every 300 seconds) ---
+                if (now_epoch - self.last_heartbeat_write_time) >= 300:
+                    self.write_heartbeat()
+                    self.last_heartbeat_write_time = now_epoch
+
+                # --- 2. Flip-Flop Power Check ---
+                if not STATE_BUS.is_power_on():
+                    time.sleep(HEARTBEAT_TICK_SEC)
+                    continue
+
+                # --- Priority 0: Manual Pulse Interruption ---
                 if STATE_BUS.check_and_clear_manual_sync():
-                    logger.info("[MANUAL OVERRIDE] Immediate resync commanded. Processing all scripts...")
+                    logger.info("[OVERRIDE PULSE] Immediate sync commanded. Processing scripts...")
                     self.execute_historical_sync(is_manual=True)
                     continue
 
-                # Priority 1: State-Driven Date Catch-Up (crossing midnight)
+                # --- Priority 1: State-Driven Date Catch-Up ---
                 if self.last_planned_date != today_date:
                     self.replan_daily_routine()
 
-                # If today is a weekend or NSE holiday, sleep and wait for next calendar date
+                # If today is a weekend or NSE holiday, sleep and wait
                 if not self.is_today_trading_day:
                     time.sleep(HEARTBEAT_TICK_SEC * 5)
                     continue
 
-                # Priority 2: Pre-Market Historical Sync Window (08:00 – 08:30 IST)
+                # --- Pre-Market Index 0 Sanitation (09:00 AM IST) ---
+                if now_time.hour == 9 and now_time.minute >= 0 and not self.preopen_cleared_today:
+                    self.sanitize_all_indices_zero("Pre-Market (09:00 AM)")
+                    self.preopen_cleared_today = True
+
+                # --- Post-Market Index 0 Sanitation (16:00 PM IST) ---
+                if now_time.hour >= 16 and not self.postclose_cleared_today:
+                    self.sanitize_all_indices_zero("Post-Market (16:00 PM)")
+                    self.postclose_cleared_today = True
+
+                # --- Priority 2: Pre-Market Historical Sync Window (08:00 – 08:30 IST) ---
                 sync_start = datetime.strptime(f"{SYNC_WINDOW_START_HOUR}:{SYNC_WINDOW_START_MIN}", "%H:%M").time()
                 sync_cutoff = datetime.strptime(f"{SYNC_WINDOW_DEADLINE_HOUR}:{SYNC_WINDOW_DEADLINE_MIN}", "%H:%M").time()
 
                 if sync_start <= now_time < sync_cutoff:
-                    has_unsynced = any(not s.get("synced", False) for s in self.script_status.values())
-                    if has_unsynced and (time.time() - self.last_sync_attempt_time >= SYNC_RETRY_INTERVAL_SEC):
+                    has_unsynced = any(not s["synced"] for s in self.script_status.values())
+                    if has_unsynced and (now_epoch - self.last_sync_attempt_time >= SYNC_RETRY_INTERVAL_SEC):
                         logger.info("[SCHEDULE] Pre-market sync window active. Retrying unsynced scripts...")
                         self.execute_historical_sync(is_manual=False)
-                        self.last_sync_attempt_time = time.time()
+                        self.last_sync_attempt_time = now_epoch
 
                 # Audit Report Check at or after 08:30 IST
                 if now_time >= sync_cutoff and not self.sync_audit_reported_today:
                     self.log_detailed_sync_audit()
                     self.sync_audit_reported_today = True
 
-                # Priority 3: Live Market Hours Execution (09:15 – 15:30 IST)
+                # --- Priority 3: Live Market Window (09:15 – 15:30 IST) ---
                 self.calendar.refresh_calendar()
-                market_status, _ = self.calendar.get_market_status()
+                status, _ = self.calendar.get_market_status()
 
-                if market_status == "LIVE":
-                    # Live intraday candle updates (Index 0)
-                    if (time.time() - self.last_live_update_time) >= LIVE_UPDATE_INTERVAL_SEC:
+                if status == "LIVE":
+                    # 5-minute live update pass
+                    if (now_epoch - self.last_live_update_time) >= LIVE_UPDATE_INTERVAL_SEC:
                         self.execute_live_updates()
-                        self.last_live_update_time = time.time()
+                        self.last_live_update_time = now_epoch
 
-                    # 15-minute parameter engine calculations
-                    if (time.time() - self.last_param_calc_time) >= PARAM_UPDATE_INTERVAL_SEC:
-                        self.execute_parameter_calculations()
-                        self.last_param_calc_time = time.time()
+                    # 15-minute parameter recalculation pass
+                    if (now_epoch - self.last_param_calc_time) >= PARAM_UPDATE_INTERVAL_SEC:
+                        active_synced_scripts = [name for name, meta in self.script_status.items() if meta["synced"]]
+                        if active_synced_scripts:
+                            update_all_parameters(active_synced_scripts)
+                        self.last_param_calc_time = now_epoch
 
-                # Priority 4: Post-Market Indicator Computation (At 15:30 IST)
-                if (now_time.hour == 15 and now_time.minute >= 30) or now_time.hour >= 16:
-                    if not self.post_market_calc_done:
-                        logger.info("[POST-MARKET] Market session concluded. Running final daily parameter computation...")
-                        self.execute_parameter_calculations()
-                        self.post_market_calc_done = True
-
-                # Heartbeat sleep
                 time.sleep(HEARTBEAT_TICK_SEC)
 
             except Exception as e:
-                logger.critical(f"Unhandled exception in Master loop: {e}", exc_info=True)
+                logger.critical(f"Unhandled exception in master loop: {e}", exc_info=True)
                 time.sleep(5)
 
-        logger.info("Master orchestrator stopped safely.")
+        logger.info("Master orchestrator stopped cleanly.")
+
+    def write_heartbeat(self):
+        """Writes live heartbeat telemetry to Firebase /system_status node."""
+        try:
+            now_epoch = time.time()
+            now_ist_str = datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S IST")
+            power_status = "RUNNING" if STATE_BUS.is_power_on() else "STOPPED"
+
+            payload = {
+                "heartbeat_epoch": now_epoch,
+                "last_heartbeat": now_ist_str,
+                "backend_power": power_status
+            }
+            db.reference("system_status").update(payload)
+            logger.info(f"[HEARTBEAT] Telemetry updated -> {now_ist_str}")
+        except Exception as e:
+            logger.error(f"[HEARTBEAT] Failed to write heartbeat: {e}")
 
     def replan_daily_routine(self):
-        """Generates or updates today's plan, rebuilds script status, and reconciles stocklist."""
+        """Generates or updates today's calendar plan and resets tracking flags."""
         now_ist = datetime.now(IST)
         today = now_ist.date()
         self.calendar.refresh_calendar()
@@ -300,146 +312,137 @@ class MasterOrchestrator:
         self.is_today_trading_day = self.calendar.is_trading_day(today)
         self.last_planned_date = today
         self.sync_audit_reported_today = False
-        self.post_market_calc_done = False
+        self.preopen_cleared_today = False
+        self.postclose_cleared_today = False
 
-        # Safe unpack of reconciled stock dictionary
-        stock_map = self._get_reconciled_stock_map()
-        if not stock_map:
-            logger.warning("[SAFETY] Watchlist reconciliation returned 0 stocks. Historical data preserved.")
-            return
-
-        # Rebuild script status dictionary
-        new_status = {}
-        for name, ticker in stock_map.items():
-            if name in self.script_status:
-                new_status[name] = self.script_status[name]
-                new_status[name]["ticker"] = ticker
-            else:
-                new_status[name] = {
-                    "synced": False,
-                    "last_attempt_at": None,
-                    "error": "Awaiting initial sync",
-                    "ticker": ticker
-                }
-        self.script_status = new_status
+        stock_map = get_stocklist_mapping()
+        self.script_status = {
+            name: {
+                "synced": False,
+                "last_attempt_at": None,
+                "error": "Awaiting daily sync",
+                "ticker": ticker
+            }
+            for name, ticker in stock_map.items()
+        }
         status_label = "TRADING SESSION" if self.is_today_trading_day else "NON-TRADING DAY (Closed)"
-        logger.info(f"[PLANNER] Day plan for {today} IST refreshed: {status_label} ({len(self.script_status)} stocks)")
+        logger.info(f"[PLANNER] Day plan for {today} IST initialized: {status_label} ({len(self.script_status)} stocks)")
 
     def execute_historical_sync(self, is_manual: bool = False):
-        """Executes CHILD-1 historical sync across registered stocks and publishes progress."""
-        logger.info(f"[SYNC] Starting historical sync cycle (Manual={is_manual})...")
-        HEALTH_MONITOR.record_sync_start()
-        stock_map = self._get_reconciled_stock_map()
+        """Runs CHILD-1 historical sync for scripts with strict fault isolation."""
+        now_str = datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S")
 
-        for name, ticker in stock_map.items():
-            if not _keep_running:
-                break
-            try:
-                existing_ohlc = get_stock_ohlc(name)
-                gap = TARGET_OHLC_COUNT
-
-                if existing_ohlc:
-                    idx1 = None
-                    if isinstance(existing_ohlc, list) and len(existing_ohlc) > 1:
-                        idx1 = existing_ohlc[1]
-                    elif isinstance(existing_ohlc, dict):
-                        idx1 = existing_ohlc.get("1") or existing_ohlc.get(1)
-
-                    if idx1 and isinstance(idx1, dict) and "date" in idx1:
-                        fb_date = datetime.strptime(str(idx1["date"]), "%Y-%m-%d").date()
-                        latest_yahoo_date = get_latest_available_trading_date(ticker)
-                        if latest_yahoo_date:
-                            gap = self.calendar.get_trading_day_gap(fb_date, latest_yahoo_date)
-
-                if not existing_ohlc or gap > 0:
-                    logger.info(f"[{name}] Sync required. Missing gap: {gap} trading day(s).")
-                    success = sync_historical_script(name, ticker, gap_trading_days=gap, calendar=self.calendar)
-                else:
-                    success = True
-
-                self.script_status[name] = {
-                    "synced": success,
-                    "last_attempt_at": datetime.now(IST).strftime("%H:%M:%S"),
-                    "error": None if success else "Vendor fetch failure",
-                    "ticker": ticker
-                }
-            except Exception as e:
-                logger.error(f"[SYNC] Error synchronizing {name}: {e}", exc_info=True)
-                self.script_status[name] = {
-                    "synced": False,
-                    "last_attempt_at": datetime.now(IST).strftime("%H:%M:%S"),
-                    "error": str(e),
-                    "ticker": ticker
-                }
-
-        # Determine completed target date string for UI display
-        try:
-            target_dt = self.calendar.get_latest_completed_trading_date(datetime.now(IST))
-            target_str = target_dt.strftime("%Y-%m-%d")
-        except Exception:
-            target_str = datetime.now(IST).strftime("%Y-%m-%d")
-
-        synced_count = sum(1 for s in self.script_status.values() if s.get("synced"))
-        HEALTH_MONITOR.record_sync_finish(
-            total=len(self.script_status),
-            synced_count=synced_count,
-            target_date_str=target_str
-        )
-
-    def execute_live_updates(self):
-        """Executes CHILD-2 live intraday candle updates on Index 0."""
-        updated_count = 0
         for name, meta in list(self.script_status.items()):
             if not _keep_running:
                 break
-            ticker = meta.get("ticker", name)
-            try:
-                update_live_script(name, ticker)
-                updated_count += 1
-            except Exception as e:
-                logger.error(f"[LIVE] Error updating live candle for {name}: {e}")
+            if not STATE_BUS.is_power_on() and not is_manual:
+                break
 
-        HEALTH_MONITOR.record_live_update(updated_count=updated_count, is_market_open=True)
+            # Skip stocks already synced today unless manually forced
+            if meta["synced"] and not is_manual:
+                continue
 
-    def execute_parameter_calculations(self):
-        """Executes parameter calculation across all active stocks."""
-        active_symbols = list(self.script_status.keys())
-        if active_symbols:
-            logger.info(f"[PARAM] Running indicator recalculation for {len(active_symbols)} stocks...")
+            meta["last_attempt_at"] = now_str
+            ticker = meta["ticker"]
+
             try:
-                update_all_parameters(active_symbols)
+                gap = self._calculate_script_gap(name, ticker)
+                if gap == 0:
+                    meta["synced"] = True
+                    meta["error"] = None
+                    logger.info(f"[{name}] Index 1 matches latest exchange session (Gap=0). Synced.")
+                    continue
+
+                success, msg = sync_historical_script(name, ticker, gap_trading_days=gap, calendar=self.calendar)
+
+                if success:
+                    meta["synced"] = True
+                    meta["error"] = None
+                    logger.info(f"[{name}] Sync successful: {msg}")
+                else:
+                    meta["synced"] = False
+                    meta["error"] = msg
+                    logger.warning(f"[{name}] Sync incomplete: {msg}")
+
             except Exception as e:
-                logger.error(f"[PARAM] Error during parameter execution: {e}", exc_info=True)
+                meta["synced"] = False
+                meta["error"] = f"Exception: {str(e)}"
+                logger.error(f"Fault isolation caught exception for [{name}]: {e}", exc_info=True)
+
+    def _calculate_script_gap(self, display_name: str, ticker: str) -> int:
+        """Determines gap strictly by comparing Index 1 date vs Yahoo's latest date."""
+        existing_ohlc = get_stock_ohlc(display_name)
+        if not existing_ohlc or not isinstance(existing_ohlc, dict):
+            return TARGET_OHLC_COUNT
+
+        idx1 = existing_ohlc.get("1")
+        if not idx1 or "date" not in idx1:
+            return TARGET_OHLC_COUNT
+
+        try:
+            latest_fb_date = datetime.strptime(str(idx1["date"]), "%Y-%m-%d").date()
+        except ValueError:
+            return TARGET_OHLC_COUNT
+
+        latest_yahoo_date = get_latest_available_trading_date(ticker)
+        if not latest_yahoo_date:
+            return 0  # Vendor unreachable; keep existing status
+
+        return self.calendar.get_trading_day_gap(latest_fb_date, latest_yahoo_date)
+
+    def execute_live_updates(self):
+        """Runs CHILD-2 for synchronized stocks only, isolating unsynced ones."""
+        logger.info("[CHILD-2] Starting 5-minute live update cycle...")
+
+        for name, meta in self.script_status.items():
+            if not _keep_running or not STATE_BUS.is_power_on():
+                break
+
+            # If not synced, isolate and skip live update
+            if not meta["synced"]:
+                logger.warning(
+                    f"[{name}] EXCLUDED FROM LIVE UPDATE | Reason: {meta['error']} | Last Attempt: {meta['last_attempt_at']}"
+                )
+                continue
+
+            try:
+                update_live_script(name, meta["ticker"])
+            except Exception as e:
+                logger.error(f"[{name}] Live update failed: {e}", exc_info=True)
+
+    def sanitize_all_indices_zero(self, label: str):
+        """Clears Index 0 across all equities to prevent stale quotes."""
+        logger.info(f"[MAINTENANCE] Clearing Index 0 for all stocks ({label})...")
+        for name in self.script_status.keys():
+            clear_live_candle(name)
 
     def log_detailed_sync_audit(self):
-        """Outputs a clean audit report of pre-market sync."""
-        synced = [k for k, v in self.script_status.items() if v.get("synced")]
-        unsynced = [k for k, v in self.script_status.items() if not v.get("synced")]
+        """Prints a comprehensive script-by-script diagnostic audit at 08:30 IST."""
+        synced = [k for k, v in self.script_status.items() if v["synced"]]
+        unsynced = [k for k, v in self.script_status.items() if not v["synced"]]
 
         logger.info("=" * 85)
         logger.info("                   SCRIPT-WISE SYNCHRONIZATION AUDIT REPORT")
         logger.info("=" * 85)
-        logger.info(f"Total: {len(self.script_status)} | Synced: {len(synced)} | Unsynced: {len(unsynced)}")
+        logger.info(f"Total: {len(self.script_status)} | Synced: {len(synced)} | Failed/Unsynced: {len(unsynced)}")
 
         if synced:
-            logger.info("[SYNCHRONIZED STOCKS]")
+            logger.info("[ACTIVE / SYNCHRONIZED SCRIPTS]")
             for s in synced:
                 logger.info(f"  ✓ {s:<24} | Synced At: {self.script_status[s]['last_attempt_at']}")
+
         if unsynced:
-            logger.error("[UNSYNCHRONIZED STOCKS - AWAITING RETRY]")
+            logger.error("[ISOLATED / UNSYNCHRONIZED SCRIPTS - DATABASE SYNCH ERROR]")
             for u in unsynced:
                 info = self.script_status[u]
                 logger.error(f"  ✗ {u:<24} | Last Attempt: {info['last_attempt_at']} | Error: {info['error']}")
+            logger.critical(f"Database Synch Error: {len(unsynced)} stock(s) failed pre-market validation.")
+        else:
+            logger.info("All registered stocks successfully synchronized. Live updater ready.")
         logger.info("=" * 85)
 
 
-# =====================================================================
-# PROGRAM ENTRY POINT
-# =====================================================================
 if __name__ == "__main__":
-    # 1. Bind port immediately so Render web service health check passes
     start_http_listener()
-
-    # 2. Run master orchestrator
     orchestrator = MasterOrchestrator()
     orchestrator.run()
