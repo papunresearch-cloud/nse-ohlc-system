@@ -1,11 +1,11 @@
 """
 MASTER ORCHESTRATOR
-- Priority 0: Watchlist is absolute master. Stocklist is continuously synchronized.
+- Watchlist is master. Stocklist is continuously synchronized.
 - Never mutates or deletes from /watchlist or /watchlist/detailedDb.
 - Guarded OHLC protection: Stocks currently present in /watchlist are never purged.
 - SR Flip-Flop Power Latch (Default: ON).
 - Handles external 30-second pulse commands: /start, /stop, /sync.
-- Embedded HTTP Server with minimal /health, GET, and HEAD handling for cron-job.org.
+- Embedded HTTP Server on port 10000 with /health handling for Render/cron-job.org.
 - Pre-market sync window (08:00–08:30 IST) with 5-minute retry intervals.
 - Index 0 live sanitization at 09:00 IST and 16:00 IST.
 - Dispute-based database auditing (Ideal vs. Lagging sessions).
@@ -17,7 +17,7 @@ import time
 import signal
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
-from datetime import datetime, date
+from datetime import datetime
 import pytz
 
 from config import (
@@ -31,7 +31,6 @@ from config import (
     PULSE_VALIDITY_SEC,
     HEARTBEAT_TICK_SEC,
     TARGET_OHLC_COUNT,
-    HISTORICAL_START_INDEX,
     logger
 )
 
@@ -50,7 +49,6 @@ from firebase_manager import (
 from market_calendar import MarketCalendar
 from sync_child import sync_historical_script
 from live_child import update_live_script
-from yahoo_manager import get_latest_available_trading_date
 from parameter import update_all_parameters
 from health import HEALTH_MONITOR
 
@@ -203,7 +201,6 @@ class MasterOrchestrator:
             logger.error(f"[RECONCILE] Failed to load scripts: {e}")
 
     def audit_database_disputes(self):
-        """Audits database status against the latest finalized exchange session."""
         try:
             target_date = self.calendar.get_latest_completed_trading_date(datetime.now(IST))
             target_date_str = target_date.strftime("%Y-%m-%d")
@@ -280,7 +277,6 @@ class MasterOrchestrator:
         count = 0
         for name, ticker in self.active_tickers.items():
             meta = self.script_status.get(name, {})
-            # Defensive check: if baseline is totally unverified, skip live writing
             if not meta.get("synced", False):
                 continue
             try:
@@ -289,14 +285,19 @@ class MasterOrchestrator:
             except Exception as e:
                 logger.error(f"[{name}] Live update error: {e}")
 
-        is_open = self.calendar.is_market_open(now_ist)
-        HEALTH_MONITOR.record_live_update(count, is_market_open=is_open)
+        # Check market session state
+        is_live = False
+        if hasattr(self.calendar, "is_market_live"):
+            is_live = self.calendar.is_market_live(now_ist)
+        elif hasattr(self.calendar, "is_market_open"):
+            is_live = self.calendar.is_market_open(now_ist)
+
+        HEALTH_MONITOR.record_live_update(count, is_market_open=is_live)
 
     def run(self):
         global _keep_running
         logger.info("[DAEMON] Master orchestrator operational.")
 
-        # Non-blocking boot audit in background thread
         threading.Thread(target=self.execute_historical_sync, kwargs={"is_manual": False}, daemon=True).start()
 
         while _keep_running:
@@ -304,7 +305,7 @@ class MasterOrchestrator:
                 now_ist = datetime.now(IST)
                 HEALTH_MONITOR.record_heartbeat(STATE_BUS.is_power_on())
 
-                # 1. State Bus Check
+                # 1. Pulse Commands Check
                 if STATE_BUS.check_and_clear_manual_sync():
                     threading.Thread(target=self.execute_historical_sync, kwargs={"is_manual": True}, daemon=True).start()
 
@@ -323,7 +324,13 @@ class MasterOrchestrator:
                         self.last_sync_retry_time = time.time()
 
                 # 4. Live Session Handling (09:15 - 15:30 IST)
-                if self.calendar.is_market_open(now_ist):
+                market_is_live = False
+                if hasattr(self.calendar, "is_market_live"):
+                    market_is_live = self.calendar.is_market_live(now_ist)
+                elif hasattr(self.calendar, "is_market_open"):
+                    market_is_live = self.calendar.is_market_open(now_ist)
+
+                if market_is_live:
                     if (time.time() - self.last_live_update_time) >= LIVE_UPDATE_INTERVAL_SEC:
                         self.execute_live_updates()
                         self.last_live_update_time = time.time()
