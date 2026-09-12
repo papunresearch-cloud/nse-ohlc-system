@@ -53,7 +53,7 @@ SYNC_WINDOW_DEADLINE_MIN = 30
 SYNC_RETRY_INTERVAL_SEC = 300       # Retry failed syncs every 5 mins between 08:00 and 08:30
 LIVE_UPDATE_INTERVAL_SEC = 300      # 5 mins live candle refresh
 PULSE_VALIDITY_SEC = 30             # 30-second TTL pulse duration
-HEARTBEAT_TICK_SEC = 2              # Fast main loop poll rate
+HEARTBEAT_TICK_SEC = 300              # Fast main loop poll rate
 
 # ==========================================
 # YAHOO RATE-LIMIT PROTECTION
