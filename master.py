@@ -1,6 +1,8 @@
 """
 MASTER ORCHESTRATOR (STABLE PRE-PURGE ARCHITECTURE)
-- Embedded HTTP server on port 10000 (/health, /start, /stop, /sync).
+- Embedded HTTP server on port 10000 (/health, /start, /stop, /sync) with robust URL parsing.
+- URL Query parameter sanitization via urllib.parse.urlparse.
+- Full CORS preflight support (OPTIONS, HEAD, GET).
 - SR Flip-Flop Power Latch (Default: ON).
 - Real-time /system_status heartbeat telemetry every 300s.
 - Non-blocking 5-second main loop idle tick on weekends and holidays.
@@ -14,6 +16,7 @@ import sys
 import time
 import signal
 import threading
+from urllib.parse import urlparse
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from datetime import datetime, date
 import pytz
@@ -93,25 +96,30 @@ STATE_BUS = SystemStateBus()
 
 
 # =====================================================================
-# HTTP PULSE RECEIVER & HEALTH SERVER (CRON-JOB / RENDER COMPATIBLE)
+# HTTP PULSE RECEIVER & HEALTH SERVER
 # =====================================================================
 class PulseCommandServer(BaseHTTPRequestHandler):
-    def do_OPTIONS(self):
-        self.send_response(200)
+    def _apply_cors_headers(self):
         self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Access-Control-Allow-Methods", "GET, HEAD, OPTIONS")
         self.send_header("Access-Control-Allow-Headers", "*")
+
+    def do_OPTIONS(self):
+        self.send_response(204)
+        self._apply_cors_headers()
         self.end_headers()
 
     def do_HEAD(self):
         self.send_response(200)
-        self.send_header("Access-Control-Allow-Origin", "*")
+        self._apply_cors_headers()
         self.send_header("Content-Type", "text/plain; charset=utf-8")
         self.send_header("Content-Length", "0")
         self.end_headers()
 
     def do_GET(self):
-        path = self.path.lower().strip()
+        # Extract clean URL path, stripping off query parameters (?_t=...)
+        parsed_url = urlparse(self.path)
+        path = parsed_url.path.lower().strip()
         state_str = "ON" if STATE_BUS.is_power_on() else "OFF"
 
         if path in ("/health", "/ping"):
@@ -131,9 +139,7 @@ class PulseCommandServer(BaseHTTPRequestHandler):
     def _send_resp(self, code: int, message: str):
         payload = message.encode("utf-8")
         self.send_response(code)
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "GET, HEAD, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "*")
+        self._apply_cors_headers()
         self.send_header("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
         self.send_header("Pragma", "no-cache")
         self.send_header("Content-Type", "text/plain; charset=utf-8")
@@ -225,15 +231,15 @@ class MasterOrchestrator:
                 if (now_epoch - self.last_heartbeat_time) >= 300:
                     self.record_heartbeat()
 
+                # --- Priority 0: Manual Pulse Interruption (Independent of power state) ---
+                if STATE_BUS.check_and_clear_manual_sync():
+                    logger.info("[OVERRIDE PULSE] Immediate sync commanded. Running CHILD-1 in background...")
+                    threading.Thread(target=self.execute_historical_sync, kwargs={"is_manual": True}, daemon=True).start()
+                    continue
+
                 # --- Power Latch Check ---
                 if not STATE_BUS.is_power_on():
                     time.sleep(5)
-                    continue
-
-                # --- Priority 0: Manual Pulse Interruption ---
-                if STATE_BUS.check_and_clear_manual_sync():
-                    logger.info("[OVERRIDE PULSE] Immediate sync commanded. Running CHILD-1...")
-                    self.execute_historical_sync(is_manual=True)
                     continue
 
                 # --- Priority 1: State-Driven Date Catch-Up ---
