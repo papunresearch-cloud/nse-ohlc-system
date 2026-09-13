@@ -38,7 +38,7 @@ PATH_CALENDAR = "config/nse_calendar"
 # ==========================================
 # CORE CONSTANTS
 # ==========================================
-TARGET_OHLC_COUNT = 250
+TARGET_OHLC_COUNT = 300
 DEFAULT_SAFETY_MARGIN = 5
 TIMEZONE = "Asia/Kolkata"
 
