@@ -179,14 +179,7 @@ def compute_script_parameters(script: str) -> Optional[Dict[str, Any]]:
     c_21 = closes[21] if len(closes) > 21 else None
     c_66 = closes[66] if len(closes) > 66 else None
     c_121 = closes[121] if len(closes) > 121 else None
-
-    # 1-Year baseline: index 250 (or oldest completed bar >= 240 days)
-    if len(closes) > 250:
-        c_250 = closes[250]
-    elif len(closes) >= 240:
-        c_250 = closes[-1]
-    else:
-        c_250 = None
+    c_250 = closes[250] if len(closes) > 250 else None
 
     chng_2dy = safe_div(close_0 - open_0, open_0) if (close_0 is not None and open_0 is not None) else "N/A"
     chng_ydy = safe_div(close_0 - c_1, c_1) if (close_0 is not None and c_1 is not None) else "N/A"
