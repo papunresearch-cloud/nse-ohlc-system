@@ -2,7 +2,7 @@
 PARAMETER CALCULATION MODULE (parameter.py)
 Calculates technical indicators and performance metrics for active scripts.
 - Source data: Reads OHLC historical series from Firebase `/stocks/<script>`
-- Lookups: Reads 1yr and 3yr values directly from `/watchlist/detailedDb/<script>`
+- Lookups: Reads 3yr value directly from `/watchlist/detailedDb/<script>`
 - Output: Writes sanitized calculations to Firebase `/param/<script>`
 - Stamping: Stores both date and time (IST) separately for each script
 """
@@ -121,15 +121,13 @@ def calculate_sma(closes_newest_first: List[float], window: int) -> Any:
 
 
 def fetch_detailed_metrics(script: str) -> Dict[str, Any]:
-    """Fetches static 1yr and 3yr metrics from /watchlist/detailedDb/<script>."""
+    """Fetches static 3yr metric from /watchlist/detailedDb/<script>."""
     ref = db.reference(f"watchlist/detailedDb/{script}")
     data = ref.get() or {}
 
-    ret_1yr = data.get("1yr") or data.get("1YR") or data.get("1Yr")
     ret_3yr = data.get("3yr") or data.get("3YR") or data.get("3Yr")
 
     return {
-        "1yr": safe_round(ret_1yr, 2),
         "3yr": safe_round(ret_3yr, 2)
     }
 
@@ -182,6 +180,14 @@ def compute_script_parameters(script: str) -> Optional[Dict[str, Any]]:
     c_66 = closes[66] if len(closes) > 66 else None
     c_121 = closes[121] if len(closes) > 121 else None
 
+    # 1-Year baseline: index 250 (or oldest completed bar >= 240 days)
+    if len(closes) > 250:
+        c_250 = closes[250]
+    elif len(closes) >= 240:
+        c_250 = closes[-1]
+    else:
+        c_250 = None
+
     chng_2dy = safe_div(close_0 - open_0, open_0) if (close_0 is not None and open_0 is not None) else "N/A"
     chng_ydy = safe_div(close_0 - c_1, c_1) if (close_0 is not None and c_1 is not None) else "N/A"
 
@@ -189,7 +195,9 @@ def compute_script_parameters(script: str) -> Optional[Dict[str, Any]]:
     ret_1mr = safe_div(c_1 - c_21, c_21) if (c_1 is not None and c_21 is not None) else "N/A"
     ret_3mr = safe_div(c_1 - c_66, c_66) if (c_1 is not None and c_66 is not None) else "N/A"
     ret_6mr = safe_div(c_1 - c_121, c_121) if (c_1 is not None and c_121 is not None) else "N/A"
+    ret_1yr = safe_div(c_1 - c_250, c_250) if (c_1 is not None and c_250 is not None) else "N/A"
 
+    # Static 3yr lookup
     detailed_metrics = fetch_detailed_metrics(script)
 
     # Timestamp Generation (IST)
@@ -212,7 +220,7 @@ def compute_script_parameters(script: str) -> Optional[Dict[str, Any]]:
         "1mr": ret_1mr,
         "3mr": ret_3mr,
         "6mr": ret_6mr,
-        "1yr": detailed_metrics["1yr"],
+        "1yr": ret_1yr,
         "3yr": detailed_metrics["3yr"],
         "updated_at": f"{current_date_str} {current_time_str}"
     }
