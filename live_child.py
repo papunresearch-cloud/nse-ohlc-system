@@ -1,7 +1,7 @@
 """
 CHILD-2: Live Intraday OHLC Updater.
-- Responsible exclusively for writing to /stocks/<display_name>/0.
-- Never modifies or shifts historical records (keys '1' through '250').
+- Responsible exclusively for writing to /stocks/<sanitized_script>/0.
+- Never modifies or shifts historical records (keys '1' upwards).
 - Performs price sanity verification and temporal checks against Index 1.
 - Injects a 'time' field exclusively for the 0-index candle.
 """
@@ -9,14 +9,15 @@ from datetime import datetime, date
 import pytz
 
 from config import TIMEZONE, logger
-from firebase_manager import update_live_candle, get_stock_ohlc, clear_live_candle
+from firebase_manager import update_live_candle, get_stock_ohlc, clear_live_candle, sanitize_key
 from yahoo_manager import download_intraday_today
 
 IST = pytz.timezone(TIMEZONE)
 
 
 def update_live_script(display_name: str, ticker: str) -> bool:
-    """Updates only node /stocks/<display_name>/0 with the latest intraday candle and time."""
+    """Updates only node /stocks/<safe_name>/0 with the latest intraday candle and time."""
+    safe_name = sanitize_key(display_name)
     candle = download_intraday_today(ticker)
     if not candle or not isinstance(candle, dict):
         logger.warning(f"[{display_name}] Unable to fetch current live candle for {ticker}")
@@ -33,7 +34,7 @@ def update_live_script(display_name: str, ticker: str) -> bool:
         return False
 
     # Temporal continuity check: Live date must not be older than Index 1 date
-    existing = get_stock_ohlc(display_name)
+    existing = get_stock_ohlc(safe_name)
     if isinstance(existing, dict) and "1" in existing and isinstance(existing["1"], dict):
         idx1_date_raw = existing["1"].get("date")
         if idx1_date_raw:
@@ -46,14 +47,13 @@ def update_live_script(display_name: str, ticker: str) -> bool:
                     )
                     return False
             except ValueError:
-                # Fallback to string comparison if date parsing fails
                 if str(candle["date"]) < str(idx1_date_raw):
                     logger.error(
                         f"[{display_name}] Date conflict: Live date {candle['date']} is older than Index 1 ({idx1_date_raw})"
                     )
                     return False
 
-    success = update_live_candle(display_name, candle)
+    success = update_live_candle(safe_name, candle)
     if success:
         logger.debug(
             f"[{display_name}] Index 0 updated @ {candle['time']}: CMP={candle['close']} "
@@ -64,12 +64,12 @@ def update_live_script(display_name: str, ticker: str) -> bool:
 
 def reset_index_zero(display_name: str) -> bool:
     """Sets index 0 to None/empty during non-market windows."""
-    return clear_live_candle(display_name)
+    safe_name = sanitize_key(display_name)
+    return clear_live_candle(safe_name)
 
 
 def _validate_single_candle(c: dict) -> tuple[bool, str]:
     """Validates that a single intraday candle has numeric and logically sound values."""
-    # Enforce mandatory fields including the newly added 'time'
     for field in ("date", "time", "open", "high", "low", "close"):
         if field not in c or c[field] is None or str(c[field]).strip() == "":
             return False, f"Missing or empty field '{field}'"
@@ -85,11 +85,9 @@ def _validate_single_candle(c: dict) -> tuple[bool, str]:
     if o <= 0 or h <= 0 or l <= 0 or cl <= 0:
         return False, "Non-positive price"
 
-    # Candle logic check with 0.05 rounding buffer
     if (h < l) or (h < max(o, cl) - 0.05) or (l > min(o, cl) + 0.05):
         return False, f"Logical boundary violation: O={o}, H={h}, L={l}, C={cl}"
 
-    # Optional volume validation if present
     if "volume" in c and c["volume"] is not None:
         try:
             vol = int(c["volume"])

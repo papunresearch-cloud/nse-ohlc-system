@@ -2,8 +2,8 @@
 PARAMETER CALCULATION MODULE (parameter.py)
 Calculates technical indicators and performance metrics for active scripts.
 - Source data: Reads OHLC historical series from Firebase `/stocks/<script>`
-- Lookups: Reads 3yr value directly from `/watchlist/detailedDb/<script>`
-- Output: Writes sanitized calculations to Firebase `/param/<script>`
+- Lookups: Reads 3yr value from `/detailedDb/<script>` or `/watchlist/detailedDb/<script>`
+- Output: Writes sanitized calculations to Firebase `/param/<sanitized_script>`
 - Stamping: Stores both date and time (IST) separately for each script
 """
 
@@ -13,6 +13,7 @@ import pytz
 from typing import Any, Dict, List, Optional
 from firebase_admin import db
 from config import logger, TIMEZONE
+from firebase_manager import sanitize_key
 
 IST = pytz.timezone(TIMEZONE)
 
@@ -31,7 +32,7 @@ def safe_round(val: Any, decimals: int = 2) -> Any:
 
 
 def safe_div(numerator: Any, denominator: Any, factor: float = 100.0) -> Any:
-    """Safely calculates (numerator / denominator) * factor; returns 'N/A' on zero-division or errors."""
+    """Safely calculates (numerator / denominator) * factor; returns 'N/A' on zero-division."""
     try:
         num = float(numerator)
         den = float(denominator)
@@ -58,10 +59,11 @@ def parse_price(candle: Optional[Dict[str, Any]], field: str) -> Optional[float]
 
 def fetch_ordered_candles(script: str) -> List[Dict[str, Any]]:
     """
-    Fetches historical candle collection under /stocks/<script>.
-    Returns candles ordered chronologically backwards (index 0 is current, index 1 is yesterday, etc.).
+    Fetches historical candle collection under /stocks/<safe_script>.
+    Returns candles ordered chronologically backwards (index 0 is current/intraday, index 1 is yesterday).
     """
-    ref = db.reference(f"stocks/{script}")
+    safe_script = sanitize_key(script)
+    ref = db.reference(f"stocks/{safe_script}")
     stock_data = ref.get()
     if not stock_data:
         return []
@@ -70,6 +72,7 @@ def fetch_ordered_candles(script: str) -> List[Dict[str, Any]]:
     if isinstance(stock_data, list):
         ordered_candles = [c for c in stock_data if isinstance(c, dict)]
     elif isinstance(stock_data, dict):
+        # Extract integer indices sequentially
         for i in range(len(stock_data)):
             key = str(i)
             if key in stock_data and isinstance(stock_data[key], dict):
@@ -121,10 +124,17 @@ def calculate_sma(closes_newest_first: List[float], window: int) -> Any:
 
 
 def fetch_detailed_metrics(script: str) -> Dict[str, Any]:
-    """Fetches static 3yr metric from /watchlist/detailedDb/<script>."""
-    ref = db.reference(f"watchlist/detailedDb/{script}")
-    data = ref.get() or {}
-
+    """
+    Fetches static 3yr metric from /detailedDb/<script> or /watchlist/detailedDb/<script>.
+    """
+    safe_script = sanitize_key(script)
+    # Check root detailedDb first, then fall back to nested watchlist/detailedDb
+    data = db.reference(f"detailedDb/{safe_script}").get() or db.reference(f"watchlist/detailedDb/{safe_script}").get()
+    
+    if not data and safe_script != script:
+        data = db.reference(f"detailedDb/{script}").get() or db.reference(f"watchlist/detailedDb/{script}").get()
+    
+    data = data or {}
     ret_3yr = data.get("3yr") or data.get("3YR") or data.get("3Yr")
 
     return {
@@ -133,10 +143,11 @@ def fetch_detailed_metrics(script: str) -> Dict[str, Any]:
 
 
 def compute_script_parameters(script: str) -> Optional[Dict[str, Any]]:
-    """Calculates all parameter metrics for a single script and commits them to /param/<script>."""
+    """Calculates all parameter metrics for a single script and commits them to /param/<safe_script>."""
+    safe_script = sanitize_key(script)
     candles = fetch_ordered_candles(script)
     if not candles:
-        logger.warning(f"[{script}] No candle records found under /stocks/{script}.")
+        logger.warning(f"[{script}] No candle records found under /stocks/{safe_script}.")
         return None
 
     c_0 = candles[0] if len(candles) > 0 else None
@@ -167,19 +178,22 @@ def compute_script_parameters(script: str) -> Optional[Dict[str, Any]]:
     # RSI
     rsi = calculate_rsi(closes, 14)
 
-    # 52-Week Extremes
-    h_slice = highs[:250]
-    l_slice = lows[:250]
+    # 52-Week Extremes (252 trading sessions)
+    h_slice = highs[:252]
+    l_slice = lows[:252]
     w52h = safe_round(max(h_slice), 2) if len(h_slice) >= 10 else "N/A"
     w52l = safe_round(min(l_slice), 2) if len(l_slice) >= 10 else "N/A"
 
-    # Periodic Returns
-    c_1 = closes[1] if len(closes) > 1 else None
-    c_6 = closes[6] if len(closes) > 6 else None
-    c_21 = closes[21] if len(closes) > 21 else None
-    c_66 = closes[66] if len(closes) > 66 else None
-    c_121 = closes[121] if len(closes) > 121 else None
-    c_250 = closes[250] if len(closes) > 250 else None
+    # Periodic Returns (Protected index access)
+    def get_close(idx: int) -> Optional[float]:
+        return closes[idx] if len(closes) > idx else None
+
+    c_1 = get_close(1)
+    c_6 = get_close(6)
+    c_21 = get_close(21)
+    c_66 = get_close(66)
+    c_121 = get_close(121)
+    c_251 = get_close(251) or get_close(250)
 
     chng_2dy = safe_div(close_0 - open_0, open_0) if (close_0 is not None and open_0 is not None) else "N/A"
     chng_ydy = safe_div(close_0 - c_1, c_1) if (close_0 is not None and c_1 is not None) else "N/A"
@@ -188,7 +202,7 @@ def compute_script_parameters(script: str) -> Optional[Dict[str, Any]]:
     ret_1mr = safe_div(c_1 - c_21, c_21) if (c_1 is not None and c_21 is not None) else "N/A"
     ret_3mr = safe_div(c_1 - c_66, c_66) if (c_1 is not None and c_66 is not None) else "N/A"
     ret_6mr = safe_div(c_1 - c_121, c_121) if (c_1 is not None and c_121 is not None) else "N/A"
-    ret_1yr = safe_div(c_1 - c_250, c_250) if (c_1 is not None and c_250 is not None) else "N/A"
+    ret_1yr = safe_div(c_1 - c_251, c_251) if (c_1 is not None and c_251 is not None) else "N/A"
 
     # Static 3yr lookup
     detailed_metrics = fetch_detailed_metrics(script)
@@ -218,8 +232,8 @@ def compute_script_parameters(script: str) -> Optional[Dict[str, Any]]:
         "updated_at": f"{current_date_str} {current_time_str}"
     }
 
-    db.reference(f"param/{script}").set(payload)
-    logger.info(f"[{script}] Parameters saved to /param/{script} at {current_time_str}")
+    db.reference(f"param/{safe_script}").set(payload)
+    logger.info(f"[{script}] Parameters saved to /param/{safe_script} at {current_time_str}")
     return payload
 
 

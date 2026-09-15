@@ -25,10 +25,12 @@ logger = logging.getLogger("NSE_OHLC_SYSTEM")
 # ==========================================
 # FIREBASE CONFIGURATION
 # ==========================================
+# Trailing slash removed to avoid URL parsing faults
 FIREBASE_DATABASE_URL = os.getenv(
     "FIREBASE_DATABASE_URL",
-    "https://stock-dashboard-5c25c-default-rtdb.asia-southeast1.firebasedatabase.app/"
-)
+    "https://stock-dashboard-5c25c-default-rtdb.asia-southeast1.firebasedatabase.app"
+).rstrip("/")
+
 FIREBASE_CREDENTIALS = os.getenv("FIREBASE_CREDENTIALS", "serviceAccountKey.json")
 
 PATH_SCRIPTS = "stocklist"
@@ -53,7 +55,7 @@ SYNC_WINDOW_DEADLINE_MIN = 30
 SYNC_RETRY_INTERVAL_SEC = 300       # Retry failed syncs every 5 mins between 08:00 and 08:30
 LIVE_UPDATE_INTERVAL_SEC = 300      # 5 mins live candle refresh
 PULSE_VALIDITY_SEC = 30             # 30-second TTL pulse duration
-HEARTBEAT_TICK_SEC = 10              # Fast main loop poll rate
+HEARTBEAT_TICK_SEC = 10             # Fast main loop poll rate
 
 # ==========================================
 # YAHOO RATE-LIMIT PROTECTION

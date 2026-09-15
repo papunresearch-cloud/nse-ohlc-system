@@ -1,8 +1,8 @@
 """
 CHILD-1: Historical Synchronization Engine.
-- Maintains up to 250 historical records under keys '1' through '250'.
+- Maintains historical records up to TARGET_OHLC_COUNT under keys '1' upwards.
 - Decouples historical verification from live-tracking permission.
-- Features a 7-day NSE Bhavcopy fallback bridge to immediately resolve Yahoo vendor lag.
+- Features an NSE Bhavcopy fallback bridge to immediately resolve Yahoo vendor lag.
 - Sanitizes NaN/Inf floating point prices for Firebase JSON compliance.
 - Never mutates Index '0' (reserved exclusively for CHILD-2 live updates).
 """
@@ -20,7 +20,7 @@ from config import (
     TIMEZONE,
     logger
 )
-from firebase_manager import get_stock_ohlc, write_full_ohlc
+from firebase_manager import get_stock_ohlc, write_full_ohlc, sanitize_key
 from yahoo_manager import download_historical_daily
 from market_calendar import MarketCalendar
 
@@ -29,6 +29,7 @@ IST = pytz.timezone(TIMEZONE)
 NSE_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
 }
 
 
@@ -45,7 +46,9 @@ def fetch_nse_bhavcopy_candle(ticker: str, trade_date: date) -> dict | None:
     url = f"https://archives.nseindia.com/products/content/sec_bhavdata_full_{date_str}.csv"
 
     try:
-        resp = requests.get(url, headers=NSE_HEADERS, timeout=12)
+        session = requests.Session()
+        session.headers.update(NSE_HEADERS)
+        resp = session.get(url, timeout=12)
         if resp.status_code != 200:
             return None
 
@@ -55,7 +58,6 @@ def fetch_nse_bhavcopy_candle(ticker: str, trade_date: date) -> dict | None:
         if "SERIES" in df.columns:
             df = df[df["SERIES"].str.strip() == "EQ"]
 
-        # Clean symbol by stripping .NS extension
         clean_symbol = ticker.replace(".NS", "").strip().upper()
         match = df[df["SYMBOL"].str.strip().str.upper() == clean_symbol]
 
@@ -74,7 +76,7 @@ def fetch_nse_bhavcopy_candle(ticker: str, trade_date: date) -> dict | None:
         except (ValueError, TypeError):
             volume_val = 0
 
-        # Validate candle logic
+        # Strict candle logic validation
         if o <= 0 or h <= 0 or l <= 0 or c <= 0 or (h < l):
             return None
 
@@ -120,7 +122,6 @@ def patch_recent_vendor_lag(merged_records: list[dict], ticker: str, calendar: M
         curr -= timedelta(days=1)
 
     if injected_count > 0:
-        # Re-sort descending: newest date at index 0
         merged_records = sorted(merged_records, key=lambda x: x["date"], reverse=True)
 
     return merged_records
@@ -137,6 +138,7 @@ def sync_historical_script(display_name: str, ticker: str, gap_trading_days: int
     - Returns (False, msg) only if baseline is completely missing or structurally invalid.
     """
     try:
+        safe_name = sanitize_key(display_name)
         if calendar is None:
             calendar = MarketCalendar()
 
@@ -144,7 +146,7 @@ def sync_historical_script(display_name: str, ticker: str, gap_trading_days: int
         expected_latest_date = _get_expected_latest_date(calendar, now_ist)
         expected_latest_str = expected_latest_date.strftime("%Y-%m-%d")
 
-        existing_ohlc = get_stock_ohlc(display_name)
+        existing_ohlc = get_stock_ohlc(safe_name)
         existing_records = _parse_firebase_historical_records(existing_ohlc)
 
         # 1. Inspect Current Firebase Baseline
@@ -192,7 +194,7 @@ def sync_historical_script(display_name: str, ticker: str, gap_trading_days: int
                 else:
                     sync_state = "VENDOR_LAG"
 
-        # 4. Commit Fresh Records (VERIFIED / RECOVERED / RECOVERED_BHAVCOPY)
+        # 4. Commit Fresh Records
         if sync_state in ("VERIFIED", "RECOVERED", "RECOVERED_BHAVCOPY"):
             final_candles = merged_records[:TARGET_OHLC_COUNT]
             indexed_db = {str(idx + HISTORICAL_START_INDEX): c for idx, c in enumerate(final_candles)}
@@ -202,7 +204,7 @@ def sync_historical_script(display_name: str, ticker: str, gap_trading_days: int
                 logger.error(f"[{display_name}] Sanity validation rejected: {err_msg}. Firebase untouched.")
                 return False, f"Validation Rejected: {err_msg}"
 
-            if write_full_ohlc(display_name, indexed_db):
+            if write_full_ohlc(safe_name, indexed_db):
                 return True, f"{sync_state}: {len(indexed_db)} bars committed (Index 1: {expected_latest_str})"
             return False, "Firebase write failed"
 
@@ -225,7 +227,7 @@ def sync_historical_script(display_name: str, ticker: str, gap_trading_days: int
             final_candles = merged_records[:TARGET_OHLC_COUNT]
             indexed_db = {str(idx + HISTORICAL_START_INDEX): c for idx, c in enumerate(final_candles)}
             valid, err_msg = validate_historical_payload(indexed_db)
-            if valid and write_full_ohlc(display_name, indexed_db):
+            if valid and write_full_ohlc(safe_name, indexed_db):
                 seeded_date = indexed_db[str(HISTORICAL_START_INDEX)]["date"]
                 logger.warning(
                     f"[{display_name}] VENDOR_LAG_BOOTSTRAP: Initial baseline seeded with {len(indexed_db)} bars "
@@ -233,7 +235,6 @@ def sync_historical_script(display_name: str, ticker: str, gap_trading_days: int
                 )
                 return True, f"VENDOR_LAG: Bootstrapped at {seeded_date}; Live tracking allowed"
 
-        # Hard failure: vendor returned nothing usable and no baseline exists
         msg = f"INITIAL_SYNC_FAILED: Missing {expected_latest_str} and no usable data returned."
         logger.error(f"[{display_name}] {msg}. Firebase untouched.")
         return False, msg
@@ -333,7 +334,7 @@ def _merge_and_sort_records(existing_records: list[dict], df: pd.DataFrame, cale
                 "volume": volume_val
             }
 
-    # CRITICAL: Exclude ongoing session from historical series (1-250) during market hours
+    # Exclude ongoing session from historical series during active market hours
     today_date = now_ist.date()
     if calendar.is_trading_day(today_date):
         status, _ = calendar.get_market_status(now_ist)
