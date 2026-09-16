@@ -1,8 +1,9 @@
 """
-MASTER ORCHESTRATOR (STABLE PRE-PURGE ARCHITECTURE)
-- Embedded HTTP server on port 10000 (/health, /start, /stop, /sync) with robust URL parsing.
+MASTER ORCHESTRATOR (UNIFIED MONITOR & SCREENER PLATFORM)
+- Embedded HTTP server on port 10000 (/health, /start, /stop, /sync, /sync-screener) with robust URL parsing.
+- Integrated on-demand ETL triggering for Google Drive -> Firebase /SCREENER ingestion.
 - URL Query parameter sanitization via urllib.parse.urlparse.
-- Full CORS preflight support (OPTIONS, HEAD, GET).
+- Full CORS preflight support (OPTIONS, HEAD, GET, POST).
 - SR Flip-Flop Power Latch (Default: ON).
 - Real-time /system_status heartbeat telemetry every 300s.
 - Non-blocking 5-second main loop idle tick on weekends and holidays.
@@ -53,8 +54,19 @@ from live_child import update_live_script
 from yahoo_manager import get_latest_available_trading_date
 from parameter import update_all_parameters
 
+# Stock-Dashboard pipeline import
+try:
+    from basic import run_pipeline as run_screener_pipeline
+except ImportError:
+    try:
+        from BASIC import run_pipeline as run_screener_pipeline
+    except ImportError:
+        run_screener_pipeline = None
+        logger.warning("[WARNING] basic.py / BASIC.py not found. Screener sync will be unavailable.")
+
 IST = pytz.timezone(TIMEZONE)
 _keep_running = True
+_screener_lock = threading.Lock()
 
 
 # =====================================================================
@@ -96,12 +108,38 @@ STATE_BUS = SystemStateBus()
 
 
 # =====================================================================
-# HTTP PULSE RECEIVER & HEALTH SERVER
+# BACKGROUND ASYNC WORKERS
+# =====================================================================
+def dispatch_screener_sync_job():
+    """Runs basic.py run_pipeline inside a thread-safe daemon worker."""
+    if not run_screener_pipeline:
+        logger.error("[SCREENER] Cannot run pipeline: basic.py is not loaded.")
+        return
+
+    if not _screener_lock.acquire(blocking=False):
+        logger.warning("[SCREENER] Pipeline sync is already in progress. Rejecting duplicate trigger.")
+        return
+
+    def worker():
+        try:
+            logger.info("[SCREENER] Starting Google Drive -> Firebase ETL Pipeline...")
+            run_screener_pipeline()
+            logger.info("[SCREENER] Pipeline successfully written to Firebase /SCREENER.")
+        except Exception as e:
+            logger.error(f"[SCREENER] Pipeline failed with error: {e}", exc_info=True)
+        finally:
+            _screener_lock.release()
+
+    threading.Thread(target=worker, daemon=True).start()
+
+
+# =====================================================================
+# HTTP PULSE RECEIVER & COMMAND SERVER
 # =====================================================================
 class PulseCommandServer(BaseHTTPRequestHandler):
     def _apply_cors_headers(self):
         self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "GET, HEAD, OPTIONS")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, HEAD, OPTIONS")
         self.send_header("Access-Control-Allow-Headers", "*")
 
     def do_OPTIONS(self):
@@ -117,7 +155,6 @@ class PulseCommandServer(BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_GET(self):
-        # Extract clean URL path, stripping off query parameters (?_t=...)
         parsed_url = urlparse(self.path)
         path = parsed_url.path.lower().strip()
         state_str = "ON" if STATE_BUS.is_power_on() else "OFF"
@@ -133,8 +170,32 @@ class PulseCommandServer(BaseHTTPRequestHandler):
         elif path in ("/sync", "/api/sync"):
             STATE_BUS.trigger_pulse("SYNC")
             self._send_resp(200, "MANUAL SYNC triggered.\n")
+        elif path in ("/sync-screener", "/run-pipeline", "/api/sync-screener"):
+            dispatch_screener_sync_job()
+            self._send_json_resp(200, {"status": "started", "message": "Screener ETL sync initiated in background."})
         else:
             self._send_resp(200, f"State: {state_str}\n")
+
+    def do_POST(self):
+        parsed_url = urlparse(self.path)
+        path = parsed_url.path.lower().strip()
+
+        if path in ("/sync-screener", "/run-pipeline", "/api/sync-screener"):
+            dispatch_screener_sync_job()
+            self._send_json_resp(200, {"status": "started", "message": "Screener ETL sync initiated in background."})
+        elif path in ("/sync", "/api/sync"):
+            STATE_BUS.trigger_pulse("SYNC")
+            self._send_resp(200, "MANUAL SYNC triggered via POST.\n")
+        elif path in ("/start", "/api/start"):
+            STATE_BUS.trigger_pulse("START")
+            self._send_resp(200, "START latched ON.\n")
+        elif path in ("/stop", "/api/stop"):
+            STATE_BUS.trigger_pulse("STOP")
+            self._send_resp(200, "STOP latched OFF.\n")
+        else:
+            self.send_response(404)
+            self._apply_cors_headers()
+            self.end_headers()
 
     def _send_resp(self, code: int, message: str):
         payload = message.encode("utf-8")
@@ -143,6 +204,17 @@ class PulseCommandServer(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
         self.send_header("Pragma", "no-cache")
         self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def _send_json_resp(self, code: int, data: dict):
+        import json
+        payload = json.dumps(data).encode("utf-8")
+        self.send_response(code)
+        self._apply_cors_headers()
+        self.send_header("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
+        self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(payload)))
         self.end_headers()
         self.wfile.write(payload)
