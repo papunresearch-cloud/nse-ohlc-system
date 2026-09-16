@@ -54,15 +54,12 @@ from live_child import update_live_script
 from yahoo_manager import get_latest_available_trading_date
 from parameter import update_all_parameters
 
-# Stock-Dashboard pipeline import
+# Stock-Dashboard pipeline import (Full 6-stage runner)
 try:
-    from basic import run_pipeline as run_screener_pipeline
+    from RUN_PIPELINE import main as run_screener_pipeline
 except ImportError:
-    try:
-        from BASIC import run_pipeline as run_screener_pipeline
-    except ImportError:
-        run_screener_pipeline = None
-        logger.warning("[WARNING] basic.py / BASIC.py not found. Screener sync will be unavailable.")
+    run_screener_pipeline = None
+    logger.warning("[WARNING] RUN_PIPELINE.py not found. Screener sync will be unavailable.")
 
 IST = pytz.timezone(TIMEZONE)
 _keep_running = True
