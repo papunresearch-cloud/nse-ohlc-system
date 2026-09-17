@@ -1,12 +1,11 @@
 """
 PARAMETER CALCULATION MODULE (parameter.py)
 Calculates technical indicators and performance metrics for active scripts.
-- Source data: Reads OHLC historical series from Firebase `/stocks/<script>`
-- Lookups: Reads 3yr value from `/detailedDb/<script>` or `/watchlist/detailedDb/<script>`
-- Output: Writes sanitized calculations to Firebase `/param/<sanitized_script>`
+- Source data: Reads OHLC historical series from Firebase /stocks/<script>
+- Lookups: Reads 3yr value directly from /watchlist/detailedDb/<script>
+- Output: Writes sanitized calculations to Firebase /param/<script>
 - Stamping: Stores both date and time (IST) separately for each script
 """
-
 import math
 from datetime import datetime
 import pytz
@@ -17,9 +16,7 @@ from firebase_manager import sanitize_key
 
 IST = pytz.timezone(TIMEZONE)
 
-
 def safe_round(val: Any, decimals: int = 2) -> Any:
-    """Rounds a numeric value or returns 'N/A' if NaN, infinite, or invalid."""
     if val is None or val == "N/A":
         return "N/A"
     try:
@@ -30,9 +27,7 @@ def safe_round(val: Any, decimals: int = 2) -> Any:
     except (ValueError, TypeError):
         return "N/A"
 
-
 def safe_div(numerator: Any, denominator: Any, factor: float = 100.0) -> Any:
-    """Safely calculates (numerator / denominator) * factor; returns 'N/A' on zero-division."""
     try:
         num = float(numerator)
         den = float(denominator)
@@ -45,9 +40,7 @@ def safe_div(numerator: Any, denominator: Any, factor: float = 100.0) -> Any:
     except (ValueError, TypeError, ZeroDivisionError):
         return "N/A"
 
-
 def parse_price(candle: Optional[Dict[str, Any]], field: str) -> Optional[float]:
-    """Extracts and verifies a floating price from an individual candle dictionary."""
     if not candle or field not in candle:
         return None
     try:
@@ -56,12 +49,7 @@ def parse_price(candle: Optional[Dict[str, Any]], field: str) -> Optional[float]
     except (ValueError, TypeError):
         return None
 
-
 def fetch_ordered_candles(script: str) -> List[Dict[str, Any]]:
-    """
-    Fetches historical candle collection under /stocks/<safe_script>.
-    Returns candles ordered chronologically backwards (index 0 is current/intraday, index 1 is yesterday).
-    """
     safe_script = sanitize_key(script)
     ref = db.reference(f"stocks/{safe_script}")
     stock_data = ref.get()
@@ -72,7 +60,6 @@ def fetch_ordered_candles(script: str) -> List[Dict[str, Any]]:
     if isinstance(stock_data, list):
         ordered_candles = [c for c in stock_data if isinstance(c, dict)]
     elif isinstance(stock_data, dict):
-        # Extract integer indices sequentially
         for i in range(len(stock_data)):
             key = str(i)
             if key in stock_data and isinstance(stock_data[key], dict):
@@ -81,9 +68,7 @@ def fetch_ordered_candles(script: str) -> List[Dict[str, Any]]:
                 break
     return ordered_candles
 
-
 def calculate_rsi(closes_newest_first: List[float], period: int = 14) -> Any:
-    """Calculates standard RSI using Exponential Moving Average on Close."""
     if len(closes_newest_first) < (period + 1):
         return "N/A"
 
@@ -111,147 +96,71 @@ def calculate_rsi(closes_newest_first: List[float], period: int = 14) -> Any:
         return 100.0 if avg_gain > 0.0 else 50.0
 
     rs = avg_gain / avg_loss
-    rsi = 100.0 - (100.0 / (1.0 + rs))
-    return safe_round(rsi, 2)
+    return round(100.0 - (100.0 / (1.0 + rs)), 2)
 
-
-def calculate_sma(closes_newest_first: List[float], window: int) -> Any:
-    """Calculates Simple Moving Average over the requested window."""
-    if len(closes_newest_first) < window:
-        return "N/A"
-    sub_slice = closes_newest_first[:window]
-    return safe_round(sum(sub_slice) / window, 2)
-
-
-def fetch_detailed_metrics(script: str) -> Dict[str, Any]:
-    """
-    Fetches static 3yr metric from /detailedDb/<script> or /watchlist/detailedDb/<script>.
-    """
+def calculate_single_script_parameters(script: str) -> bool:
+    """Calculates all metrics for a single script and writes directly to /param/<script>."""
     safe_script = sanitize_key(script)
-    # Check root detailedDb first, then fall back to nested watchlist/detailedDb
-    data = db.reference(f"detailedDb/{safe_script}").get() or db.reference(f"watchlist/detailedDb/{safe_script}").get()
-    
-    if not data and safe_script != script:
-        data = db.reference(f"detailedDb/{script}").get() or db.reference(f"watchlist/detailedDb/{script}").get()
-    
-    data = data or {}
-    ret_3yr = data.get("3yr") or data.get("3YR") or data.get("3Yr")
+    candles = fetch_ordered_candles(safe_script)
+    if not candles or len(candles) < 2:
+        logger.warning(f"[PARAM] Insufficient candle history for {safe_script} (Count: {len(candles)})")
+        return False
 
-    return {
-        "3yr": safe_round(ret_3yr, 2)
-    }
+    now_ist = datetime.now(IST)
+    current_date_str = now_ist.strftime("%d-%m-%Y")
+    current_time_str = now_ist.strftime("%H:%M:%S")
 
+    # Index 0 = Live candle, Index 1 = Previous trading session
+    live_c = candles[0]
+    cmp_val = parse_price(live_c, "close")
+    prev_close = parse_price(candles[1], "close") if len(candles) > 1 else None
 
-def compute_script_parameters(script: str) -> Optional[Dict[str, Any]]:
-    """Calculates all parameter metrics for a single script and commits them to /param/<safe_script>."""
-    safe_script = sanitize_key(script)
-    candles = fetch_ordered_candles(script)
-    if not candles:
-        logger.warning(f"[{script}] No candle records found under /stocks/{safe_script}.")
-        return None
+    closes = [parse_price(c, "close") for c in candles if parse_price(c, "close") is not None]
 
-    c_0 = candles[0] if len(candles) > 0 else None
-    close_0 = parse_price(c_0, "close")
-    open_0 = parse_price(c_0, "open")
-
-    closes: List[float] = []
-    highs: List[float] = []
-    lows: List[float] = []
-
-    for c in candles:
-        cl = parse_price(c, "close")
-        hi = parse_price(c, "high")
-        lo = parse_price(c, "low")
-        if cl is not None:
-            closes.append(cl)
-        if hi is not None:
-            highs.append(hi)
-        if lo is not None:
-            lows.append(lo)
-
-    # Moving Averages
-    ma10 = calculate_sma(closes, 10)
-    ma25 = calculate_sma(closes, 25)
-    ma50 = calculate_sma(closes, 50)
-    ma200 = calculate_sma(closes, 200)
+    # Moving averages
+    ma10 = safe_round(sum(closes[:10]) / 10) if len(closes) >= 10 else "N/A"
+    ma25 = safe_round(sum(closes[:25]) / 25) if len(closes) >= 25 else "N/A"
+    ma50 = safe_round(sum(closes[:50]) / 50) if len(closes) >= 50 else "N/A"
+    ma200 = safe_round(sum(closes[:200]) / 200) if len(closes) >= 200 else "N/A"
 
     # RSI
-    rsi = calculate_rsi(closes, 14)
+    rsi_val = calculate_rsi(closes, period=14)
 
-    # 52-Week Extremes (252 trading sessions)
-    h_slice = highs[:252]
-    l_slice = lows[:252]
-    w52h = safe_round(max(h_slice), 2) if len(h_slice) >= 10 else "N/A"
-    w52l = safe_round(min(l_slice), 2) if len(l_slice) >= 10 else "N/A"
+    # Return percentages
+    chg_today = safe_div(cmp_val - prev_close, prev_close) if cmp_val and prev_close else "N/A"
 
-    # Periodic Returns (Protected index access)
-    def get_close(idx: int) -> Optional[float]:
-        return closes[idx] if len(closes) > idx else None
+    # 3-year value from detailedDb
+    three_yr_val = "N/A"
+    try:
+        det_data = db.reference(f"watchlist/detailedDb/{safe_script}").get() or {}
+        three_yr_val = det_data.get("3yr", "N/A")
+    except Exception:
+        pass
 
-    c_1 = get_close(1)
-    c_6 = get_close(6)
-    c_21 = get_close(21)
-    c_66 = get_close(66)
-    c_121 = get_close(121)
-    c_251 = get_close(251) or get_close(250)
-
-    chng_2dy = safe_div(close_0 - open_0, open_0) if (close_0 is not None and open_0 is not None) else "N/A"
-    chng_ydy = safe_div(close_0 - c_1, c_1) if (close_0 is not None and c_1 is not None) else "N/A"
-
-    ret_1wr = safe_div(c_1 - c_6, c_6) if (c_1 is not None and c_6 is not None) else "N/A"
-    ret_1mr = safe_div(c_1 - c_21, c_21) if (c_1 is not None and c_21 is not None) else "N/A"
-    ret_3mr = safe_div(c_1 - c_66, c_66) if (c_1 is not None and c_66 is not None) else "N/A"
-    ret_6mr = safe_div(c_1 - c_121, c_121) if (c_1 is not None and c_121 is not None) else "N/A"
-    ret_1yr = safe_div(c_1 - c_251, c_251) if (c_1 is not None and c_251 is not None) else "N/A"
-
-    # Static 3yr lookup
-    detailed_metrics = fetch_detailed_metrics(script)
-
-    # Timestamp Generation (IST)
-    now_ist = datetime.now(IST)
-    current_time_str = now_ist.strftime("%H:%M:%S")
-    current_date_str = str(c_0.get("date", now_ist.strftime("%Y-%m-%d"))) if c_0 else now_ist.strftime("%Y-%m-%d")
-
-    payload = {
-        "date": current_date_str,
-        "RSI": rsi,
-        "10ma": ma10,
-        "25ma": ma25,
-        "50ma": ma50,
-        "200ma": ma200,
-        "52wh": w52h,
-        "52wl": w52l,
-        "2dy-%chng": chng_2dy,
-        "Ydy-%chng": chng_ydy,
-        "1wr": ret_1wr,
-        "1mr": ret_1mr,
-        "3mr": ret_3mr,
-        "6mr": ret_6mr,
-        "1yr": ret_1yr,
-        "3yr": detailed_metrics["3yr"],
-        "updated_at": f"{current_date_str} {current_time_str}"
+    param_payload = {
+        "Name": safe_script,
+        "CMP": cmp_val or "N/A",
+        "PREV_CLOSE": prev_close or "N/A",
+        "%Chg (T)": chg_today,
+        "10MA": ma10,
+        "25MA": ma25,
+        "50MA": ma50,
+        "200MA": ma200,
+        "RSI": rsi_val,
+        "3yr": three_yr_val,
+        "DATE": current_date_str,
+        "TIME": current_time_str
     }
 
-    db.reference(f"param/{safe_script}").set(payload)
-    logger.info(f"[{script}] Parameters saved to /param/{safe_script} at {current_time_str}")
-    return payload
+    try:
+        db.reference(f"param/{safe_script}").set(param_payload)
+        logger.info(f"[PARAM] Updated /param/{safe_script} at {current_time_str}")
+        return True
+    except Exception as e:
+        logger.error(f"[PARAM] Failed writing /param/{safe_script}: {e}")
+        return False
 
-
-def update_all_parameters(scripts: List[str]) -> None:
-    """Iterates through all registered active scripts to calculate and save parameters."""
-    logger.info(f"[PARAM ENGINE] Executing 15-minute calculation cycle across {len(scripts)} scripts...")
-    for script in scripts:
-        try:
-            compute_script_parameters(script)
-        except Exception as e:
-            logger.error(f"[{script}] Failed to process parameters: {e}", exc_info=True)
-
-
-if __name__ == "__main__":
-    from firebase_manager import init_firebase, get_stocklist_mapping
-    init_firebase()
-    stock_map = get_stocklist_mapping()
-    stock_names = list(stock_map.keys())
-    print(f"Forcefully calculating parameters for {len(stock_names)} stocks...")
-    update_all_parameters(stock_names)
-    print("Parameter calculation complete.")
+def update_all_parameters(scripts: List[str]):
+    logger.info(f"[PARAM ENGINE] Executing calculation cycle across {len(scripts)} scripts...")
+    for s in scripts:
+        calculate_single_script_parameters(s)
