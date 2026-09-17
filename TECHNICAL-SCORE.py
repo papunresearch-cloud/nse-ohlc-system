@@ -1,15 +1,11 @@
-# =====================================================================
-# TECHNICAL SCORE ENGINE – Unified Pipeline (Firebase Realtime DB)
-# =====================================================================
-
 import firebase_admin
 from firebase_admin import credentials, db
 import numpy as np
 import pandas as pd
 
-# ---------------------------------------------------------------------
+# =====================================================================
 # CONFIGURATION
-# ---------------------------------------------------------------------
+# =====================================================================
 FIREBASE_KEY_FILE = "serviceAccountKey.json"
 FIREBASE_DB_URL = "https://stock-dashboard-5c25c-default-rtdb.asia-southeast1.firebasedatabase.app"
 FIREBASE_TARGET_NODE = "SCREENER"
@@ -178,18 +174,21 @@ def compute_t_score(df):
     return df
 
 def update_technical_score():
-    print("Connecting to Firebase Realtime Database...")
+    print("[INFO] Connecting to Firebase Realtime Database...")
     init_firebase()
 
     ref = db.reference(FIREBASE_TARGET_NODE)
     data = ref.get()
 
     if not data:
-        print(f"Error: No data found at Firebase node '/{FIREBASE_TARGET_NODE}'.")
+        print(f"[ERROR] No data found at Firebase node '/{FIREBASE_TARGET_NODE}'.")
         return
 
-    print(f"Fetched records from Firebase. Loading into DataFrame...")
-    df = pd.DataFrame(data)
+    print("[INFO] Loading records into DataFrame...")
+    if isinstance(data, dict):
+        df = pd.DataFrame.from_dict(data, orient="index")
+    else:
+        df = pd.DataFrame(data)
 
     # Coerce numeric columns safely across the entire database
     num_cols = ["cmp", "50ma", "200ma", "52wh", "52wl", MCAP_COL] + RETURN_COLS
@@ -207,10 +206,10 @@ def update_technical_score():
     )
 
     if not valid_mask.any():
-        print("Warning: No records found with sufficient technical data to score.")
+        print("[WARN] No records found with sufficient technical data to score.")
         return
 
-    print(f"Calculating T-score for {valid_mask.sum()} eligible records...")
+    print(f"[INFO] Calculating T-score for {valid_mask.sum()} eligible records...")
     calc_df = df[valid_mask].copy()
 
     # --- DMA part ---
@@ -246,11 +245,14 @@ def update_technical_score():
     cleaned_df = df.replace([np.inf, -np.inf], np.nan)
     cleaned_df = cleaned_df.astype(object).where(pd.notnull(cleaned_df), None)
 
-    records = cleaned_df.to_dict(orient="records")
+    if "CODE" in cleaned_df.columns:
+        payload = cleaned_df.set_index("CODE", drop=False).to_dict(orient="index")
+    else:
+        payload = cleaned_df.to_dict(orient="index")
 
-    print(f"Writing records with updated 'T-score' back to Firebase node '/{FIREBASE_TARGET_NODE}'...")
-    ref.set(records)
-    print(f"[OK] Success! Updated {len(records)} records in Firebase node '/{FIREBASE_TARGET_NODE}'.")
+    print(f"[INFO] Writing records with updated 'T-score' back to Firebase node '/{FIREBASE_TARGET_NODE}'...")
+    ref.set(payload)
+    print(f"[OK] Success! Updated {len(cleaned_df)} records in Firebase node '/{FIREBASE_TARGET_NODE}'.")
 
 if __name__ == "__main__":
     try:

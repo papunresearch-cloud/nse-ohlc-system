@@ -5,13 +5,13 @@ import sys
 # =====================================================================
 # CONFIGURATION BLOCK
 # =====================================================================
+# Pipeline sequence: Ingestion & PK derivation -> Metric derivations -> Scoring
 scripts = [
-    "BASIC.py",                # 1. Copies screener.csv from Drive to Firebase
-    "NSE-BSE-Code.py",         # 2. Computes and attaches CODE column
-    "DPE-DPB-MCAP.py",         # 3. Computes DPB%, DPE%, LGCAP, PCCAP
-    "GROWTH-SCORE.py",         # 4. Computes and attaches G-score
-    "FUNDAMENTAL-SCORE.py",    # 5. Computes and attaches F-score
-    "TECHNICAL-SCORE.py"       # 6. Computes and attaches T-score
+    "BASIC.py",                # 1. Copies screener.csv, sets primary key CODE, saves to Firebase
+    "DPE-DPB-MCAP.py",         # 2. Computes DPB%, DPE%, LGCAP, PCCAP
+    "GROWTH-SCORE.py",         # 3. Computes and attaches G-score
+    "FUNDAMENTAL-SCORE.py",    # 4. Computes and attaches F-score
+    "TECHNICAL-SCORE.py"       # 5. Computes and attaches T-score
 ]
 # =====================================================================
 
@@ -61,7 +61,7 @@ def main():
         run_script(script)
 
     print(f"\n{'='*60}")
-    print("[OK] All 6 stages completed successfully! Firebase /SCREENER updated.")
+    print(f"[OK] All {total_steps} stages completed successfully! Firebase /SCREENER updated.")
     print(f"{'='*60}")
 
 if __name__ == "__main__":

@@ -25,25 +25,28 @@ def safe_division(num, denom):
     return 100 * (num - denom) / denom
 
 def update_dpe_dpb_metrics():
-    print("Connecting to Firebase Realtime Database...")
+    print("[INFO] Connecting to Firebase Realtime Database...")
     init_firebase()
 
     ref = db.reference(FIREBASE_TARGET_NODE)
     data = ref.get()
 
     if not data:
-        print(f"Error: No data found at Firebase node '/{FIREBASE_TARGET_NODE}'.")
+        print(f"[ERROR] No data found at Firebase node '/{FIREBASE_TARGET_NODE}'.")
         return
 
-    print("Fetched records from Firebase. Loading into DataFrame...")
-    df = pd.DataFrame(data)
+    print("[INFO] Loading records into DataFrame...")
+    if isinstance(data, dict):
+        df = pd.DataFrame.from_dict(data, orient="index")
+    else:
+        df = pd.DataFrame(data)
 
     # Ensure numeric conversion (invalid entries become NaN)
     for col in ["PB", "3PB", "PE", "3PE", "mcap"]:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
         else:
-            print(f"Warning: Column '{col}' not found in database.")
+            print(f"[WARN] Column '{col}' not found in database.")
 
     # Calculate % deviation of PE & PB with respect to their 3-year average
     if "PB" in df.columns and "3PB" in df.columns:
@@ -69,14 +72,18 @@ def update_dpe_dpb_metrics():
     cleaned_df = df.replace([np.inf, -np.inf], np.nan)
     cleaned_df = cleaned_df.astype(object).where(pd.notnull(cleaned_df), None)
 
-    records = cleaned_df.to_dict(orient="records")
+    # Maintain keyed dictionary under primary key 'CODE'
+    if "CODE" in cleaned_df.columns:
+        payload = cleaned_df.set_index("CODE", drop=False).to_dict(orient="index")
+    else:
+        payload = cleaned_df.to_dict(orient="index")
 
-    print(f"Writing updated records back to Firebase node '/{FIREBASE_TARGET_NODE}'...")
-    ref.set(records)
-    print(f"Success! Columns 'DPB%', 'DPE%', 'LGCAP', and 'PCCAP' added to Firebase.")
+    print(f"[INFO] Writing updated records back to Firebase node '/{FIREBASE_TARGET_NODE}'...")
+    ref.set(payload)
+    print(f"[OK] Success! Columns 'DPB%', 'DPE%', 'LGCAP', and 'PCCAP' added to Firebase.")
 
 if __name__ == "__main__":
     try:
         update_dpe_dpb_metrics()
     except Exception as e:
-        print(f"An unexpected error occurred: {e}")
+        print(f"[ERROR] An unexpected error occurred: {e}")

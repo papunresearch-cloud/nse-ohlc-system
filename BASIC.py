@@ -126,7 +126,7 @@ def get_file_id(service, folder_id, file_name):
     return files[0]['id'] if files else None
 
 # ==========================================
-# 3. FIREBASE SETUP
+# 3. FIREBASE SETUP & PRIMARY KEY HELPERS
 # ==========================================
 def init_firebase():
     """Initializes Firebase Admin SDK for Realtime Database."""
@@ -136,24 +136,59 @@ def init_firebase():
             'databaseURL': FIREBASE_DB_URL
         })
 
+def sanitize_firebase_key(key: str) -> str:
+    """Removes or replaces forbidden Firebase RTDB path characters."""
+    if not key:
+        return ""
+    return (
+        str(key)
+        .strip()
+        .replace(".", "_")
+        .replace("#", "_")
+        .replace("$", "_")
+        .replace("/", "_")
+        .replace("[", "_")
+        .replace("]", "_")
+    )
+
+def derive_primary_key(bse: str, nse: str, name: str) -> str:
+    """
+    Selects primary identifier:
+    1. Clean NSE Code (preferred)
+    2. BSE Code (if NSE missing)
+    3. Sanitized Name (fallback if both missing)
+    """
+    nse_clean = str(nse).strip() if pd.notna(nse) else ""
+    bse_clean = str(bse).strip() if pd.notna(bse) else ""
+    name_clean = str(name).strip() if pd.notna(name) else ""
+
+    if nse_clean and nse_clean.lower() != "nan":
+        chosen = nse_clean
+    elif bse_clean and bse_clean.lower() != "nan":
+        chosen = bse_clean
+    else:
+        chosen = name_clean
+
+    return sanitize_firebase_key(chosen)
+
 # ==========================================
 # 4. EXECUTION PIPELINE
 # ==========================================
 def run_pipeline():
-    print("Connecting to Google Drive...")
+    print("[INFO] Connecting to Google Drive...")
     service = get_drive_service()
     
-    print(f"Locating folder '{GDRIVE_FOLDER_NAME}'...")
+    print(f"[INFO] Locating folder '{GDRIVE_FOLDER_NAME}'...")
     folder_id = get_folder_id(service, GDRIVE_FOLDER_NAME)
     if not folder_id:
         raise FileNotFoundError(f"Folder '{GDRIVE_FOLDER_NAME}' not found in Google Drive.")
 
-    print(f"Locating file '{GDRIVE_FILE_NAME}'...")
+    print(f"[INFO] Locating file '{GDRIVE_FILE_NAME}'...")
     file_id = get_file_id(service, folder_id, GDRIVE_FILE_NAME)
     if not file_id:
         raise FileNotFoundError(f"File '{GDRIVE_FILE_NAME}' not found inside folder '{GDRIVE_FOLDER_NAME}'.")
 
-    print(f"Streaming '{GDRIVE_FILE_NAME}' into memory...")
+    print(f"[INFO] Streaming '{GDRIVE_FILE_NAME}' into memory...")
     request = service.files().get_media(fileId=file_id)
     fh = io.BytesIO()
     downloader = MediaIoBaseDownload(fh, request)
@@ -163,23 +198,41 @@ def run_pipeline():
 
     fh.seek(0)
     df = pd.read_csv(fh)
-    print(f"Successfully loaded CSV ({len(df)} rows).")
+    print(f"[OK] Successfully loaded CSV ({len(df)} rows).")
 
-    # Column filtering & renaming
-    extracted_df = df[list(column_mapping.keys())].rename(columns=column_mapping)
+    # Column filtering & renaming (only matching configured columns)
+    valid_cols = [c for c in column_mapping.keys() if c in df.columns]
+    extracted_df = df[valid_cols].rename(columns=column_mapping)
 
-    # Sanitize invalid float/NaN values for JSON serialization
+    # 1. Derive Primary Key column 'CODE'
+    bse_col = extracted_df["BSE"] if "BSE" in extracted_df.columns else ""
+    nse_col = extracted_df["NSE"] if "NSE" in extracted_df.columns else ""
+    name_col = extracted_df["Name"] if "Name" in extracted_df.columns else ""
+
+    extracted_df["CODE"] = [
+        derive_primary_key(b, n, nm)
+        for b, n, nm in zip(bse_col, nse_col, name_col)
+    ]
+
+    # Remove rows where no valid key could be constructed
+    extracted_df = extracted_df[extracted_df["CODE"] != ""].copy()
+
+    # Drop duplicate primary keys if any exist in the CSV (keeps first occurrence)
+    extracted_df = extracted_df.drop_duplicates(subset=["CODE"], keep="first")
+
+    # Sanitize invalid float/NaN values for clean JSON serialization
     cleaned_df = extracted_df.replace([np.inf, -np.inf], np.nan)
     cleaned_df = cleaned_df.astype(object).where(pd.notnull(cleaned_df), None)
-    
-    records = cleaned_df.to_dict(orient="records")
 
-    print("Uploading records to Firebase Realtime Database...")
+    # 2. Convert DataFrame to a keyed dictionary: { "CODE": { ...record... } }
+    keyed_records = cleaned_df.set_index("CODE", drop=False).to_dict(orient="index")
+
+    print("[INFO] Uploading keyed dictionary to Firebase Realtime Database...")
     init_firebase()
     ref = db.reference(FIREBASE_TARGET_NODE)
-    ref.set(records)
+    ref.set(keyed_records)
     
-    print(f"[OK] Success! Uploaded {len(records)} records to Firebase node: /{FIREBASE_TARGET_NODE}")
+    print(f"[OK] Success! Uploaded {len(keyed_records)} keyed records to Firebase node: /{FIREBASE_TARGET_NODE}")
 
 if __name__ == "__main__":
     try:

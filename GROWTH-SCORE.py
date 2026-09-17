@@ -142,18 +142,21 @@ def sg_score(x):
 # MAIN PIPELINE
 # =====================================================================
 def update_growth_scores():
-    print("Connecting to Firebase Realtime Database...")
+    print("[INFO] Connecting to Firebase Realtime Database...")
     init_firebase()
 
     ref = db.reference(FIREBASE_TARGET_NODE)
     data = ref.get()
 
     if not data:
-        print(f"Error: No data found at Firebase node '/{FIREBASE_TARGET_NODE}'.")
+        print(f"[ERROR] No data found at Firebase node '/{FIREBASE_TARGET_NODE}'.")
         return
 
-    print("Fetched records from Firebase. Loading into DataFrame...")
-    df = pd.DataFrame(data)
+    print("[INFO] Loading records into DataFrame...")
+    if isinstance(data, dict):
+        df = pd.DataFrame.from_dict(data, orient="index")
+    else:
+        df = pd.DataFrame(data)
 
     # 1. Clean input numeric columns
     for col in ["pg-1", "pg-3", "sg-eq", "sg-ttm", "sg-3y"]:
@@ -185,22 +188,25 @@ def update_growth_scores():
 
     df.loc[temp.index, "G-score"] = temp["G-score"]
 
-    # 4. Strictly drop all intermediate and temporary columns
+    # 4. Drop all temporary/intermediate columns
     df.drop(
         columns=["_pg_c", "_sg_c", "_m", "_n", "pg-c", "sg-c"],
         inplace=True,
         errors="ignore"
     )
-    print(f"G-score calculated for {len(temp)} stocks.")
+    print(f"[INFO] G-score calculated for {len(temp)} stocks.")
 
-    # 5. Sanitize and upload to Firebase
+    # 5. Sanitize and upload to Firebase as keyed dictionary
     cleaned_df = df.replace([np.inf, -np.inf], np.nan)
     cleaned_df = cleaned_df.astype(object).where(pd.notnull(cleaned_df), None)
 
-    records = cleaned_df.to_dict(orient="records")
+    if "CODE" in cleaned_df.columns:
+        payload = cleaned_df.set_index("CODE", drop=False).to_dict(orient="index")
+    else:
+        payload = cleaned_df.to_dict(orient="index")
 
-    print(f"Writing records with only 'G-score' added back to Firebase node '/{FIREBASE_TARGET_NODE}'...")
-    ref.set(records)
+    print(f"[INFO] Writing records with 'G-score' back to Firebase node '/{FIREBASE_TARGET_NODE}'...")
+    ref.set(payload)
     print(f"[OK] Success! Single column 'G-score' updated in Firebase.")
 
 if __name__ == "__main__":
