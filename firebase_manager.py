@@ -235,25 +235,29 @@ def reconcile_stocklist_with_watchlist() -> tuple[bool, dict[str, str]]:
     return False, current_stocklist
 
 
-def get_stocklist_mapping() -> dict[str, str]:
+def get_stocklist_mapping(force_reconcile: bool = True) -> dict[str, str]:
     """
-    Returns the active target dictionary:
-    Always includes the 4 permanent indices merged with /stocklist.
+    Returns the active target dictionary.
+    If force_reconcile is True (default), it immediately purges deleted symbols
+    from /stocklist and keeps it an identical mirror of /watchlist.
     """
-    mapping = get_current_stocklist()
-    if not mapping:
+    if force_reconcile:
         _, mapping = reconcile_stocklist_with_watchlist()
-    
+    else:
+        mapping = get_current_stocklist()
+        if not mapping:
+            _, mapping = reconcile_stocklist_with_watchlist()
+
     # Ensure permanent indices are present even if /stocklist was incomplete
     for k, v in FIXED_INDICES.items():
         mapping.setdefault(sanitize_key(k), v)
-        
+
     return mapping
 
 
 def get_stocklist() -> list:
     """Returns active target names list."""
-    return list(get_stocklist_mapping().keys())
+    return list(get_stocklist_mapping(force_reconcile=False).keys())
 
 
 # =====================================================================

@@ -7,7 +7,7 @@ MASTER ORCHESTRATOR (UNIFIED MONITOR & SCREENER PLATFORM)
 - SR Flip-Flop Power Latch (Default: ON).
 - Real-time /system_status heartbeat telemetry every 300s.
 - Non-blocking 5-second main loop idle tick on weekends and holidays.
-- Dynamic stock discovery using get_stocklist_mapping().
+- Dynamic stock discovery using get_stocklist_mapping(force_reconcile=True).
 - Pre-market sync window (08:00–08:30 IST) with 5-minute retry intervals.
 - Index 0 preserved (no 09:00 AM or 16:00 PM wipes).
 - 5-minute live updates (CHILD-2) and 15-minute parameter engine calculations.
@@ -45,6 +45,7 @@ from firebase_admin import db
 from firebase_manager import (
     init_firebase,
     get_stocklist_mapping,
+    reconcile_stocklist_with_watchlist,
     get_stock_ohlc,
     clear_live_candle
 )
@@ -54,12 +55,18 @@ from live_child import update_live_script
 from yahoo_manager import get_latest_available_trading_date
 from parameter import update_all_parameters
 
-# Stock-Dashboard pipeline import (Full 6-stage runner)
+# Screener Pipeline ETL Runner
 try:
-    from RUN_PIPELINE import main as run_screener_pipeline
+    from basic import run_pipeline as run_screener_pipeline
 except ImportError:
-    run_screener_pipeline = None
-    logger.warning("[WARNING] RUN_PIPELINE.py not found. Screener sync will be unavailable.")
+    try:
+        from BASIC import run_pipeline as run_screener_pipeline
+    except ImportError:
+        try:
+            from RUN_PIPELINE import main as run_screener_pipeline
+        except ImportError:
+            run_screener_pipeline = None
+            logger.warning("[WARNING] Screener ETL script not found. Pipeline sync will be unavailable.")
 
 IST = pytz.timezone(TIMEZONE)
 _keep_running = True
@@ -108,9 +115,9 @@ STATE_BUS = SystemStateBus()
 # BACKGROUND ASYNC WORKERS
 # =====================================================================
 def dispatch_screener_sync_job():
-    """Runs basic.py run_pipeline inside a thread-safe daemon worker."""
+    """Runs screener ETL run_pipeline inside a thread-safe daemon worker."""
     if not run_screener_pipeline:
-        logger.error("[SCREENER] Cannot run pipeline: basic.py is not loaded.")
+        logger.error("[SCREENER] Cannot run pipeline: ETL runner is not loaded.")
         return
 
     if not _screener_lock.acquire(blocking=False):
@@ -302,7 +309,8 @@ class MasterOrchestrator:
 
                 # --- Priority 0: Manual Pulse Interruption (Independent of power state) ---
                 if STATE_BUS.check_and_clear_manual_sync():
-                    logger.info("[OVERRIDE PULSE] Immediate sync commanded. Running CHILD-1 in background...")
+                    logger.info("[OVERRIDE PULSE] Immediate sync commanded. Running reconciliation & CHILD-1...")
+                    self.replan_daily_routine()
                     threading.Thread(target=self.execute_historical_sync, kwargs={"is_manual": True}, daemon=True).start()
                     continue
 
@@ -362,7 +370,7 @@ class MasterOrchestrator:
         logger.info("Master orchestrator stopped cleanly.")
 
     def replan_daily_routine(self):
-        """Initializes day plan using get_stocklist_mapping."""
+        """Initializes day plan, forcing reconciliation to purge deleted stocks from /stocklist."""
         now_ist = datetime.now(IST)
         today = now_ist.date()
         self.calendar.refresh_calendar()
@@ -371,7 +379,8 @@ class MasterOrchestrator:
         self.last_planned_date = today
         self.sync_audit_reported_today = False
 
-        stock_map = get_stocklist_mapping()
+        # Force reconciliation with /watchlist to purge deleted entries immediately
+        stock_map = get_stocklist_mapping(force_reconcile=True)
         self.script_status = {
             name: {
                 "synced": False,
