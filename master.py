@@ -1,9 +1,7 @@
 """
-===============================================================================
 MASTER ENGINE: Stock Market Data Orchestrator
-===============================================================================
-Coordinates historical sync, intraday candle updates, indicators, and
-live command events dispatched from Watchlist.jsx.
+Coordinates historical sync, intraday candle updates, indicators,
+and live command events dispatched from Watchlist.jsx.
 """
 
 import sys
@@ -12,42 +10,46 @@ import time
 import signal
 import logging
 import threading
-from datetime import datetime, time as dtime
+from datetime import datetime
 import pytz
 
 # Add project root to path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+# FIXED_INDICES belongs to firebase_manager, not config
 from config import (
-    FIXED_INDICES,
     PATH_STOCKS,
-    PATH_SCRIPTS
+    PATH_SCRIPTS,
+    TIMEZONE,
+    logger
 )
 from firebase_manager import (
     init_firebase,
     sanitize_key,
+    FIXED_INDICES,
     reconcile_stocklist_with_watchlist,
     get_stocklist_mapping,
-    get_historical_stock_data,
-    update_live_candle,
-    write_historical_stock_data
+    get_stock_ohlc,
+    update_live_candle
 )
 import firebase_admin
 from firebase_admin import db
 from yahoo_manager import (
-    download_historical_data,
-    download_intraday_data,
-    download_all_indices_intraday
+    download_historical_daily,
+    download_intraday_data
 )
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] (%(threadName)s) %(message)s",
-    handlers=[logging.StreamHandler(sys.stdout)]
-)
-logger = logging.getLogger("MASTER")
-IST = pytz.timezone("Asia/Kolkata")
+try:
+    from parameter import update_all_parameters
+except ImportError:
+    update_all_parameters = None
 
+try:
+    from RUN_PIPELINE import main as run_screener_pipeline
+except ImportError:
+    run_screener_pipeline = None
+
+IST = pytz.timezone(TIMEZONE if 'TIMEZONE' in locals() else "Asia/Kolkata")
 _keep_running = True
 
 def handle_exit_signal(sig, frame):
@@ -109,9 +111,7 @@ class MasterOrchestrator:
         logger.info(f"[STOCK EVENT] Received action: '{action}' on target: {stock} ({safe_stock})")
 
         if action == "ADD":
-            # Replan targets to include the newly added stock
             self.replan_daily_routine()
-            # Immediately download historical bars and seed live row
             threading.Thread(
                 target=self.sync_single_stock_history,
                 args=(safe_stock, ticker or stock),
@@ -150,15 +150,17 @@ class MasterOrchestrator:
                 del self.script_status[safe_stock]
 
     def sync_single_stock_history(self, safe_stock: str, ticker: str):
-        """Fetches 300 daily bars for a newly enrolled stock and writes to Firebase."""
+        """Fetches historical bars for a newly enrolled stock and updates parameters."""
         logger.info(f"[ON-DEMAND SYNC] Starting historical sync for {safe_stock} ({ticker})...")
         try:
-            df = download_historical_data(ticker, period="2y")
-            if df is not None and not df.empty:
-                write_historical_stock_data(safe_stock, df)
-                logger.info(f"[ON-DEMAND SYNC] Successfully seeded 300 bars for {safe_stock}")
+            from sync_child import sync_historical_script
+            success, msg = sync_historical_script(safe_stock, ticker)
+            if success:
+                logger.info(f"[ON-DEMAND SYNC] {safe_stock} synchronized: {msg}")
+                if update_all_parameters:
+                    update_all_parameters()
             else:
-                logger.warning(f"[ON-DEMAND SYNC] No historical bars returned for {ticker}")
+                logger.warning(f"[ON-DEMAND SYNC] Sync failed for {safe_stock}: {msg}")
         except Exception as e:
             logger.error(f"[ON-DEMAND SYNC] Failed syncing {safe_stock}: {e}", exc_info=True)
 
