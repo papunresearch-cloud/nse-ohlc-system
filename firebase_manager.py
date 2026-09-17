@@ -5,6 +5,7 @@ FIREBASE MANAGER
 - Permanent anchoring of 4 master market indices (immune to purging/deletion).
 - Pure read-only access to master nodes: /watchlist and /detailedDb.
 - Guarded OHLC access for Child-1 (1 to 250) and Child-2 (index 0).
+- Automated Garbage Collector for deleted assets in /stocks.
 """
 import os
 import json
@@ -195,7 +196,7 @@ def get_current_stocklist() -> dict[str, str]:
 def reconcile_stocklist_with_watchlist() -> tuple[bool, dict[str, str]]:
     """
     Compares /stocklist against the master /watchlist and FIXED_INDICES.
-    Synchronizes /stocklist if discrepancies are detected.
+    Synchronizes /stocklist and removes orphaned historical OHLC entries under /stocks.
     Returns: (was_changed: bool, active_stock_mapping: dict)
     """
     init_firebase()
@@ -225,7 +226,18 @@ def reconcile_stocklist_with_watchlist() -> tuple[bool, dict[str, str]]:
             f"and stocklist ({len(current_stocklist)})."
         )
         try:
+            # 1. Update /stocklist with the cleaned mapping
             db.reference(PATH_SCRIPTS).set(safe_master_map)
+            
+            # 2. Garbage Collector: Purge orphaned /stocks OHLC records
+            orphans = set(current_stocklist.keys()) - set(safe_master_map.keys())
+            for orphan in orphans:
+                logger.info(f"[GARBAGE COLLECTOR] Purging historical OHLC for deleted stock: {orphan}")
+                try:
+                    db.reference(f"{PATH_STOCKS}/{orphan}").delete()
+                except Exception as del_err:
+                    logger.warning(f"[GARBAGE COLLECTOR] Failed to purge {orphan}: {del_err}")
+
             logger.info(f"[RECONCILE] /stocklist successfully synchronized with {len(safe_master_map)} targets.")
             return True, safe_master_map
         except Exception as e:
@@ -237,9 +249,9 @@ def reconcile_stocklist_with_watchlist() -> tuple[bool, dict[str, str]]:
 
 def get_stocklist_mapping(force_reconcile: bool = True) -> dict[str, str]:
     """
-    Returns the active target dictionary.
-    If force_reconcile is True (default), it immediately purges deleted symbols
-    from /stocklist and keeps it an identical mirror of /watchlist.
+    Returns active target dictionary:
+    If force_reconcile is True (default), it immediately reconciles with /watchlist,
+    purging deleted stocks from /stocklist and /stocks.
     """
     if force_reconcile:
         _, mapping = reconcile_stocklist_with_watchlist()
@@ -248,7 +260,7 @@ def get_stocklist_mapping(force_reconcile: bool = True) -> dict[str, str]:
         if not mapping:
             _, mapping = reconcile_stocklist_with_watchlist()
 
-    # Ensure permanent indices are present even if /stocklist was incomplete
+    # Ensure permanent indices are present
     for k, v in FIXED_INDICES.items():
         mapping.setdefault(sanitize_key(k), v)
 
