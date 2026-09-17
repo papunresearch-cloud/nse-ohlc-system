@@ -25,42 +25,61 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from config import (
     TIMEZONE,
-    FIXED_INDICES,
     PATH_STOCKS,
     PATH_SCRIPTS,
     LIVE_UPDATE_INTERVAL_SEC,
     PULSE_VALIDITY_SEC,
     logger
 )
+
+# FIXED_INDICES is defined in firebase_manager.py
+try:
+    from firebase_manager import FIXED_INDICES
+except ImportError:
+    FIXED_INDICES = {
+        "NIFTY50": "^NSEI",
+        "NIFTY100": "^CNX100",
+        "NIFTY MIDCAP 150": "^CRSLDX",
+        "NIFTY SMALLCAP 250": "^CNXSC"
+    }
+
 from firebase_manager import (
     init_firebase,
     sanitize_key,
     reconcile_stocklist_with_watchlist,
-    get_stocklist_mapping,
-    get_historical_stock_data,
-    update_live_candle,
-    write_historical_stock_data
+    get_stocklist_mapping
 )
 import firebase_admin
 from firebase_admin import db
-from yahoo_manager import (
-    download_historical_data,
-    download_intraday_data,
-    download_all_indices_intraday
-)
 
+# Calendar and Child Workers
+from market_calendar import MarketCalendar
+from sync_child import sync_historical_script
+from live_child import update_live_script
+
+# Parameter calculation engine
 try:
-    from parameter import update_all_parameters
+    from parameter import update_all_parameters, calculate_single_script_parameters
 except ImportError:
-    update_all_parameters = None
+    try:
+        from parameter import update_all_parameters
+        calculate_single_script_parameters = None
+    except ImportError:
+        update_all_parameters = None
+        calculate_single_script_parameters = None
 
+# Screener Pipeline ETL runner
 try:
     from RUN_PIPELINE import main as run_screener_pipeline
 except ImportError:
-    run_screener_pipeline = None
+    try:
+        from BASIC import run_pipeline as run_screener_pipeline
+    except ImportError:
+        run_screener_pipeline = None
 
 IST = pytz.timezone(TIMEZONE)
 _keep_running = True
+_screener_lock = threading.Lock()
 
 def handle_exit_signal(sig, frame):
     global _keep_running
@@ -113,7 +132,7 @@ class HealthAndControlHandler(BaseHTTPRequestHandler):
     def _send_cors_headers(self):
         self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.send_header("Access-Control-Allow-Headers", "*")
 
     def do_OPTIONS(self):
         self.send_response(200)
@@ -124,7 +143,7 @@ class HealthAndControlHandler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         path = parsed.path.lower()
 
-        if path in ["/", "/health"]:
+        if path in ["/", "/health", "/ping"]:
             self.send_response(200)
             self._send_cors_headers()
             self.send_header("Content-Type", "application/json")
@@ -134,6 +153,18 @@ class HealthAndControlHandler(BaseHTTPRequestHandler):
                 "timestamp": datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S IST")
             }
             self.wfile.write(json.dumps(status).encode("utf-8"))
+        elif path in ["/calc-param", "/api/calc-param"]:
+            if update_all_parameters:
+                stock_map = get_stocklist_mapping(force_reconcile=True)
+                threading.Thread(target=update_all_parameters, args=(list(stock_map.keys()),), daemon=True).start()
+                msg = {"status": "started", "message": "Manual parameter calculation started."}
+            else:
+                msg = {"error": "parameter module not loaded"}
+            self.send_response(200)
+            self._send_cors_headers()
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps(msg).encode("utf-8"))
         else:
             self.send_response(404)
             self._send_cors_headers()
@@ -143,18 +174,30 @@ class HealthAndControlHandler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         path = parsed.path.lower()
 
-        if path == "/start":
+        if path in ["/start", "/api/start"]:
             STATE_BUS.trigger_pulse("START")
             msg = {"message": "Master engine started"}
-        elif path == "/stop":
+        elif path in ["/stop", "/api/stop"]:
             STATE_BUS.trigger_pulse("STOP")
             msg = {"message": "Master engine paused"}
-        elif path == "/sync":
+        elif path in ["/sync", "/api/sync"]:
             STATE_BUS.trigger_pulse("SYNC")
             msg = {"message": "Sync pulse triggered"}
-        elif path == "/sync-screener":
+        elif path in ["/sync-screener", "/run-pipeline", "/api/sync-screener"]:
             if run_screener_pipeline:
-                threading.Thread(target=run_screener_pipeline, daemon=True).start()
+                def run_screener_worker():
+                    if _screener_lock.acquire(blocking=False):
+                        try:
+                            logger.info("[SCREENER] Starting Google Drive -> Firebase ETL...")
+                            run_screener_pipeline()
+                            logger.info("[SCREENER] Screener ETL completed successfully.")
+                        except Exception as ex:
+                            logger.error(f"[SCREENER] Error in pipeline: {ex}", exc_info=True)
+                        finally:
+                            _screener_lock.release()
+                    else:
+                        logger.warning("[SCREENER] Pipeline sync already in progress.")
+                threading.Thread(target=run_screener_worker, daemon=True).start()
                 msg = {"message": "Screener ETL pipeline triggered in background"}
             else:
                 msg = {"error": "RUN_PIPELINE module not available"}
@@ -170,7 +213,11 @@ class HealthAndControlHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(json.dumps(msg).encode("utf-8"))
 
+    def log_message(self, format, *args):
+        return
+
 def start_http_listener(port=10000):
+    port = int(os.environ.get("PORT", port))
     server = HTTPServer(("0.0.0.0", port), HealthAndControlHandler)
     t = threading.Thread(target=server.serve_forever, daemon=True, name="HttpServer")
     t.start()
@@ -182,15 +229,16 @@ def start_http_listener(port=10000):
 class MasterOrchestrator:
     def __init__(self):
         init_firebase()
+        self.calendar = MarketCalendar()
         self.script_status = {}
-        self.last_stock_event_ts = 0.0
+        self.last_stock_event_ts = time.time() * 1000
         self.replan_daily_routine()
 
     def replan_daily_routine(self):
         """Builds target dictionary keyed exclusively by primary key CODE."""
-        _, stock_map = reconcile_stocklist_with_watchlist()
+        stock_map = get_stocklist_mapping(force_reconcile=True)
         
-        # Include fixed master market indices
+        # Merge fixed market indices
         for k, v in FIXED_INDICES.items():
             stock_map.setdefault(sanitize_key(k), v)
 
@@ -231,12 +279,11 @@ class MasterOrchestrator:
         logger.info(f"[STOCK EVENT] Received action '{action}' for CODE '{safe_code}'")
 
         if action == "ADD":
-            # Replan targets to discover the new CODE
             self.replan_daily_routine()
-            # Immediately download historical bars and seed live row
+            resolved_ticker = ticker or f"{safe_code}.NS"
             threading.Thread(
-                target=self.sync_single_stock_history,
-                args=(safe_code, ticker or f"{safe_code}.NS"),
+                target=self.sync_single_stock_addition,
+                args=(safe_code, resolved_ticker),
                 daemon=True,
                 name=f"SyncAdd-{safe_code}"
             ).start()
@@ -244,7 +291,7 @@ class MasterOrchestrator:
         elif action == "DELETE":
             # Admin cascade purge using primary key CODE
             try:
-                db.reference(f"{PATH_STOCKS}/{safe_code}").delete()
+                db.reference(f"stocks/{safe_code}").delete()
                 db.reference(f"param/{safe_code}").delete()
                 logger.info(f"[DELETE EVENT] Purged /stocks/{safe_code} and /param/{safe_code}")
             except Exception as e:
@@ -268,29 +315,37 @@ class MasterOrchestrator:
             if safe_code in self.script_status:
                 del self.script_status[safe_code]
 
-    def sync_single_stock_history(self, safe_code: str, ticker: str):
-        """Fetches 300 daily bars for a newly enrolled stock and writes under /stocks/<CODE>."""
-        logger.info(f"[ON-DEMAND SYNC] Starting historical sync for CODE: {safe_code} ({ticker})...")
+    def sync_single_stock_addition(self, safe_code: str, ticker: str):
+        """Seeds 300 bars, initializes live candle 0, and calculates indicators."""
+        logger.info(f"[ON-DEMAND SYNC] Seeding 300 bars for CODE: {safe_code} ({ticker})...")
         try:
-            df = download_historical_data(ticker, period="2y")
-            if df is not None and not df.empty:
-                write_historical_stock_data(safe_code, df)
-                logger.info(f"[ON-DEMAND SYNC] Successfully seeded 300 bars under /stocks/{safe_code}")
-                if update_all_parameters:
-                    update_all_parameters()
+            success, msg = sync_historical_script(safe_code, ticker, gap_trading_days=300, calendar=self.calendar)
+            if success:
+                logger.info(f"[ON-DEMAND SYNC] Historical 300 bars seeded for {safe_code}: {msg}")
+                try:
+                    update_live_script(safe_code, ticker)
+                except Exception as live_err:
+                    logger.warning(f"[ON-DEMAND SYNC] Live candle init skipped for {safe_code}: {live_err}")
+
+                if calculate_single_script_parameters:
+                    try:
+                        calculate_single_script_parameters(safe_code)
+                        logger.info(f"[ON-DEMAND SYNC] /param/{safe_code} populated successfully.")
+                    except Exception as param_err:
+                        logger.error(f"[ON-DEMAND SYNC] Parameter calc error for {safe_code}: {param_err}")
+                elif update_all_parameters:
+                    update_all_parameters([safe_code])
             else:
-                logger.warning(f"[ON-DEMAND SYNC] No historical bars returned for {ticker}")
+                logger.error(f"[ON-DEMAND SYNC] Historical sync failed for {safe_code}: {msg}")
         except Exception as e:
             logger.error(f"[ON-DEMAND SYNC] Failed syncing {safe_code}: {e}", exc_info=True)
 
     def execute_live_intraday_cycle(self):
-        """Updates live candles and technical indicators for all active stocks."""
+        """Updates live candles for all active stocks."""
         for safe_code, info in list(self.script_status.items()):
             ticker = info.get("ticker", f"{safe_code}.NS")
             try:
-                live_candle = download_intraday_data(ticker)
-                if live_candle:
-                    update_live_candle(safe_code, live_candle)
+                update_live_script(safe_code, ticker)
             except Exception as e:
                 logger.debug(f"[LIVE CYCLE] Live update skipped for {safe_code}: {e}")
 
@@ -310,7 +365,7 @@ class MasterOrchestrator:
             if STATE_BUS.check_and_clear_manual_sync():
                 self.replan_daily_routine()
 
-            # 3. Intraday tick cycle (every 60 seconds if power latched ON)
+            # 3. Intraday tick cycle (every LIVE_UPDATE_INTERVAL_SEC if power latched ON)
             if STATE_BUS.is_power_on() and (now - last_intraday_tick >= LIVE_UPDATE_INTERVAL_SEC):
                 self.execute_live_intraday_cycle()
                 last_intraday_tick = now
