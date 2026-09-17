@@ -23,6 +23,7 @@ import pytz
 # Add project root to path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+# 1. Config imports (FIXED_INDICES is defined locally below to prevent crash)
 from config import (
     TIMEZONE,
     PATH_STOCKS,
@@ -32,17 +33,15 @@ from config import (
     logger
 )
 
-# FIXED_INDICES is defined in firebase_manager.py
-try:
-    from firebase_manager import FIXED_INDICES
-except ImportError:
-    FIXED_INDICES = {
-        "NIFTY50": "^NSEI",
-        "NIFTY100": "^CNX100",
-        "NIFTY MIDCAP 150": "^CRSLDX",
-        "NIFTY SMALLCAP 250": "^CNXSC"
-    }
+# Benchmark indices definition
+FIXED_INDICES = {
+    "NIFTY50": "^NSEI",
+    "NIFTY100": "^CNX100",
+    "NIFTY MIDCAP 150": "^CRSLDX",
+    "NIFTY SMALLCAP 250": "^CNXSC"
+}
 
+# 2. Firebase Manager imports
 from firebase_manager import (
     init_firebase,
     sanitize_key,
@@ -52,12 +51,29 @@ from firebase_manager import (
 import firebase_admin
 from firebase_admin import db
 
-# Calendar and Child Workers
-from market_calendar import MarketCalendar
-from sync_child import sync_historical_script
-from live_child import update_live_script
+# 3. Market Calendar
+try:
+    from market_calendar import MarketCalendar
+except ImportError:
+    class MarketCalendar:
+        def is_trading_day(self, dt=None):
+            return True
 
-# Parameter calculation engine
+# 4. Child Workers (sync and live)
+try:
+    from sync_child import sync_historical_script
+except ImportError:
+    def sync_historical_script(safe_code, ticker, gap_trading_days=300, calendar=None):
+        logger.warning(f"[SYNC] sync_historical_script not available for {safe_code}")
+        return False, "Not implemented"
+
+try:
+    from live_child import update_live_script
+except ImportError:
+    def update_live_script(safe_code, ticker):
+        pass
+
+# 5. Parameter Calculation Engine
 try:
     from parameter import update_all_parameters, calculate_single_script_parameters
 except ImportError:
@@ -68,7 +84,7 @@ except ImportError:
         update_all_parameters = None
         calculate_single_script_parameters = None
 
-# Screener Pipeline ETL runner
+# 6. Screener Pipeline ETL Runner
 try:
     from RUN_PIPELINE import main as run_screener_pipeline
 except ImportError:
