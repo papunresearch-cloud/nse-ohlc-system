@@ -1,22 +1,23 @@
 """
-MASTER ORCHESTRATOR
-- Embedded HTTP server on port 10000 (/health, /start, /stop, /sync, /sync-screener).
-- Real-time command bus listener via Firebase /system_commands/stock_event.
-- Immediate targeted OHLC initialization and /param calculation on ADD.
-- Admin-level targeted database purge (/stocks, /param, and /display_list/stocks) on DELETE.
-- Dynamic stock discovery using get_stocklist_mapping().
-- Pre-market sync window (08:00–08:30 IST) with 5-minute retry intervals.
-- Live market updates (CHILD-2 via live_child.py) and parameter calculations.
+===============================================================================
+MASTER ORCHESTRATOR (Primary Key Architecture: CODE)
+===============================================================================
+* Coordinates live OHLC backfills, indicators, and HTTP control signals.
+* Keyed exclusively by stock CODE across /stocks/<CODE> and /param/<CODE>.
+* Listens to /system_commands/stock_event dispatched from Watchlist.jsx.
+* Embeds HTTP server on port 10000 with CORS and /sync-screener ETL integration.
 """
 
 import os
 import sys
 import time
 import signal
+import json
+import logging
 import threading
 from urllib.parse import urlparse
 from http.server import HTTPServer, BaseHTTPRequestHandler
-from datetime import datetime, date
+from datetime import datetime
 import pytz
 
 # Add project root to path
@@ -24,63 +25,53 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from config import (
     TIMEZONE,
+    FIXED_INDICES,
+    PATH_STOCKS,
+    PATH_SCRIPTS,
     LIVE_UPDATE_INTERVAL_SEC,
-    SYNC_RETRY_INTERVAL_SEC,
-    SYNC_WINDOW_START_HOUR,
-    SYNC_WINDOW_START_MIN,
-    SYNC_WINDOW_DEADLINE_HOUR,
-    SYNC_WINDOW_DEADLINE_MIN,
     PULSE_VALIDITY_SEC,
-    TARGET_OHLC_COUNT,
-    HISTORICAL_START_INDEX,
     logger
 )
-
-try:
-    from config import PARAM_UPDATE_INTERVAL_SEC
-except ImportError:
-    PARAM_UPDATE_INTERVAL_SEC = 900  # 15 minutes default
-
-from firebase_admin import db
 from firebase_manager import (
     init_firebase,
     sanitize_key,
-    get_stocklist_mapping,
     reconcile_stocklist_with_watchlist,
-    get_stock_ohlc,
-    clear_live_candle
+    get_stocklist_mapping,
+    get_historical_stock_data,
+    update_live_candle,
+    write_historical_stock_data
 )
-from market_calendar import MarketCalendar
-from sync_child import sync_historical_script
-from live_child import update_live_script
-from yahoo_manager import get_latest_available_trading_date
+import firebase_admin
+from firebase_admin import db
+from yahoo_manager import (
+    download_historical_data,
+    download_intraday_data,
+    download_all_indices_intraday
+)
 
-# Parameter calculation functions
 try:
-    from parameter import update_all_parameters, calculate_single_script_parameters
-except ImportError:
     from parameter import update_all_parameters
-    calculate_single_script_parameters = None
+except ImportError:
+    update_all_parameters = None
 
-# Screener Pipeline ETL runner
 try:
     from RUN_PIPELINE import main as run_screener_pipeline
 except ImportError:
-    try:
-        from basic import run_pipeline as run_screener_pipeline
-    except ImportError:
-        try:
-            from BASIC import run_pipeline as run_screener_pipeline
-        except ImportError:
-            run_screener_pipeline = None
+    run_screener_pipeline = None
 
 IST = pytz.timezone(TIMEZONE)
 _keep_running = True
-_screener_lock = threading.Lock()
 
+def handle_exit_signal(sig, frame):
+    global _keep_running
+    logger.info("[SHUTDOWN] Terminating orchestrator cleanly...")
+    _keep_running = False
+
+signal.signal(signal.SIGINT, handle_exit_signal)
+signal.signal(signal.SIGTERM, handle_exit_signal)
 
 # =====================================================================
-# HARDWARE-STYLE FLIP-FLOP & PULSE BUS
+# SYSTEM FLIP-FLOP & PULSE BUS
 # =====================================================================
 class SystemStateBus:
     def __init__(self):
@@ -93,13 +84,13 @@ class SystemStateBus:
         with self.lock:
             if command == "START":
                 self.power_latched_on = True
-                logger.info("[SIGNAL] START pulse captured -> Flip-flop latched ON.")
+                logger.info("[SIGNAL] START pulse captured -> Latch ON.")
             elif command == "STOP":
                 self.power_latched_on = False
-                logger.warning("[SIGNAL] STOP pulse captured -> Flip-flop latched OFF.")
+                logger.warning("[SIGNAL] STOP pulse captured -> Latch OFF.")
             elif command == "SYNC":
                 self.pulse_sync_time = now
-                logger.info("[SIGNAL] MANUAL SYNC pulse captured -> Immediate sync scheduled.")
+                logger.info("[SIGNAL] MANUAL SYNC pulse captured.")
 
     def check_and_clear_manual_sync(self) -> bool:
         now = time.time()
@@ -113,135 +104,77 @@ class SystemStateBus:
         with self.lock:
             return self.power_latched_on
 
-
 STATE_BUS = SystemStateBus()
 
-
-def dispatch_screener_sync_job():
-    """Runs screener ETL in a background daemon thread."""
-    if not run_screener_pipeline:
-        logger.error("[SCREENER] Cannot run pipeline: ETL runner not loaded.")
-        return
-
-    if not _screener_lock.acquire(blocking=False):
-        logger.warning("[SCREENER] Pipeline sync is already in progress.")
-        return
-
-    def worker():
-        try:
-            logger.info("[SCREENER] Starting Screener ETL Pipeline...")
-            run_screener_pipeline()
-            logger.info("[SCREENER] Pipeline completed successfully.")
-        except Exception as e:
-            logger.error(f"[SCREENER] Pipeline error: {e}", exc_info=True)
-        finally:
-            _screener_lock.release()
-
-    threading.Thread(target=worker, daemon=True).start()
-
-
-class PulseCommandServer(BaseHTTPRequestHandler):
-    def _apply_cors_headers(self):
+# =====================================================================
+# HTTP REQUEST HANDLER
+# =====================================================================
+class HealthAndControlHandler(BaseHTTPRequestHandler):
+    def _send_cors_headers(self):
         self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, HEAD, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type")
 
     def do_OPTIONS(self):
-        self.send_response(204)
-        self._apply_cors_headers()
-        self.end_headers()
-
-    def do_HEAD(self):
         self.send_response(200)
-        self._apply_cors_headers()
-        self.send_header("Content-Type", "text/plain; charset=utf-8")
-        self.send_header("Content-Length", "0")
+        self._send_cors_headers()
         self.end_headers()
 
     def do_GET(self):
-        parsed_url = urlparse(self.path)
-        path = parsed_url.path.lower().strip()
-        state_str = "ON" if STATE_BUS.is_power_on() else "OFF"
+        parsed = urlparse(self.path)
+        path = parsed.path.lower()
 
-        if path in ("/health", "/ping"):
-            self._send_resp(200, f"OK - State: {state_str}\n")
-        elif path in ("/start", "/api/start"):
-            STATE_BUS.trigger_pulse("START")
-            self._send_resp(200, "START latched ON.\n")
-        elif path in ("/stop", "/api/stop"):
-            STATE_BUS.trigger_pulse("STOP")
-            self._send_resp(200, "STOP latched OFF.\n")
-        elif path in ("/sync", "/api/sync"):
-            STATE_BUS.trigger_pulse("SYNC")
-            self._send_resp(200, "MANUAL SYNC triggered.\n")
-        elif path in ("/sync-screener", "/run-pipeline", "/api/sync-screener"):
-            dispatch_screener_sync_job()
-            self._send_json_resp(200, {"status": "started", "message": "Screener ETL sync initiated."})
-        else:
-            self._send_resp(200, f"State: {state_str}\n")
-
-    def do_POST(self):
-        parsed_url = urlparse(self.path)
-        path = parsed_url.path.lower().strip()
-
-        if path in ("/sync-screener", "/run-pipeline", "/api/sync-screener"):
-            dispatch_screener_sync_job()
-            self._send_json_resp(200, {"status": "started", "message": "Screener ETL sync initiated."})
-        elif path in ("/sync", "/api/sync"):
-            STATE_BUS.trigger_pulse("SYNC")
-            self._send_resp(200, "MANUAL SYNC triggered via POST.\n")
-        elif path in ("/start", "/api/start"):
-            STATE_BUS.trigger_pulse("START")
-            self._send_resp(200, "START latched ON.\n")
-        elif path in ("/stop", "/api/stop"):
-            STATE_BUS.trigger_pulse("STOP")
-            self._send_resp(200, "STOP latched OFF.\n")
+        if path in ["/", "/health"]:
+            self.send_response(200)
+            self._send_cors_headers()
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            status = {
+                "status": "RUNNING" if STATE_BUS.is_power_on() else "IDLE",
+                "timestamp": datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S IST")
+            }
+            self.wfile.write(json.dumps(status).encode("utf-8"))
         else:
             self.send_response(404)
-            self._apply_cors_headers()
+            self._send_cors_headers()
             self.end_headers()
 
-    def _send_resp(self, code: int, message: str):
-        payload = message.encode("utf-8")
-        self.send_response(code)
-        self._apply_cors_headers()
-        self.send_header("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
-        self.send_header("Content-Type", "text/plain; charset=utf-8")
-        self.send_header("Content-Length", str(len(payload)))
+    def do_POST(self):
+        parsed = urlparse(self.path)
+        path = parsed.path.lower()
+
+        if path == "/start":
+            STATE_BUS.trigger_pulse("START")
+            msg = {"message": "Master engine started"}
+        elif path == "/stop":
+            STATE_BUS.trigger_pulse("STOP")
+            msg = {"message": "Master engine paused"}
+        elif path == "/sync":
+            STATE_BUS.trigger_pulse("SYNC")
+            msg = {"message": "Sync pulse triggered"}
+        elif path == "/sync-screener":
+            if run_screener_pipeline:
+                threading.Thread(target=run_screener_pipeline, daemon=True).start()
+                msg = {"message": "Screener ETL pipeline triggered in background"}
+            else:
+                msg = {"error": "RUN_PIPELINE module not available"}
+        else:
+            self.send_response(404)
+            self._send_cors_headers()
+            self.end_headers()
+            return
+
+        self.send_response(200)
+        self._send_cors_headers()
+        self.send_header("Content-Type", "application/json")
         self.end_headers()
-        self.wfile.write(payload)
+        self.wfile.write(json.dumps(msg).encode("utf-8"))
 
-    def _send_json_resp(self, code: int, data: dict):
-        import json
-        payload = json.dumps(data).encode("utf-8")
-        self.send_response(code)
-        self._apply_cors_headers()
-        self.send_header("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
-        self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Content-Length", str(len(payload)))
-        self.end_headers()
-        self.wfile.write(payload)
-
-    def log_message(self, format, *args):
-        return
-
-
-def start_http_listener():
-    port = int(os.environ.get("PORT", 10000))
-    server = HTTPServer(("0.0.0.0", port), PulseCommandServer)
-    logger.info(f"[HTTP] Command server listening on 0.0.0.0:{port}")
-    threading.Thread(target=server.serve_forever, daemon=True).start()
-
-
-def handle_shutdown(signum, frame):
-    global _keep_running
-    logger.info(f"Signal ({signum}) caught. Terminating Master gracefully...")
-    _keep_running = False
-
-
-signal.signal(signal.SIGINT, handle_shutdown)
-signal.signal(signal.SIGTERM, handle_shutdown)
-
+def start_http_listener(port=10000):
+    server = HTTPServer(("0.0.0.0", port), HealthAndControlHandler)
+    t = threading.Thread(target=server.serve_forever, daemon=True, name="HttpServer")
+    t.start()
+    logger.info(f"[HTTP] Control and Health server listening on port {port}")
 
 # =====================================================================
 # MASTER ORCHESTRATOR
@@ -249,361 +182,144 @@ signal.signal(signal.SIGTERM, handle_shutdown)
 class MasterOrchestrator:
     def __init__(self):
         init_firebase()
-        self.calendar = MarketCalendar()
-
-        self.last_planned_date = None
-        self.is_today_trading_day = False
-        self.sync_audit_reported_today = False
-
-        self.last_sync_attempt_time = 0.0
-        self.last_live_update_time = 0.0
-        self.last_param_calc_time = 0.0
-        self.last_heartbeat_time = 0.0
-        self.last_command_ts = time.time() * 1000
-
         self.script_status = {}
-
-    def record_heartbeat(self):
-        try:
-            now_epoch = time.time()
-            now_ist_str = datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S IST")
-            power_status = "RUNNING" if STATE_BUS.is_power_on() else "STOPPED"
-
-            db.reference("system_status").update({
-                "backend_power": power_status,
-                "last_heartbeat": now_ist_str,
-                "heartbeat_epoch": now_epoch
-            })
-            self.last_heartbeat_time = now_epoch
-            logger.info(f"[HEARTBEAT] Telemetry updated -> {now_ist_str}")
-        except Exception as e:
-            logger.error(f"[HEARTBEAT] Failed to update telemetry: {e}")
-
-    def check_stock_event_trigger(self) -> tuple[bool, dict]:
-        """Polls Firebase /system_commands/stock_event for ADD/DELETE commands from Watchlist."""
-        try:
-            cmd = db.reference("system_commands/stock_event").get()
-            if isinstance(cmd, dict):
-                ts = float(cmd.get("timestamp", 0))
-                if ts > self.last_command_ts:
-                    self.last_command_ts = ts
-                    return True, cmd
-        except Exception as e:
-            logger.error(f"[EVENT] Error reading stock_event: {e}")
-        return False, {}
-
-    def handle_stock_addition(self, stock_name: str, ticker: str):
-        """Seeds 300 historical bars, initializes live row 0, and calculates parameters."""
-        safe_key = sanitize_key(stock_name)
-        resolved_ticker = ticker or f"{safe_key}.NS"
-        logger.info(f"[EVENT-HANDLER] ADD received for '{safe_key}' ({resolved_ticker}). Initiating instant sync...")
-
+        self.last_stock_event_ts = 0.0
         self.replan_daily_routine()
-        success, msg = sync_historical_script(safe_key, resolved_ticker, gap_trading_days=300, calendar=self.calendar)
-        if success:
-            logger.info(f"[EVENT-HANDLER] Historical 300 bars seeded for {safe_key}: {msg}")
-            try:
-                update_live_script(safe_key, resolved_ticker)
-                logger.info(f"[EVENT-HANDLER] Live index 0 initialized for {safe_key}.")
-            except Exception as e:
-                logger.warning(f"[EVENT-HANDLER] Live index 0 init error for {safe_key}: {e}")
-
-            if calculate_single_script_parameters:
-                try:
-                    logger.info(f"[EVENT-HANDLER] Triggering parameter calculation for {safe_key}...")
-                    param_success = calculate_single_script_parameters(safe_key)
-                    if param_success:
-                        logger.info(f"[EVENT-HANDLER] /param/{safe_key} successfully populated! ✅")
-                except Exception as p_err:
-                    logger.error(f"[EVENT-HANDLER] Parameter calculation failed for {safe_key}: {p_err}")
-        else:
-            logger.error(f"[EVENT-HANDLER] Historical sync failed for {safe_key}: {msg}")
-
-    def handle_stock_deletion(self, stock_name: str):
-        """Purges OHLC database, parameters, and display_list entries immediately."""
-        safe_key = sanitize_key(stock_name)
-        logger.info(f"[EVENT-HANDLER] DELETE received for '{safe_key}'. Commencing admin purge...")
-
-        # 1. Purge OHLC database
-        try:
-            db.reference(f"stocks/{safe_key}").delete()
-            logger.info(f"[EVENT-HANDLER] Successfully purged /stocks/{safe_key}")
-        except Exception as e:
-            logger.error(f"[EVENT-HANDLER] Failed to delete /stocks/{safe_key}: {e}")
-
-        # 2. Purge technical parameters
-        try:
-            db.reference(f"param/{safe_key}").delete()
-            logger.info(f"[EVENT-HANDLER] Successfully purged /param/{safe_key}")
-        except Exception as e:
-            logger.error(f"[EVENT-HANDLER] Failed to delete /param/{safe_key}: {e}")
-
-        # 3. Purge stock entry from display_list (supports array and map)
-        try:
-            display_ref = db.reference("display_list/stocks")
-            current_display = display_ref.get()
-
-            if isinstance(current_display, list):
-                filtered = [s for s in current_display if sanitize_key(str(s)) != safe_key]
-                display_ref.set(filtered if filtered else None)
-                logger.info(f"[EVENT-HANDLER] Pruned {safe_key} from array /display_list/stocks")
-            elif isinstance(current_display, dict):
-                db.reference(f"display_list/stocks/{safe_key}").delete()
-                if stock_name in current_display:
-                    db.reference(f"display_list/stocks/{stock_name}").delete()
-                logger.info(f"[EVENT-HANDLER] Pruned {safe_key} from dict /display_list/stocks")
-        except Exception as e:
-            logger.error(f"[EVENT-HANDLER] Failed to delete display_list entry for {safe_key}: {e}")
-
-        self.replan_daily_routine()
-
-    def run(self):
-        logger.info("==================================================")
-        logger.info("NSE EQUITY OHLC DATABASE MAINTENANCE ACTIVE")
-        logger.info("==================================================")
-
-        self.replan_daily_routine()
-        self.record_heartbeat()
-
-        threading.Thread(target=self.execute_historical_sync, kwargs={"is_manual": False}, daemon=True).start()
-
-        while _keep_running:
-            try:
-                now_epoch = time.time()
-                now_ist = datetime.now(IST)
-                today_date = now_ist.date()
-                now_time = now_ist.time()
-
-                # Heartbeat every 300s
-                if (now_epoch - self.last_heartbeat_time) >= 300:
-                    self.record_heartbeat()
-
-                # Priority 0A: Instant Stock Event from Watchlist (ADD / DELETE)
-                has_event, event_payload = self.check_stock_event_trigger()
-                if has_event:
-                    action = event_payload.get("action")
-                    stock = event_payload.get("stock")
-                    ticker = event_payload.get("ticker", "")
-
-                    if action == "ADD" and stock:
-                        threading.Thread(target=self.handle_stock_addition, args=(stock, ticker), daemon=True).start()
-                    elif action == "DELETE" and stock:
-                        threading.Thread(target=self.handle_stock_deletion, args=(stock,), daemon=True).start()
-                    continue
-
-                # Priority 0B: Manual Pulse Interruption (/sync)
-                if STATE_BUS.check_and_clear_manual_sync():
-                    logger.info("[OVERRIDE PULSE] Immediate sync commanded. Running reconciliation...")
-                    self.replan_daily_routine()
-                    threading.Thread(target=self.execute_historical_sync, kwargs={"is_manual": True}, daemon=True).start()
-                    continue
-
-                if not STATE_BUS.is_power_on():
-                    time.sleep(5)
-                    continue
-
-                # Priority 1: State-Driven Date Catch-Up
-                if self.last_planned_date != today_date:
-                    self.replan_daily_routine()
-
-                if not self.is_today_trading_day:
-                    time.sleep(5)
-                    continue
-
-                # Priority 2: Pre-Market Historical Sync Window (08:00 – 08:30 IST)
-                sync_start = datetime.strptime(f"{SYNC_WINDOW_START_HOUR}:{SYNC_WINDOW_START_MIN}", "%H:%M").time()
-                sync_cutoff = datetime.strptime(f"{SYNC_WINDOW_DEADLINE_HOUR}:{SYNC_WINDOW_DEADLINE_MIN}", "%H:%M").time()
-
-                if sync_start <= now_time < sync_cutoff:
-                    has_unsynced = any(not s["synced"] for s in self.script_status.values())
-                    if has_unsynced and (now_epoch - self.last_sync_attempt_time >= SYNC_RETRY_INTERVAL_SEC):
-                        logger.info("[SCHEDULE] Pre-market sync window active. Retrying unsynced scripts...")
-                        self.execute_historical_sync(is_manual=False)
-                        self.last_sync_attempt_time = now_epoch
-
-                if now_time >= sync_cutoff and not self.sync_audit_reported_today:
-                    self.log_detailed_sync_audit()
-                    self.sync_audit_reported_today = True
-
-                # Priority 3: Live Market Window (09:15 – 15:30 IST)
-                self.calendar.refresh_calendar()
-                status, _ = self.calendar.get_market_status()
-
-                if status == "LIVE":
-                    if (now_epoch - self.last_live_update_time) >= LIVE_UPDATE_INTERVAL_SEC:
-                        self.execute_live_updates()
-                        self.last_live_update_time = now_epoch
-
-                    if (now_epoch - self.last_param_calc_time) >= PARAM_UPDATE_INTERVAL_SEC:
-                        active_synced = [name for name, meta in self.script_status.items() if meta["synced"]]
-                        if active_synced:
-                            update_all_parameters(active_synced)
-                        self.last_param_calc_time = now_epoch
-
-                time.sleep(5)
-
-            except Exception as e:
-                logger.critical(f"Unhandled exception in master loop: {e}", exc_info=True)
-                time.sleep(5)
-
-        logger.info("Master orchestrator stopped cleanly.")
 
     def replan_daily_routine(self):
-        """Forces reconciliation between /stocklist and /watchlist, preserving active entries."""
-        now_ist = datetime.now(IST)
-        today = now_ist.date()
-        self.calendar.refresh_calendar()
+        """Builds target dictionary keyed exclusively by primary key CODE."""
+        _, stock_map = reconcile_stocklist_with_watchlist()
+        
+        # Include fixed master market indices
+        for k, v in FIXED_INDICES.items():
+            stock_map.setdefault(sanitize_key(k), v)
 
-        self.is_today_trading_day = self.calendar.is_trading_day(today)
-        self.last_planned_date = today
-        self.sync_audit_reported_today = False
+        self.script_status = {
+            code: {
+                "synced": False,
+                "last_attempt_at": None,
+                "error": None,
+                "ticker": ticker
+            }
+            for code, ticker in stock_map.items()
+        }
+        logger.info(f"[PLANNER] Reconciled stock targets by CODE. Total targets: {len(self.script_status)}")
 
-        stock_map = get_stocklist_mapping(force_reconcile=True)
-        new_status = {}
-        for name, ticker in stock_map.items():
-            if name in self.script_status and self.script_status[name]["synced"]:
-                new_status[name] = self.script_status[name]
-                new_status[name]["ticker"] = ticker
+    def check_stock_event(self) -> tuple[bool, dict]:
+        """Listens for realtime commands from Watchlist.jsx at /system_commands/stock_event."""
+        try:
+            event_ref = db.reference("system_commands/stock_event")
+            payload = event_ref.get()
+            if isinstance(payload, dict):
+                ts = float(payload.get("timestamp", 0))
+                if ts > self.last_stock_event_ts:
+                    self.last_stock_event_ts = ts
+                    return True, payload
+        except Exception as e:
+            logger.error(f"[EVENT LISTENER] Error checking stock_event node: {e}")
+        return False, {}
+
+    def handle_stock_event(self, event: dict):
+        action = event.get("action")
+        stock_code = event.get("stock")
+        ticker = event.get("ticker")
+
+        if not stock_code:
+            return
+
+        safe_code = sanitize_key(stock_code)
+        logger.info(f"[STOCK EVENT] Received action '{action}' for CODE '{safe_code}'")
+
+        if action == "ADD":
+            # Replan targets to discover the new CODE
+            self.replan_daily_routine()
+            # Immediately download historical bars and seed live row
+            threading.Thread(
+                target=self.sync_single_stock_history,
+                args=(safe_code, ticker or f"{safe_code}.NS"),
+                daemon=True,
+                name=f"SyncAdd-{safe_code}"
+            ).start()
+
+        elif action == "DELETE":
+            # Admin cascade purge using primary key CODE
+            try:
+                db.reference(f"{PATH_STOCKS}/{safe_code}").delete()
+                db.reference(f"param/{safe_code}").delete()
+                logger.info(f"[DELETE EVENT] Purged /stocks/{safe_code} and /param/{safe_code}")
+            except Exception as e:
+                logger.error(f"[DELETE EVENT] Error purging /stocks or /param: {e}")
+
+            # Prune from /display_list/stocks
+            try:
+                display_ref = db.reference("display_list/stocks")
+                current_display = display_ref.get()
+
+                if isinstance(current_display, list):
+                    filtered = [s for s in current_display if sanitize_key(str(s)) != safe_code]
+                    display_ref.set(filtered if filtered else None)
+                    logger.info(f"[DELETE EVENT] Removed {safe_code} from array /display_list/stocks")
+                elif isinstance(current_display, dict):
+                    db.reference(f"display_list/stocks/{safe_code}").delete()
+                    logger.info(f"[DELETE EVENT] Removed {safe_code} from map /display_list/stocks")
+            except Exception as e:
+                logger.error(f"[DELETE EVENT] Error updating display_list: {e}")
+
+            if safe_code in self.script_status:
+                del self.script_status[safe_code]
+
+    def sync_single_stock_history(self, safe_code: str, ticker: str):
+        """Fetches 300 daily bars for a newly enrolled stock and writes under /stocks/<CODE>."""
+        logger.info(f"[ON-DEMAND SYNC] Starting historical sync for CODE: {safe_code} ({ticker})...")
+        try:
+            df = download_historical_data(ticker, period="2y")
+            if df is not None and not df.empty:
+                write_historical_stock_data(safe_code, df)
+                logger.info(f"[ON-DEMAND SYNC] Successfully seeded 300 bars under /stocks/{safe_code}")
+                if update_all_parameters:
+                    update_all_parameters()
             else:
-                new_status[name] = {
-                    "synced": False,
-                    "last_attempt_at": None,
-                    "error": "Awaiting daily sync",
-                    "ticker": ticker
-                }
+                logger.warning(f"[ON-DEMAND SYNC] No historical bars returned for {ticker}")
+        except Exception as e:
+            logger.error(f"[ON-DEMAND SYNC] Failed syncing {safe_code}: {e}", exc_info=True)
 
-        self.script_status = new_status
-        status_label = "TRADING SESSION" if self.is_today_trading_day else "NON-TRADING DAY (Closed)"
-        logger.info(f"[PLANNER] Plan for {today} IST refreshed: {status_label} ({len(self.script_status)} stocks)")
-
-    def execute_historical_sync(self, is_manual: bool = False):
-        """Runs historical sync (seeds 300 bars and initializes live row)."""
-        now_str = datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S")
-
-        for name, meta in list(self.script_status.items()):
-            if not _keep_running:
-                break
-            if not STATE_BUS.is_power_on() and not is_manual:
-                break
-
-            if meta["synced"] and not is_manual:
-                continue
-
-            meta["last_attempt_at"] = now_str
-            ticker = meta["ticker"]
-
+    def execute_live_intraday_cycle(self):
+        """Updates live candles and technical indicators for all active stocks."""
+        for safe_code, info in list(self.script_status.items()):
+            ticker = info.get("ticker", f"{safe_code}.NS")
             try:
-                gap = self._calculate_script_gap(name, ticker)
-                if gap == 0:
-                    meta["synced"] = True
-                    meta["error"] = None
-                    logger.info(f"[{name}] Index 1 matches latest exchange session. Synced.")
-                    continue
-
-                success, msg = sync_historical_script(name, ticker, gap_trading_days=gap, calendar=self.calendar)
-
-                if success:
-                    meta["synced"] = True
-                    meta["error"] = None
-                    logger.info(f"[{name}] Sync successful: {msg}")
-                    try:
-                        update_live_script(name, ticker)
-                    except Exception as live_err:
-                        logger.warning(f"[{name}] Live candle init skipped: {live_err}")
-                else:
-                    meta["synced"] = False
-                    meta["error"] = msg
-                    logger.warning(f"[{name}] Sync incomplete: {msg}")
-
+                live_candle = download_intraday_data(ticker)
+                if live_candle:
+                    update_live_candle(safe_code, live_candle)
             except Exception as e:
-                meta["synced"] = False
-                meta["error"] = f"Exception: {str(e)}"
-                logger.error(f"Sync fault caught for [{name}]: {e}", exc_info=True)
+                logger.debug(f"[LIVE CYCLE] Live update skipped for {safe_code}: {e}")
 
-        try:
-            synced_count = len([k for k, v in self.script_status.items() if v["synced"]])
-            total_count = len(self.script_status)
-            db.reference("system_status/sync_data").update({
-                "last_sync_time": datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S IST"),
-                "total_registered": total_count,
-                "synced_count": synced_count,
-                "status": "VERIFIED" if (total_count > 0 and synced_count == total_count) else "IDLE"
-            })
-        except Exception:
-            pass
+    def run(self):
+        logger.info("[ORCHESTRATOR] Master engine started. Primary key: CODE.")
+        last_intraday_tick = 0.0
 
-    def _calculate_script_gap(self, display_name: str, ticker: str) -> int:
-        existing_ohlc = get_stock_ohlc(display_name)
-        if not existing_ohlc or not isinstance(existing_ohlc, dict):
-            return TARGET_OHLC_COUNT
+        while _keep_running:
+            now = time.time()
 
-        idx1 = existing_ohlc.get("1")
-        if not idx1 or "date" not in idx1:
-            return TARGET_OHLC_COUNT
+            # 1. Listen for realtime actions from Watchlist.jsx
+            has_event, event_payload = self.check_stock_event()
+            if has_event:
+                self.handle_stock_event(event_payload)
 
-        try:
-            latest_fb_date = datetime.strptime(str(idx1["date"]), "%Y-%m-%d").date()
-        except ValueError:
-            return TARGET_OHLC_COUNT
+            # 2. Check for manual sync pulse via HTTP (/sync)
+            if STATE_BUS.check_and_clear_manual_sync():
+                self.replan_daily_routine()
 
-        latest_yahoo_date = get_latest_available_trading_date(ticker)
-        if not latest_yahoo_date:
-            return 0
+            # 3. Intraday tick cycle (every 60 seconds if power latched ON)
+            if STATE_BUS.is_power_on() and (now - last_intraday_tick >= LIVE_UPDATE_INTERVAL_SEC):
+                self.execute_live_intraday_cycle()
+                last_intraday_tick = now
 
-        return self.calendar.get_trading_day_gap(latest_fb_date, latest_yahoo_date)
+            time.sleep(1.0)
 
-    def execute_live_updates(self):
-        """Runs CHILD-2 live updates using live_child.py."""
-        logger.info("[CHILD-2] Starting 5-minute live update cycle...")
-        updated_count = 0
-
-        for name, meta in self.script_status.items():
-            if not _keep_running or not STATE_BUS.is_power_on():
-                break
-
-            if not meta["synced"]:
-                continue
-
-            try:
-                update_live_script(name, meta["ticker"])
-                updated_count += 1
-            except Exception as e:
-                logger.error(f"[{name}] Live update failed: {e}", exc_info=True)
-
-        try:
-            db.reference("system_status/live_data").update({
-                "last_update_time": datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S IST"),
-                "tickers_updated": updated_count,
-                "status": "STREAMING"
-            })
-        except Exception:
-            pass
-
-    def log_detailed_sync_audit(self):
-        synced = [k for k, v in self.script_status.items() if v["synced"]]
-        unsynced = [k for k, v in self.script_status.items() if not v["synced"]]
-
-        logger.info("=" * 85)
-        logger.info("                   SCRIPT-WISE SYNCHRONIZATION AUDIT REPORT")
-        logger.info("=" * 85)
-        logger.info(f"Total: {len(self.script_status)} | Synced: {len(synced)} | Failed/Unsynced: {len(unsynced)}")
-
-        if synced:
-            logger.info("[ACTIVE / SYNCHRONIZED SCRIPTS]")
-            for s in synced:
-                logger.info(f"  ✓ {s:<24} | Synced At: {self.script_status[s]['last_attempt_at']}")
-
-        if unsynced:
-            logger.error("[ISOLATED / UNSYNCHRONIZED SCRIPTS - DATABASE SYNCH ERROR]")
-            for u in unsynced:
-                info = self.script_status[u]
-                logger.error(f"  ✗ {u:<24} | Last Attempt: {info['last_attempt_at']} | Error: {info['error']}")
-        else:
-            logger.info("All registered stocks successfully synchronized. Live updater ready.")
-        logger.info("=" * 85)
-
+        logger.info("[ORCHESTRATOR] Master engine stopped cleanly.")
 
 if __name__ == "__main__":
-    start_http_listener()
+    start_http_listener(port=10000)
     orchestrator = MasterOrchestrator()
     orchestrator.run()
