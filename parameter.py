@@ -2,8 +2,7 @@
 PARAMETER CALCULATION MODULE (parameter.py)
 Calculates technical indicators and performance metrics for active scripts.
 - Source data: Reads OHLC historical series from Firebase `/stocks/<script>`
-- Lookups: Reads 3yr value from `/SCREENER` array (keyed by Name/NSE/BSE)
-  with fallback to `/watchlist/detailedDb/<script>` or `/detailedDb/<script>`.
+- Lookups: Reads 3yr value from `/detailedDb/<script>` or `/watchlist/detailedDb/<script>`
 - Output: Writes sanitized calculations to Firebase `/param/<sanitized_script>`
 - Stamping: Stores both date and time (IST) separately for each script
 """
@@ -11,15 +10,12 @@ Calculates technical indicators and performance metrics for active scripts.
 import math
 from datetime import datetime
 import pytz
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional
 from firebase_admin import db
 from config import logger, TIMEZONE
 from firebase_manager import sanitize_key
 
 IST = pytz.timezone(TIMEZONE)
-
-# Module-level cache for SCREENER array to prevent redundant network fetches
-_SCREENER_CACHE: Optional[Dict[str, Any]] = None
 
 
 def safe_round(val: Any, decimals: int = 2) -> Any:
@@ -36,7 +32,7 @@ def safe_round(val: Any, decimals: int = 2) -> Any:
 
 
 def safe_div(numerator: Any, denominator: Any, factor: float = 100.0) -> Any:
-    """Safely calculates (numerator / denominator) * factor; returns 'N/A' on zero-division or errors."""
+    """Safely calculates (numerator / denominator) * factor; returns 'N/A' on zero-division."""
     try:
         num = float(numerator)
         den = float(denominator)
@@ -64,7 +60,7 @@ def parse_price(candle: Optional[Dict[str, Any]], field: str) -> Optional[float]
 def fetch_ordered_candles(script: str) -> List[Dict[str, Any]]:
     """
     Fetches historical candle collection under /stocks/<safe_script>.
-    Returns candles ordered chronologically backwards (index 0 is current/live, index 1 is yesterday).
+    Returns candles ordered chronologically backwards (index 0 is current/intraday, index 1 is yesterday).
     """
     safe_script = sanitize_key(script)
     ref = db.reference(f"stocks/{safe_script}")
@@ -76,6 +72,7 @@ def fetch_ordered_candles(script: str) -> List[Dict[str, Any]]:
     if isinstance(stock_data, list):
         ordered_candles = [c for c in stock_data if isinstance(c, dict)]
     elif isinstance(stock_data, dict):
+        # Extract integer indices sequentially
         for i in range(len(stock_data)):
             key = str(i)
             if key in stock_data and isinstance(stock_data[key], dict):
@@ -126,74 +123,19 @@ def calculate_sma(closes_newest_first: List[float], window: int) -> Any:
     return safe_round(sum(sub_slice) / window, 2)
 
 
-def get_screener_map() -> Dict[str, Any]:
-    """
-    Downloads and caches the /SCREENER list, mapping records by Name, NSE, BSE, and CODE.
-    """
-    global _SCREENER_CACHE
-    if _SCREENER_CACHE is not None:
-        return _SCREENER_CACHE
-
-    screener_map = {}
-    try:
-        raw_data = db.reference("SCREENER").get()
-        records: List[Dict[str, Any]] = []
-
-        if isinstance(raw_data, list):
-            records = [r for r in raw_data if isinstance(r, dict)]
-        elif isinstance(raw_data, dict):
-            records = [v for v in raw_data.values() if isinstance(v, dict)]
-
-        for rec in records:
-            keys_to_index = [
-                rec.get("Name"),
-                rec.get("NSE"),
-                rec.get("BSE"),
-                rec.get("CODE")
-            ]
-            for k in keys_to_index:
-                if k:
-                    screener_map[str(k).strip().upper()] = rec
-                    screener_map[sanitize_key(str(k).strip().upper())] = rec
-
-        _SCREENER_CACHE = screener_map
-    except Exception as e:
-        logger.error(f"[PARAM] Failed to fetch /SCREENER table: {e}")
-        _SCREENER_CACHE = {}
-
-    return _SCREENER_CACHE
-
-
 def fetch_detailed_metrics(script: str) -> Dict[str, Any]:
     """
-    Fetches static 3yr metric primarily from /SCREENER, falling back to /detailedDb.
+    Fetches static 3yr metric from /detailedDb/<script> or /watchlist/detailedDb/<script>.
     """
-    safe_script = sanitize_key(script).upper()
-    raw_script = str(script).strip().upper()
-    screener_map = get_screener_map()
-
-    # 1. Primary lookup from /SCREENER
-    screener_item = (
-        screener_map.get(raw_script)
-        or screener_map.get(safe_script)
-        or screener_map.get(raw_script.replace(".NS", "").replace(".BO", ""))
-        or screener_map.get(safe_script.replace(".NS", "").replace(".BO", ""))
-    )
-
-    ret_3yr = None
-    if screener_item:
-        ret_3yr = screener_item.get("3yr") or screener_item.get("3YR") or screener_item.get("3Yr")
-
-    # 2. Secondary fallback lookup from detailedDb nodes if missing from SCREENER
-    if ret_3yr is None:
-        fallback_data = (
-            db.reference(f"watchlist/detailedDb/{safe_script}").get()
-            or db.reference(f"detailedDb/{safe_script}").get()
-            or db.reference(f"watchlist/detailedDb/{script}").get()
-            or db.reference(f"detailedDb/{script}").get()
-        )
-        if isinstance(fallback_data, dict):
-            ret_3yr = fallback_data.get("3yr") or fallback_data.get("3YR") or fallback_data.get("3Yr")
+    safe_script = sanitize_key(script)
+    # Check root detailedDb first, then fall back to nested watchlist/detailedDb
+    data = db.reference(f"detailedDb/{safe_script}").get() or db.reference(f"watchlist/detailedDb/{safe_script}").get()
+    
+    if not data and safe_script != script:
+        data = db.reference(f"detailedDb/{script}").get() or db.reference(f"watchlist/detailedDb/{script}").get()
+    
+    data = data or {}
+    ret_3yr = data.get("3yr") or data.get("3YR") or data.get("3Yr")
 
     return {
         "3yr": safe_round(ret_3yr, 2)
@@ -201,7 +143,7 @@ def fetch_detailed_metrics(script: str) -> Dict[str, Any]:
 
 
 def compute_script_parameters(script: str) -> Optional[Dict[str, Any]]:
-    """Calculates all technical parameters and commits the payload to /param/<safe_script>."""
+    """Calculates all parameter metrics for a single script and commits them to /param/<safe_script>."""
     safe_script = sanitize_key(script)
     candles = fetch_ordered_candles(script)
     if not candles:
@@ -236,13 +178,13 @@ def compute_script_parameters(script: str) -> Optional[Dict[str, Any]]:
     # RSI
     rsi = calculate_rsi(closes, 14)
 
-    # 52-Week Extremes (252 rolling trading days)
+    # 52-Week Extremes (252 trading sessions)
     h_slice = highs[:252]
     l_slice = lows[:252]
     w52h = safe_round(max(h_slice), 2) if len(h_slice) >= 10 else "N/A"
     w52l = safe_round(min(l_slice), 2) if len(l_slice) >= 10 else "N/A"
 
-    # Periodic Returns with safe boundary protection
+    # Periodic Returns (Protected index access)
     def get_close(idx: int) -> Optional[float]:
         return closes[idx] if len(closes) > idx else None
 
@@ -262,7 +204,7 @@ def compute_script_parameters(script: str) -> Optional[Dict[str, Any]]:
     ret_6mr = safe_div(c_1 - c_121, c_121) if (c_1 is not None and c_121 is not None) else "N/A"
     ret_1yr = safe_div(c_1 - c_251, c_251) if (c_1 is not None and c_251 is not None) else "N/A"
 
-    # 3yr metric lookup from SCREENER
+    # Static 3yr lookup
     detailed_metrics = fetch_detailed_metrics(script)
 
     # Timestamp Generation (IST)
@@ -270,9 +212,7 @@ def compute_script_parameters(script: str) -> Optional[Dict[str, Any]]:
     current_time_str = now_ist.strftime("%H:%M:%S")
     current_date_str = str(c_0.get("date", now_ist.strftime("%Y-%m-%d"))) if c_0 else now_ist.strftime("%Y-%m-%d")
 
-    # Dual-compatible payload ensuring front page display functions properly
     payload = {
-        # Old File Keys (frontpage expected schema)
         "date": current_date_str,
         "RSI": rsi,
         "10ma": ma10,
@@ -289,43 +229,17 @@ def compute_script_parameters(script: str) -> Optional[Dict[str, Any]]:
         "6mr": ret_6mr,
         "1yr": ret_1yr,
         "3yr": detailed_metrics["3yr"],
-        "updated_at": f"{current_date_str} {current_time_str}",
-
-        # New Features / Uppercase Aliases
-        "Name": safe_script,
-        "CMP": close_0 if close_0 is not None else "N/A",
-        "PREV_CLOSE": c_1 if c_1 is not None else "N/A",
-        "%Chg (T)": chng_ydy,
-        "10MA": ma10,
-        "25MA": ma25,
-        "50MA": ma50,
-        "200MA": ma200,
-        "DATE": current_date_str,
-        "TIME": current_time_str
+        "updated_at": f"{current_date_str} {current_time_str}"
     }
 
     db.reference(f"param/{safe_script}").set(payload)
-    logger.info(f"[{script}] Parameters saved to /param/{safe_script} (3yr: {detailed_metrics['3yr']}) at {current_time_str}")
+    logger.info(f"[{script}] Parameters saved to /param/{safe_script} at {current_time_str}")
     return payload
-
-
-def calculate_single_script_parameters(script: str) -> bool:
-    """Calculates all metrics for a single script and writes to /param/<script>."""
-    try:
-        res = compute_script_parameters(script)
-        return res is not None
-    except Exception as e:
-        logger.error(f"[PARAM] Failed calculating single script {script}: {e}", exc_info=True)
-        return False
 
 
 def update_all_parameters(scripts: List[str]) -> None:
     """Iterates through all registered active scripts to calculate and save parameters."""
-    global _SCREENER_CACHE
-    _SCREENER_CACHE = None  # Reset cache before batch run to fetch latest screener data
-    get_screener_map()
-
-    logger.info(f"[PARAM ENGINE] Executing calculation cycle across {len(scripts)} scripts...")
+    logger.info(f"[PARAM ENGINE] Executing 15-minute calculation cycle across {len(scripts)} scripts...")
     for script in scripts:
         try:
             compute_script_parameters(script)
