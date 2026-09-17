@@ -1,25 +1,29 @@
 """
 PARAMETER CALCULATION MODULE (parameter.py)
-Fully autonomous calculation engine:
-1. Discovers every active stock from /watchlist, /display_list, /stocks, and fixed indices.
-2. Calculates RSI, 10MA, 25MA, 50MA, 200MA, 52W Extremes, Periodic Returns, and 3yr from SCREENER.
-3. Multi-writes to /param across raw, sanitized, and symbol aliases so frontend fetches never miss.
+Calculates technical indicators and performance metrics for active scripts.
+- Source data: Reads OHLC historical series from Firebase `/stocks/<script>`
+- Lookups: Reads 3yr value from `/SCREENER` array (keyed by Name/NSE/BSE)
+  with fallback to `/watchlist/detailedDb/<script>` or `/detailedDb/<script>`.
+- Output: Writes sanitized calculations to Firebase `/param/<sanitized_script>`
+- Stamping: Stores both date and time (IST) separately for each script
 """
 
 import math
 from datetime import datetime
 import pytz
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Union
 from firebase_admin import db
 from config import logger, TIMEZONE
-from firebase_manager import sanitize_key, FIXED_INDICES
+from firebase_manager import sanitize_key
 
 IST = pytz.timezone(TIMEZONE)
 
+# Module-level cache for SCREENER array to prevent redundant network fetches
 _SCREENER_CACHE: Optional[Dict[str, Any]] = None
 
 
 def safe_round(val: Any, decimals: int = 2) -> Any:
+    """Rounds a numeric value or returns 'N/A' if NaN, infinite, or invalid."""
     if val is None or val == "N/A":
         return "N/A"
     try:
@@ -32,6 +36,7 @@ def safe_round(val: Any, decimals: int = 2) -> Any:
 
 
 def safe_div(numerator: Any, denominator: Any, factor: float = 100.0) -> Any:
+    """Safely calculates (numerator / denominator) * factor; returns 'N/A' on zero-division or errors."""
     try:
         num = float(numerator)
         den = float(denominator)
@@ -46,6 +51,7 @@ def safe_div(numerator: Any, denominator: Any, factor: float = 100.0) -> Any:
 
 
 def parse_price(candle: Optional[Dict[str, Any]], field: str) -> Optional[float]:
+    """Extracts and verifies a floating price from an individual candle dictionary."""
     if not candle or field not in candle:
         return None
     try:
@@ -55,101 +61,32 @@ def parse_price(candle: Optional[Dict[str, Any]], field: str) -> Optional[float]
         return None
 
 
-def get_screener_map() -> Dict[str, Any]:
-    """Caches /SCREENER array to map records by Name, NSE, BSE, and CODE."""
-    global _SCREENER_CACHE
-    if _SCREENER_CACHE is not None:
-        return _SCREENER_CACHE
+def fetch_ordered_candles(script: str) -> List[Dict[str, Any]]:
+    """
+    Fetches historical candle collection under /stocks/<safe_script>.
+    Returns candles ordered chronologically backwards (index 0 is current/live, index 1 is yesterday).
+    """
+    safe_script = sanitize_key(script)
+    ref = db.reference(f"stocks/{safe_script}")
+    stock_data = ref.get()
+    if not stock_data:
+        return []
 
-    screener_map = {}
-    try:
-        raw_data = db.reference("SCREENER").get()
-        records: List[Dict[str, Any]] = []
-
-        if isinstance(raw_data, list):
-            records = [r for r in raw_data if isinstance(r, dict)]
-        elif isinstance(raw_data, dict):
-            records = [v for v in raw_data.values() if isinstance(v, dict)]
-
-        for rec in records:
-            keys_to_index = [
-                rec.get("Name"),
-                rec.get("NSE"),
-                rec.get("BSE"),
-                rec.get("CODE")
-            ]
-            for k in keys_to_index:
-                if k:
-                    k_str = str(k).strip().upper()
-                    screener_map[k_str] = rec
-                    screener_map[sanitize_key(k_str)] = rec
-
-        _SCREENER_CACHE = screener_map
-    except Exception as e:
-        logger.error(f"[PARAM] Failed to fetch /SCREENER table: {e}")
-        _SCREENER_CACHE = {}
-
-    return _SCREENER_CACHE
-
-
-def fetch_detailed_metrics(aliases: List[str]) -> Dict[str, Any]:
-    """Fetches static 3yr metric primarily from /SCREENER with fallback to detailedDb."""
-    screener_map = get_screener_map()
-    ret_3yr = None
-
-    for alias in aliases:
-        up = str(alias).strip().upper()
-        clean = up.replace(".NS", "").replace(".BO", "")
-        item = screener_map.get(up) or screener_map.get(clean) or screener_map.get(sanitize_key(up))
-        if item:
-            val = item.get("3yr") or item.get("3YR") or item.get("3Yr")
-            if val is not None:
-                ret_3yr = val
+    ordered_candles: List[Dict[str, Any]] = []
+    if isinstance(stock_data, list):
+        ordered_candles = [c for c in stock_data if isinstance(c, dict)]
+    elif isinstance(stock_data, dict):
+        for i in range(len(stock_data)):
+            key = str(i)
+            if key in stock_data and isinstance(stock_data[key], dict):
+                ordered_candles.append(stock_data[key])
+            else:
                 break
-
-    if ret_3yr is None:
-        for alias in aliases:
-            data = (
-                db.reference(f"watchlist/detailedDb/{alias}").get()
-                or db.reference(f"detailedDb/{alias}").get()
-                or db.reference(f"watchlist/detailedDb/{sanitize_key(alias)}").get()
-                or db.reference(f"detailedDb/{sanitize_key(alias)}").get()
-            )
-            if isinstance(data, dict):
-                val = data.get("3yr") or data.get("3YR") or data.get("3Yr")
-                if val is not None:
-                    ret_3yr = val
-                    break
-
-    return {"3yr": safe_round(ret_3yr, 2)}
-
-
-def fetch_candles_for_aliases(aliases: List[str]) -> Tuple[List[Dict[str, Any]], Optional[str]]:
-    """Tries all alias variations to find candles in /stocks."""
-    for key in aliases:
-        if not key:
-            continue
-        for candidate in [key, sanitize_key(key)]:
-            stock_data = db.reference(f"stocks/{candidate}").get()
-            if not stock_data:
-                continue
-
-            ordered: List[Dict[str, Any]] = []
-            if isinstance(stock_data, list):
-                ordered = [c for c in stock_data if isinstance(c, dict)]
-            elif isinstance(stock_data, dict):
-                for i in range(len(stock_data)):
-                    idx_key = str(i)
-                    if idx_key in stock_data and isinstance(stock_data[idx_key], dict):
-                        ordered.append(stock_data[idx_key])
-                    else:
-                        break
-            if len(ordered) >= 1:
-                return ordered, candidate
-    return [], None
+    return ordered_candles
 
 
 def calculate_rsi(closes_newest_first: List[float], period: int = 14) -> Any:
+    """Calculates standard RSI using Exponential Moving Average on Close."""
     if len(closes_newest_first) < (period + 1):
         return "N/A"
 
@@ -182,27 +119,96 @@ def calculate_rsi(closes_newest_first: List[float], period: int = 14) -> Any:
 
 
 def calculate_sma(closes_newest_first: List[float], window: int) -> Any:
+    """Calculates Simple Moving Average over the requested window."""
     if len(closes_newest_first) < window:
         return "N/A"
     sub_slice = closes_newest_first[:window]
     return safe_round(sum(sub_slice) / window, 2)
 
 
-def process_target_group(aliases: List[str]) -> bool:
-    clean_aliases = list(dict.fromkeys([str(a).strip() for a in aliases if a and str(a).strip()]))
-    if not clean_aliases:
-        return False
+def get_screener_map() -> Dict[str, Any]:
+    """
+    Downloads and caches the /SCREENER list, mapping records by Name, NSE, BSE, and CODE.
+    """
+    global _SCREENER_CACHE
+    if _SCREENER_CACHE is not None:
+        return _SCREENER_CACHE
 
-    candles, found_source_key = fetch_candles_for_aliases(clean_aliases)
-    primary_name = clean_aliases[0]
+    screener_map = {}
+    try:
+        raw_data = db.reference("SCREENER").get()
+        records: List[Dict[str, Any]] = []
 
+        if isinstance(raw_data, list):
+            records = [r for r in raw_data if isinstance(r, dict)]
+        elif isinstance(raw_data, dict):
+            records = [v for v in raw_data.values() if isinstance(v, dict)]
+
+        for rec in records:
+            keys_to_index = [
+                rec.get("Name"),
+                rec.get("NSE"),
+                rec.get("BSE"),
+                rec.get("CODE")
+            ]
+            for k in keys_to_index:
+                if k:
+                    screener_map[str(k).strip().upper()] = rec
+                    screener_map[sanitize_key(str(k).strip().upper())] = rec
+
+        _SCREENER_CACHE = screener_map
+    except Exception as e:
+        logger.error(f"[PARAM] Failed to fetch /SCREENER table: {e}")
+        _SCREENER_CACHE = {}
+
+    return _SCREENER_CACHE
+
+
+def fetch_detailed_metrics(script: str) -> Dict[str, Any]:
+    """
+    Fetches static 3yr metric primarily from /SCREENER, falling back to /detailedDb.
+    """
+    safe_script = sanitize_key(script).upper()
+    raw_script = str(script).strip().upper()
+    screener_map = get_screener_map()
+
+    # 1. Primary lookup from /SCREENER
+    screener_item = (
+        screener_map.get(raw_script)
+        or screener_map.get(safe_script)
+        or screener_map.get(raw_script.replace(".NS", "").replace(".BO", ""))
+        or screener_map.get(safe_script.replace(".NS", "").replace(".BO", ""))
+    )
+
+    ret_3yr = None
+    if screener_item:
+        ret_3yr = screener_item.get("3yr") or screener_item.get("3YR") or screener_item.get("3Yr")
+
+    # 2. Secondary fallback lookup from detailedDb nodes if missing from SCREENER
+    if ret_3yr is None:
+        fallback_data = (
+            db.reference(f"watchlist/detailedDb/{safe_script}").get()
+            or db.reference(f"detailedDb/{safe_script}").get()
+            or db.reference(f"watchlist/detailedDb/{script}").get()
+            or db.reference(f"detailedDb/{script}").get()
+        )
+        if isinstance(fallback_data, dict):
+            ret_3yr = fallback_data.get("3yr") or fallback_data.get("3YR") or fallback_data.get("3Yr")
+
+    return {
+        "3yr": safe_round(ret_3yr, 2)
+    }
+
+
+def compute_script_parameters(script: str) -> Optional[Dict[str, Any]]:
+    """Calculates all technical parameters and commits the payload to /param/<safe_script>."""
+    safe_script = sanitize_key(script)
+    candles = fetch_ordered_candles(script)
     if not candles:
-        logger.warning(f"[{primary_name}] Skipped: No candle history found in /stocks under {clean_aliases}")
-        return False
+        logger.warning(f"[{script}] No candle records found under /stocks/{safe_script}.")
+        return None
 
     c_0 = candles[0] if len(candles) > 0 else None
-    c_1_candle = candles[1] if len(candles) > 1 else None
-
     close_0 = parse_price(c_0, "close")
     open_0 = parse_price(c_0, "open")
 
@@ -230,12 +236,13 @@ def process_target_group(aliases: List[str]) -> bool:
     # RSI
     rsi = calculate_rsi(closes, 14)
 
-    # 52-Week Extremes
+    # 52-Week Extremes (252 rolling trading days)
     h_slice = highs[:252]
     l_slice = lows[:252]
     w52h = safe_round(max(h_slice), 2) if len(h_slice) >= 10 else "N/A"
     w52l = safe_round(min(l_slice), 2) if len(l_slice) >= 10 else "N/A"
 
+    # Periodic Returns with safe boundary protection
     def get_close(idx: int) -> Optional[float]:
         return closes[idx] if len(closes) > idx else None
 
@@ -255,14 +262,17 @@ def process_target_group(aliases: List[str]) -> bool:
     ret_6mr = safe_div(c_1 - c_121, c_121) if (c_1 is not None and c_121 is not None) else "N/A"
     ret_1yr = safe_div(c_1 - c_251, c_251) if (c_1 is not None and c_251 is not None) else "N/A"
 
-    detailed_metrics = fetch_detailed_metrics(clean_aliases)
+    # 3yr metric lookup from SCREENER
+    detailed_metrics = fetch_detailed_metrics(script)
 
+    # Timestamp Generation (IST)
     now_ist = datetime.now(IST)
     current_time_str = now_ist.strftime("%H:%M:%S")
     current_date_str = str(c_0.get("date", now_ist.strftime("%Y-%m-%d"))) if c_0 else now_ist.strftime("%Y-%m-%d")
 
+    # Dual-compatible payload ensuring front page display functions properly
     payload = {
-        # Old File Keys (Stock_window.jsx and Index_window.jsx primary)
+        # Old File Keys (frontpage expected schema)
         "date": current_date_str,
         "RSI": rsi,
         "10ma": ma10,
@@ -281,183 +291,53 @@ def process_target_group(aliases: List[str]) -> bool:
         "3yr": detailed_metrics["3yr"],
         "updated_at": f"{current_date_str} {current_time_str}",
 
-        # Uppercase Schema Aliases
-        "Name": primary_name,
+        # New Features / Uppercase Aliases
+        "Name": safe_script,
         "CMP": close_0 if close_0 is not None else "N/A",
         "PREV_CLOSE": c_1 if c_1 is not None else "N/A",
-        "Tdy-%chng": chng_2dy,
         "%Chg (T)": chng_ydy,
         "10MA": ma10,
         "25MA": ma25,
         "50MA": ma50,
         "200MA": ma200,
-        "52WH": w52h,
-        "52WL": w52l,
-        "1W": ret_1wr,
-        "1M": ret_1mr,
-        "3M": ret_3mr,
-        "1YR": ret_1yr,
-        "3YR": detailed_metrics["3yr"],
         "DATE": current_date_str,
         "TIME": current_time_str
     }
 
-    # 1. Mirror payload across all alias keys in /param
-    write_keys: Set[str] = set()
-    for a in clean_aliases:
-        write_keys.add(a)
-        write_keys.add(sanitize_key(a))
-
-    for wkey in write_keys:
-        try:
-            db.reference(f"param/{wkey}").set(payload)
-        except Exception:
-            pass
-
-    # 2. Mirror indices if applicable
-    for a in clean_aliases:
-        if a in FIXED_INDICES:
-            try:
-                db.reference(f"indices/{a}").set(payload)
-                db.reference(f"indices/{sanitize_key(a)}").set(payload)
-            except Exception:
-                pass
-
-    # 3. Ensure live /stocks nodes exist for every alias so c0/c1 fetches resolve
-    for alias in clean_aliases:
-        if alias != found_source_key:
-            try:
-                if c_0:
-                    ref_idx0 = db.reference(f"stocks/{alias}/0")
-                    if not ref_idx0.get():
-                        ref_idx0.set(c_0)
-                if c_1_candle:
-                    ref_idx1 = db.reference(f"stocks/{alias}/1")
-                    if not ref_idx1.get():
-                        ref_idx1.set(c_1_candle)
-            except Exception:
-                pass
-
-    logger.info(f"[{primary_name}] Successfully updated /param across: {list(write_keys)}")
-    return True
-
-
-def discover_all_system_targets() -> List[List[str]]:
-    """Discovers every target group across /stocks, /watchlist, /display_list, and FIXED_INDICES."""
-    targets: List[List[str]] = []
-
-    # 1. Fixed market indices
-    for idx_name, idx_ticker in FIXED_INDICES.items():
-        targets.append([idx_name, idx_ticker, sanitize_key(idx_name), sanitize_key(idx_ticker)])
-
-    # 2. All stocks currently populated under /stocks
-    try:
-        stocks_root = db.reference("stocks").shallow().get() or {}
-        if isinstance(stocks_root, dict):
-            for stock_k in stocks_root.keys():
-                targets.append([stock_k, sanitize_key(stock_k)])
-    except Exception:
-        pass
-
-    # 3. Watchlist detailedDb
-    try:
-        det_db = db.reference("watchlist/detailedDb").get() or {}
-        if isinstance(det_db, dict):
-            for k, info in det_db.items():
-                if isinstance(info, dict):
-                    aliases = [k, info.get("Name"), info.get("TICKER"), info.get("NSE"), info.get("CODE")]
-                    targets.append([str(a).strip() for a in aliases if a])
-                else:
-                    targets.append([str(k).strip()])
-    except Exception:
-        pass
-
-    # 4. Watchlist array
-    try:
-        raw_wl = db.reference("watchlist/watchlist").get() or db.reference("watchlist").get()
-        if isinstance(raw_wl, list):
-            for item in raw_wl:
-                if isinstance(item, str):
-                    targets.append([item.strip(), f"{item.strip()}.NS"])
-                elif isinstance(item, dict):
-                    aliases = [item.get("Name"), item.get("TICKER"), item.get("NSE")]
-                    targets.append([str(a).strip() for a in aliases if a])
-    except Exception:
-        pass
-
-    # 5. Front page display_list
-    try:
-        dl = db.reference("display_list").get() or {}
-        stk_list = dl.get("stocks", [])
-        if isinstance(stk_list, list):
-            for s in stk_list:
-                if isinstance(s, str):
-                    targets.append([s.strip()])
-                elif isinstance(s, dict):
-                    aliases = [s.get("Name"), s.get("ticker"), s.get("TICKER")]
-                    targets.append([str(a).strip() for a in aliases if a])
-    except Exception:
-        pass
-
-    # 6. Existing /stocklist
-    try:
-        sl = db.reference("stocklist").get() or {}
-        if isinstance(sl, dict):
-            for s_name, s_ticker in sl.items():
-                targets.append([str(s_name).strip(), str(s_ticker).strip()])
-    except Exception:
-        pass
-
-    # Merge overlapping alias sets
-    merged: List[Set[str]] = []
-    for grp in targets:
-        grp_set = {str(x).strip() for x in grp if x and str(x).strip()}
-        if not grp_set:
-            continue
-        found_idx = -1
-        for idx, ex in enumerate(merged):
-            if not ex.isdisjoint(grp_set):
-                found_idx = idx
-                break
-        if found_idx >= 0:
-            merged[found_idx].update(grp_set)
-        else:
-            merged.append(grp_set)
-
-    return [list(s) for s in merged]
-
-
-def update_all_parameters(scripts: Optional[List[str]] = None) -> None:
-    """Executes parameters cycle across all discovered system assets."""
-    global _SCREENER_CACHE
-    _SCREENER_CACHE = None
-    get_screener_map()
-
-    all_groups = discover_all_system_targets()
-    logger.info(f"[PARAM ENGINE] Discovered {len(all_groups)} asset groups across database nodes.")
-
-    success = 0
-    for group in all_groups:
-        try:
-            if process_target_group(group):
-                success += 1
-        except Exception as e:
-            logger.error(f"[{group[0]}] Parameter calculation error: {e}", exc_info=True)
-
-    logger.info(f"[PARAM ENGINE] Completed: Updated {success}/{len(all_groups)} assets.")
+    db.reference(f"param/{safe_script}").set(payload)
+    logger.info(f"[{script}] Parameters saved to /param/{safe_script} (3yr: {detailed_metrics['3yr']}) at {current_time_str}")
+    return payload
 
 
 def calculate_single_script_parameters(script: str) -> bool:
+    """Calculates all metrics for a single script and writes to /param/<script>."""
     try:
-        return process_target_group([script, sanitize_key(script)])
+        res = compute_script_parameters(script)
+        return res is not None
     except Exception as e:
-        logger.error(f"[PARAM] Error on single script {script}: {e}")
+        logger.error(f"[PARAM] Failed calculating single script {script}: {e}", exc_info=True)
         return False
 
 
+def update_all_parameters(scripts: List[str]) -> None:
+    """Iterates through all registered active scripts to calculate and save parameters."""
+    global _SCREENER_CACHE
+    _SCREENER_CACHE = None  # Reset cache before batch run to fetch latest screener data
+    get_screener_map()
+
+    logger.info(f"[PARAM ENGINE] Executing calculation cycle across {len(scripts)} scripts...")
+    for script in scripts:
+        try:
+            compute_script_parameters(script)
+        except Exception as e:
+            logger.error(f"[{script}] Failed to process parameters: {e}", exc_info=True)
+
+
 if __name__ == "__main__":
-    from firebase_manager import init_firebase
+    from firebase_manager import init_firebase, get_stocklist_mapping
     init_firebase()
-    print("Initiating full multi-target parameter calculation...")
-    update_all_parameters()
+    stock_map = get_stocklist_mapping()
+    stock_names = list(stock_map.keys())
+    print(f"Forcefully calculating parameters for {len(stock_names)} stocks...")
+    update_all_parameters(stock_names)
     print("Parameter calculation complete.")
