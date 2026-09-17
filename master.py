@@ -1,16 +1,12 @@
 """
-MASTER ORCHESTRATOR (UNIFIED MONITOR & SCREENER PLATFORM)
+MASTER ORCHESTRATOR
 - Embedded HTTP server on port 10000 (/health, /start, /stop, /sync, /sync-screener) with robust URL parsing.
 - Integrated on-demand ETL triggering for Google Drive -> Firebase /SCREENER ingestion.
-- URL Query parameter sanitization via urllib.parse.urlparse.
 - Full CORS preflight support (OPTIONS, HEAD, GET, POST).
-- SR Flip-Flop Power Latch (Default: ON).
-- Real-time /system_status heartbeat telemetry every 300s.
-- Non-blocking 5-second main loop idle tick on weekends and holidays.
 - Dynamic stock discovery using get_stocklist_mapping(force_reconcile=True).
+- Instant targeted sync support for newly added stocks via /sync or manual bus triggers.
 - Pre-market sync window (08:00–08:30 IST) with 5-minute retry intervals.
-- Index 0 preserved (no 09:00 AM or 16:00 PM wipes).
-- 5-minute live updates (CHILD-2) and 15-minute parameter engine calculations.
+- Live market updates (CHILD-2) and parameter calculations.
 """
 import os
 import sys
@@ -55,18 +51,14 @@ from live_child import update_live_script
 from yahoo_manager import get_latest_available_trading_date
 from parameter import update_all_parameters
 
-# Screener Pipeline ETL Runner
 try:
     from basic import run_pipeline as run_screener_pipeline
 except ImportError:
     try:
         from BASIC import run_pipeline as run_screener_pipeline
     except ImportError:
-        try:
-            from RUN_PIPELINE import main as run_screener_pipeline
-        except ImportError:
-            run_screener_pipeline = None
-            logger.warning("[WARNING] Screener ETL script not found. Pipeline sync will be unavailable.")
+        run_screener_pipeline = None
+        logger.warning("[WARNING] basic.py / BASIC.py not found. Screener sync will be unavailable.")
 
 IST = pytz.timezone(TIMEZONE)
 _keep_running = True
@@ -79,7 +71,7 @@ _screener_lock = threading.Lock()
 class SystemStateBus:
     def __init__(self):
         self.lock = threading.Lock()
-        self.power_latched_on = True  # Default: ON
+        self.power_latched_on = True
         self.pulse_sync_time = 0.0
 
     def trigger_pulse(self, command: str):
@@ -111,13 +103,10 @@ class SystemStateBus:
 STATE_BUS = SystemStateBus()
 
 
-# =====================================================================
-# BACKGROUND ASYNC WORKERS
-# =====================================================================
 def dispatch_screener_sync_job():
-    """Runs screener ETL run_pipeline inside a thread-safe daemon worker."""
+    """Runs basic.py run_pipeline inside a thread-safe daemon worker."""
     if not run_screener_pipeline:
-        logger.error("[SCREENER] Cannot run pipeline: ETL runner is not loaded.")
+        logger.error("[SCREENER] Cannot run pipeline: basic.py is not loaded.")
         return
 
     if not _screener_lock.acquire(blocking=False):
@@ -234,9 +223,6 @@ def start_http_listener():
     threading.Thread(target=server.serve_forever, daemon=True).start()
 
 
-# =====================================================================
-# SIGNAL HANDLING
-# =====================================================================
 def handle_shutdown(signum, frame):
     global _keep_running
     logger.info(f"Signal ({signum}) caught. Terminating Master gracefully...")
@@ -292,7 +278,7 @@ class MasterOrchestrator:
         self.replan_daily_routine()
         self.record_heartbeat()
 
-        # 2. Non-blocking initial sync in background
+        # 2. Initial sync in background
         threading.Thread(target=self.execute_historical_sync, kwargs={"is_manual": False}, daemon=True).start()
 
         # 3. Main Dispatch Loop
@@ -303,32 +289,31 @@ class MasterOrchestrator:
                 today_date = now_ist.date()
                 now_time = now_ist.time()
 
-                # --- Periodic Heartbeat (Every 300s) ---
+                # Periodic Heartbeat (Every 300s)
                 if (now_epoch - self.last_heartbeat_time) >= 300:
                     self.record_heartbeat()
 
-                # --- Priority 0: Manual Pulse Interruption (Independent of power state) ---
+                # Priority 0: Manual Pulse Interruption (Triggered when stock is added or /sync called)
                 if STATE_BUS.check_and_clear_manual_sync():
                     logger.info("[OVERRIDE PULSE] Immediate sync commanded. Running reconciliation & CHILD-1...")
                     self.replan_daily_routine()
                     threading.Thread(target=self.execute_historical_sync, kwargs={"is_manual": True}, daemon=True).start()
                     continue
 
-                # --- Power Latch Check ---
+                # Power Latch Check
                 if not STATE_BUS.is_power_on():
                     time.sleep(5)
                     continue
 
-                # --- Priority 1: State-Driven Date Catch-Up ---
+                # Priority 1: State-Driven Date Catch-Up
                 if self.last_planned_date != today_date:
                     self.replan_daily_routine()
 
-                # Non-trading days: Sleep in short 5s increments to keep the heartbeat ticking
                 if not self.is_today_trading_day:
                     time.sleep(5)
                     continue
 
-                # --- Priority 2: Pre-Market Historical Sync Window (08:00 – 08:30 IST) ---
+                # Priority 2: Pre-Market Historical Sync Window (08:00 – 08:30 IST)
                 sync_start = datetime.strptime(f"{SYNC_WINDOW_START_HOUR}:{SYNC_WINDOW_START_MIN}", "%H:%M").time()
                 sync_cutoff = datetime.strptime(f"{SYNC_WINDOW_DEADLINE_HOUR}:{SYNC_WINDOW_DEADLINE_MIN}", "%H:%M").time()
 
@@ -339,12 +324,11 @@ class MasterOrchestrator:
                         self.execute_historical_sync(is_manual=False)
                         self.last_sync_attempt_time = now_epoch
 
-                # Audit report at or after 08:30 IST
                 if now_time >= sync_cutoff and not self.sync_audit_reported_today:
                     self.log_detailed_sync_audit()
                     self.sync_audit_reported_today = True
 
-                # --- Priority 3: Live Market Window (09:15 – 15:30 IST) ---
+                # Priority 3: Live Market Window (09:15 – 15:30 IST)
                 self.calendar.refresh_calendar()
                 status, _ = self.calendar.get_market_status()
 
@@ -370,7 +354,7 @@ class MasterOrchestrator:
         logger.info("Master orchestrator stopped cleanly.")
 
     def replan_daily_routine(self):
-        """Initializes day plan, forcing reconciliation to purge deleted stocks from /stocklist."""
+        """Forces reconciliation between /stocklist and /watchlist, preserving only active entries."""
         now_ist = datetime.now(IST)
         today = now_ist.date()
         self.calendar.refresh_calendar()
@@ -379,22 +363,29 @@ class MasterOrchestrator:
         self.last_planned_date = today
         self.sync_audit_reported_today = False
 
-        # Force reconciliation with /watchlist to purge deleted entries immediately
+        # Forces reconciliation with /watchlist to purge deleted entries and pick up additions
         stock_map = get_stocklist_mapping(force_reconcile=True)
-        self.script_status = {
-            name: {
-                "synced": False,
-                "last_attempt_at": None,
-                "error": "Awaiting daily sync",
-                "ticker": ticker
-            }
-            for name, ticker in stock_map.items()
-        }
+
+        # Preserve status of previously synced stocks if they are still present
+        new_status = {}
+        for name, ticker in stock_map.items():
+            if name in self.script_status and self.script_status[name]["synced"]:
+                new_status[name] = self.script_status[name]
+                new_status[name]["ticker"] = ticker
+            else:
+                new_status[name] = {
+                    "synced": False,
+                    "last_attempt_at": None,
+                    "error": "Awaiting initial sync",
+                    "ticker": ticker
+                }
+
+        self.script_status = new_status
         status_label = "TRADING SESSION" if self.is_today_trading_day else "NON-TRADING DAY (Closed)"
         logger.info(f"[PLANNER] Plan for {today} IST refreshed: {status_label} ({len(self.script_status)} stocks)")
 
     def execute_historical_sync(self, is_manual: bool = False):
-        """Runs CHILD-1 historical sync."""
+        """Runs CHILD-1 historical sync (seeds 300 bars and initializes live row)."""
         now_str = datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S")
 
         for name, meta in list(self.script_status.items()):
@@ -423,6 +414,11 @@ class MasterOrchestrator:
                     meta["synced"] = True
                     meta["error"] = None
                     logger.info(f"[{name}] Sync successful: {msg}")
+                    # Initialize live candle row 0 immediately upon historical commitment
+                    try:
+                        update_live_script(name, ticker)
+                    except Exception as live_init_err:
+                        logger.warning(f"[{name}] Initial live candle row 0 seed skipped: {live_init_err}")
                 else:
                     meta["synced"] = False
                     meta["error"] = msg
@@ -433,7 +429,6 @@ class MasterOrchestrator:
                 meta["error"] = f"Exception: {str(e)}"
                 logger.error(f"Sync fault caught for [{name}]: {e}", exc_info=True)
 
-        # Update sync telemetry in Firebase
         try:
             synced_count = len([k for k, v in self.script_status.items() if v["synced"]])
             total_count = len(self.script_status)
@@ -518,9 +513,6 @@ class MasterOrchestrator:
         logger.info("=" * 85)
 
 
-# =====================================================================
-# PROGRAM ENTRY POINT
-# =====================================================================
 if __name__ == "__main__":
     start_http_listener()
     orchestrator = MasterOrchestrator()

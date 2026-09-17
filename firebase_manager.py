@@ -3,9 +3,9 @@ FIREBASE MANAGER
 - Centralized Firebase Admin SDK connection and lifecycle management.
 - Dynamic stock discovery and reconciliation for /stocklist.
 - Permanent anchoring of 4 master market indices (immune to purging/deletion).
-- Pure read-only access to master nodes: /watchlist and /detailedDb.
-- Guarded OHLC access for Child-1 (1 to 250) and Child-2 (index 0).
-- Automated Garbage Collector for deleted assets in /stocks.
+- Safe targeted mutations for /watchlist/detailedDb and /stocklist.
+- Guarded OHLC access for Child-1 (1 to 300) and Child-2 (index 0).
+- Garbage Collector: purges orphaned OHLC records from /stocks on deletion.
 """
 import os
 import json
@@ -31,9 +31,6 @@ FIXED_INDICES = {
 }
 
 
-# =====================================================================
-# 1. CENTRALIZED FIREBASE INITIALIZATION
-# =====================================================================
 def init_firebase():
     """Idempotently initializes Firebase Admin SDK."""
     if not firebase_admin._apps:
@@ -77,9 +74,6 @@ def sanitize_key(key: str) -> str:
     )
 
 
-# =====================================================================
-# 2. CALENDAR CONFIG ACCESS (FOR MARKET_CALENDAR.PY)
-# =====================================================================
 def get_calendar_config() -> dict:
     """Reads custom calendar overrides / holidays from Firebase."""
     init_firebase()
@@ -105,18 +99,15 @@ def set_calendar_config(payload: dict) -> bool:
 
 
 # =====================================================================
-# 3. MASTER WATCHLIST READ-ONLY QUERIES & STOCKLIST SYNCHRONIZER
+# MASTER WATCHLIST READ-ONLY QUERIES & STOCKLIST SYNCHRONIZER
 # =====================================================================
 def get_master_watchlist_mapping() -> dict[str, str]:
     """
-    STRICT READ-ONLY:
     1. Anchors the 4 permanent master indices.
-    2. Reads active stocks from /watchlist and /detailedDb.
+    2. Reads active stocks from /watchlist and maps to TICKER.
     Returns: { Clean Sanitized Name: Yahoo Ticker }
     """
     init_firebase()
-    
-    # 1. Start with the permanent, immutable indices
     master_mapping = {sanitize_key(k): v for k, v in FIXED_INDICES.items()}
 
     try:
@@ -139,40 +130,23 @@ def get_master_watchlist_mapping() -> dict[str, str]:
         elif isinstance(raw_names, list):
             active_names = [str(v).strip() for v in raw_names if v]
 
-        param_db = db.reference("param").get() or {}
+        current_stocklist = get_current_stocklist()
 
-        # 2. Extract tickers and sanitize dictionary keys for Firebase safety
         for name in active_names:
             sanitized_name = sanitize_key(name)
             stock_info = (
                 detailed_db.get(name) or 
                 detailed_db.get(sanitized_name) or 
                 detailed_db.get(name.replace(".", "_")) or 
-                param_db.get(name) or 
-                param_db.get(sanitized_name) or 
                 {}
             )
 
-            ticker = stock_info.get("TICKER") or stock_info.get("ticker") or stock_info.get("Ticker")
-
-            # Fallback to CODE or NSE if TICKER key is missing
+            # Preference: detailedDb TICKER -> existing /stocklist mapping -> fallback to .NS
+            ticker = stock_info.get("TICKER") or current_stocklist.get(sanitized_name)
             if not ticker:
-                code_val = (
-                    stock_info.get("CODE") or 
-                    stock_info.get("NSE") or 
-                    stock_info.get("code") or 
-                    stock_info.get("nse")
-                )
-                if code_val:
-                    ticker = f"{str(code_val).strip()}.NS"
+                ticker = f"{sanitized_name}.NS"
 
-            if ticker:
-                t = str(ticker).strip()
-                if t.upper() == "^NESI":
-                    t = "^NSEI"
-                master_mapping[sanitized_name] = t
-            else:
-                logger.warning(f"[MASTER-WATCHLIST] Stock '{name}' has no TICKER or CODE in detailedDb/param.")
+            master_mapping[sanitized_name] = str(ticker).strip()
 
         return master_mapping
     except Exception as e:
@@ -195,22 +169,19 @@ def get_current_stocklist() -> dict[str, str]:
 
 def reconcile_stocklist_with_watchlist() -> tuple[bool, dict[str, str]]:
     """
-    Compares /stocklist against the master /watchlist and FIXED_INDICES.
-    Synchronizes /stocklist and removes orphaned historical OHLC entries under /stocks.
-    Returns: (was_changed: bool, active_stock_mapping: dict)
+    Synchronizes /stocklist with active stocks in /watchlist.
+    Purges orphaned OHLC records from /stocks without touching other symbols or indices.
     """
     init_firebase()
     master_map = get_master_watchlist_mapping()
     current_stocklist = get_current_stocklist()
 
-    # Safety Guard: Never clear stocklist if master watchlist returns empty
     if not master_map:
         logger.warning("[RECONCILE] Target map returned empty. Skipping sync to prevent accidental data loss.")
         return False, current_stocklist
 
     safe_master_map = {sanitize_key(k): v for k, v in master_map.items()}
 
-    # Check for discrepancies
     diff_detected = False
     if set(safe_master_map.keys()) != set(current_stocklist.keys()):
         diff_detected = True
@@ -226,12 +197,16 @@ def reconcile_stocklist_with_watchlist() -> tuple[bool, dict[str, str]]:
             f"and stocklist ({len(current_stocklist)})."
         )
         try:
-            # 1. Update /stocklist with the cleaned mapping
+            # 1. Update /stocklist with exact active target set
             db.reference(PATH_SCRIPTS).set(safe_master_map)
             
             # 2. Garbage Collector: Purge orphaned /stocks OHLC records
             orphans = set(current_stocklist.keys()) - set(safe_master_map.keys())
+            fixed_keys = {sanitize_key(k) for k in FIXED_INDICES.keys()}
+
             for orphan in orphans:
+                if orphan in fixed_keys:
+                    continue  # Guard fixed indices
                 logger.info(f"[GARBAGE COLLECTOR] Purging historical OHLC for deleted stock: {orphan}")
                 try:
                     db.reference(f"{PATH_STOCKS}/{orphan}").delete()
@@ -248,11 +223,7 @@ def reconcile_stocklist_with_watchlist() -> tuple[bool, dict[str, str]]:
 
 
 def get_stocklist_mapping(force_reconcile: bool = True) -> dict[str, str]:
-    """
-    Returns active target dictionary:
-    If force_reconcile is True (default), it immediately reconciles with /watchlist,
-    purging deleted stocks from /stocklist and /stocks.
-    """
+    """Returns the active target dictionary."""
     if force_reconcile:
         _, mapping = reconcile_stocklist_with_watchlist()
     else:
@@ -260,7 +231,6 @@ def get_stocklist_mapping(force_reconcile: bool = True) -> dict[str, str]:
         if not mapping:
             _, mapping = reconcile_stocklist_with_watchlist()
 
-    # Ensure permanent indices are present
     for k, v in FIXED_INDICES.items():
         mapping.setdefault(sanitize_key(k), v)
 
@@ -273,7 +243,7 @@ def get_stocklist() -> list:
 
 
 # =====================================================================
-# 4. OHLC DATABASE ACCESS (CHILD-1 & CHILD-2)
+# OHLC DATABASE ACCESS (CHILD-1 & CHILD-2)
 # =====================================================================
 def get_stock_ohlc(display_name: str) -> dict:
     """Reads complete OHLC records from /stocks/<display_name>."""
