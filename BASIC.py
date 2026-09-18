@@ -124,15 +124,18 @@ def download_csv_from_drive(file_id: str) -> pd.DataFrame:
     return pd.read_csv(io.BytesIO(response.content))
 
 def init_firebase():
-    """Initializes Firebase Admin SDK if not already active."""
+    """Initializes Firebase Admin SDK using disk file or Render Environment Variable."""
     if not firebase_admin._apps:
-        if os.path.exists(FIREBASE_KEY_FILE):
-            cred = credentials.Certificate(FIREBASE_KEY_FILE)
+        if os.path.exists("serviceAccountKey.json"):
+            cred = credentials.Certificate("serviceAccountKey.json")
         elif os.environ.get("FIREBASE_SERVICE_ACCOUNT_KEY"):
             key_dict = json.loads(os.environ["FIREBASE_SERVICE_ACCOUNT_KEY"])
             cred = credentials.Certificate(key_dict)
+        elif os.environ.get("FIREBASE_CREDENTIALS"):
+            key_dict = json.loads(os.environ["FIREBASE_CREDENTIALS"])
+            cred = credentials.Certificate(key_dict)
         else:
-            raise FileNotFoundError(f"Firebase credentials not found ({FIREBASE_KEY_FILE})")
+            raise FileNotFoundError("Firebase credentials not found (serviceAccountKey.json)")
 
         firebase_admin.initialize_app(cred, {
             'databaseURL': FIREBASE_DB_URL
