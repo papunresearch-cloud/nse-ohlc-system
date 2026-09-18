@@ -74,8 +74,7 @@ column_mapping = {
     "Promoter holding": "PRH",
     "Change in promoter holding": "DPRH",
     "YOY Quarterly sales growth": "YSG",
-    "YOY Quarterly profit growth": "YPG",
-    "Last result date": "C-QTR"
+    "YOY Quarterly profit growth": "YPG"
 }
 
 # ==========================================
@@ -228,6 +227,12 @@ def run_pipeline():
     init_firebase()
     ref = db.reference(FIREBASE_TARGET_NODE)
     ref.set(keyed_records)
+
+    # Record sync status in Firebase
+    db.reference("system_status/screener_sync").set({
+        "last_updated": datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S IST"),
+        "status": "SUCCESS"
+    })
     
     print(f"[OK] Success! Uploaded {len(keyed_records)} keyed records to Firebase node: /{FIREBASE_TARGET_NODE}")
 
