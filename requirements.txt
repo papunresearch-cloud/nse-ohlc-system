@@ -1,9 +1,15 @@
+firebase-admin>=6.5.0
+yfinance>=0.2.40
+pandas>=2.2.0
+pytz>=2024.1
+requests>=2.31.0
+python-dotenv>=1.0.1
 firebase-admin
 pandas
 numpy
 google-api-python-client
-google-auth
 google-auth-httplib2
+google-auth-oauthlib
 yfinance
 pytz
 python-dotenv

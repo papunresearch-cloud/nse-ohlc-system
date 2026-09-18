@@ -1,12 +1,13 @@
 """
 ===============================================================================
-SCREENER BASE INGESTION (BASIC.py)
+SCREENER BASE INGESTION (BASIC.py) - DIRECT REST STREAMING (OPTION 2)
 ===============================================================================
-* Downloads screener.csv from Google Drive using headless OAuth token authentication.
-* Eliminates browser pop-ups (InstalledAppFlow) to run reliably on Render.
-* Cleans and sanitizes columns, deriving the primary key 'CODE'.
-* Overwrites and saves data as a keyed dictionary directly under /SCREENER/<CODE>.
-* Publishes update telemetry to /system_status/screener_sync.
+* Downloads screener.csv directly via Google Drive v3 REST API using requests.
+* Completely eliminates googleapiclient and google-auth-oauthlib dependencies.
+* Parses CSV into memory (io.BytesIO) and cleans columns.
+* Derives the primary key 'CODE' (NSE > BSE > Name fallback).
+* Overwrites and saves data as a keyed dictionary under /SCREENER/<CODE>.
+* Writes completion telemetry to /system_status/screener_sync.
 ===============================================================================
 """
 
@@ -17,6 +18,7 @@ import json
 import logging
 from datetime import datetime
 import pytz
+import requests
 import numpy as np
 import pandas as pd
 
@@ -24,8 +26,6 @@ import firebase_admin
 from firebase_admin import credentials, db
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
-from googleapiclient.discovery import build
-from googleapiclient.http import MediaIoBaseDownload
 
 logger = logging.getLogger("NSE_OHLC_SYSTEM")
 
@@ -98,13 +98,12 @@ column_mapping = {
 }
 
 # ==========================================
-# 2. HEADLESS GOOGLE DRIVE CLIENT
+# 2. REST-BASED GOOGLE DRIVE STREAMER
 # ==========================================
-def get_drive_service():
+def get_drive_access_token() -> str:
     """
-    Authenticates and returns Google Drive API service.
-    Reads token from local token.json or Render's GDRIVE_TOKEN_JSON secret env var.
-    Never attempts to launch a local browser popup.
+    Acquires and refreshes Google OAuth2 access token without
+    relying on local browser popups or googleapiclient.
     """
     creds = None
 
@@ -114,15 +113,15 @@ def get_drive_service():
         try:
             token_info = json.loads(os.environ['GDRIVE_TOKEN_JSON'])
             creds = Credentials.from_authorized_user_info(token_info, SCOPES)
-        except Exception as err:
-            logger.error(f"[GDRIVE] Error parsing GDRIVE_TOKEN_JSON environment variable: {err}")
+        except Exception as e:
+            logger.error(f"[GDRIVE] Error parsing GDRIVE_TOKEN_JSON env: {e}")
 
     if creds and creds.expired and creds.refresh_token:
         try:
             creds.refresh(Request())
             if os.path.exists('token.json'):
-                with open('token.json', 'w') as token_file:
-                    token_file.write(creds.to_json())
+                with open('token.json', 'w') as f:
+                    f.write(creds.to_json())
         except Exception as e:
             logger.error(f"[GDRIVE] Token refresh error: {e}")
             creds = None
@@ -130,26 +129,47 @@ def get_drive_service():
     if not creds or not creds.valid:
         raise RuntimeError(
             "[GDRIVE ERROR] Missing or invalid 'token.json'. "
-            "Ensure token.json exists in Render Secret Files or GDRIVE_TOKEN_JSON is configured."
+            "Please ensure token.json is configured in Render Secret Files or GDRIVE_TOKEN_JSON."
         )
 
-    return build('drive', 'v3', credentials=creds)
+    return creds.token
 
-def get_folder_id(service, folder_name: str):
-    """Searches Drive for the parent folder."""
-    query = f"name='{folder_name}' and mimeType='application/vnd.google-apps.folder' and trashed=false"
-    results = service.files().list(q=query, spaces='drive', fields='files(id, name)').execute()
-    folders = results.get('files', [])
-    if folders:
-        return folders[0]['id']
-    return None
+def download_screener_dataframe() -> pd.DataFrame:
+    """
+    Directly queries Google Drive v3 REST API via requests
+    and loads the CSV content straight into a pandas DataFrame.
+    """
+    access_token = get_drive_access_token()
+    headers = {"Authorization": f"Bearer {access_token}"}
 
-def get_file_id(service, folder_id: str, file_name: str):
-    """Finds target file within specified folder."""
-    query = f"name='{file_name}' and '{folder_id}' in parents and trashed=false"
-    results = service.files().list(q=query, spaces='drive', fields='files(id, name)').execute()
-    files = results.get('files', [])
-    return files[0]['id'] if files else None
+    # 1. Search for parent folder
+    folder_query = f"name='{GDRIVE_FOLDER_NAME}' and mimeType='application/vnd.google-apps.folder' and trashed=false"
+    folder_url = f"https://www.googleapis.com/drive/v3/files?q={folder_query}"
+    res_folder = requests.get(folder_url, headers=headers)
+    res_folder.raise_for_status()
+    folders = res_folder.json().get('files', [])
+
+    if not folders:
+        raise FileNotFoundError(f"Folder '{GDRIVE_FOLDER_NAME}' was not found in Google Drive.")
+    folder_id = folders[0]['id']
+
+    # 2. Search for screener.csv within the folder
+    file_query = f"name='{GDRIVE_FILE_NAME}' and '{folder_id}' in parents and trashed=false"
+    file_url = f"https://www.googleapis.com/drive/v3/files?q={file_query}"
+    res_file = requests.get(file_url, headers=headers)
+    res_file.raise_for_status()
+    files = res_file.json().get('files', [])
+
+    if not files:
+        raise FileNotFoundError(f"File '{GDRIVE_FILE_NAME}' not found inside folder '{GDRIVE_FOLDER_NAME}'.")
+    file_id = files[0]['id']
+
+    # 3. Stream binary CSV media
+    media_url = f"https://www.googleapis.com/drive/v3/files/{file_id}?alt=media"
+    res_media = requests.get(media_url, headers=headers)
+    res_media.raise_for_status()
+
+    return pd.read_csv(io.BytesIO(res_media.content))
 
 # ==========================================
 # 3. FIREBASE SETUP & PRIMARY KEY HELPERS
@@ -199,32 +219,11 @@ def derive_primary_key(bse: str, nse: str, name: str) -> str:
 # 4. MAIN PIPELINE EXECUTION
 # ==========================================
 def run_pipeline():
-    print("[INFO] Connecting to Google Drive...")
-    service = get_drive_service()
-    
-    print(f"[INFO] Locating folder '{GDRIVE_FOLDER_NAME}'...")
-    folder_id = get_folder_id(service, GDRIVE_FOLDER_NAME)
-    if not folder_id:
-        raise FileNotFoundError(f"Folder '{GDRIVE_FOLDER_NAME}' not found in Google Drive.")
+    print("[INFO] Fetching screener.csv from Google Drive via REST API...")
+    df = download_screener_dataframe()
+    print(f"[OK] Successfully downloaded and parsed CSV ({len(df)} rows).")
 
-    print(f"[INFO] Locating file '{GDRIVE_FILE_NAME}'...")
-    file_id = get_file_id(service, folder_id, GDRIVE_FILE_NAME)
-    if not file_id:
-        raise FileNotFoundError(f"File '{GDRIVE_FILE_NAME}' not found inside folder '{GDRIVE_FOLDER_NAME}'.")
-
-    print(f"[INFO] Streaming '{GDRIVE_FILE_NAME}' into memory...")
-    request = service.files().get_media(fileId=file_id)
-    fh = io.BytesIO()
-    downloader = MediaIoBaseDownload(fh, request)
-    done = False
-    while not done:
-        _, done = downloader.next_chunk()
-
-    fh.seek(0)
-    df = pd.read_csv(fh)
-    print(f"[OK] Successfully loaded CSV ({len(df)} rows).")
-
-    # Filter columns to only those defined in the mapping
+    # Filter columns to only mapped definitions
     valid_cols = [c for c in column_mapping.keys() if c in df.columns]
     extracted_df = df[valid_cols].rename(columns=column_mapping)
 
@@ -246,7 +245,7 @@ def run_pipeline():
     cleaned_df = extracted_df.replace([np.inf, -np.inf], np.nan)
     cleaned_df = cleaned_df.astype(object).where(pd.notnull(cleaned_df), None)
 
-    # Convert DataFrame to a keyed dictionary: { "CODE": { ...fields... } }
+    # Convert DataFrame to a keyed dictionary: { "CODE": { ...record... } }
     keyed_records = cleaned_df.set_index("CODE", drop=False).to_dict(orient="index")
 
     print("[INFO] Uploading keyed dictionary to Firebase Realtime Database...")
@@ -254,7 +253,7 @@ def run_pipeline():
     ref = db.reference(FIREBASE_TARGET_NODE)
     ref.set(keyed_records)
 
-    # Update real-time sync telemetry
+    # Write status telemetry timestamp
     now_ist = datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S IST")
     db.reference("system_status/screener_sync").set({
         "last_updated": now_ist,
