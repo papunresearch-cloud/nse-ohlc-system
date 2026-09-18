@@ -1,3 +1,15 @@
+"""
+===============================================================================
+SCREENER BASE INGESTION (BASIC.py)
+===============================================================================
+* Downloads screener.csv from Google Drive using headless OAuth token authentication.
+* Eliminates browser pop-ups (InstalledAppFlow) to run reliably on Render.
+* Cleans and sanitizes columns, deriving the primary key 'CODE'.
+* Overwrites and saves data as a keyed dictionary directly under /SCREENER/<CODE>.
+* Publishes update telemetry to /system_status/screener_sync.
+===============================================================================
+"""
+
 import io
 import os
 import re
@@ -15,10 +27,10 @@ from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("NSE_OHLC_SYSTEM")
 
 # ==========================================
-# 1. CONFIGURATION
+# 1. CONFIGURATION & CONSTANTS
 # ==========================================
 SCOPES = ['https://www.googleapis.com/auth/drive.readonly', 'https://www.googleapis.com/auth/drive']
 
@@ -86,12 +98,13 @@ column_mapping = {
 }
 
 # ==========================================
-# 2. CLOUD-READY GOOGLE DRIVE HELPERS
+# 2. HEADLESS GOOGLE DRIVE CLIENT
 # ==========================================
 def get_drive_service():
     """
-    Authenticates and returns the Google Drive API service without blocking on headless cloud servers.
-    Reads token from local file or Render environment variables.
+    Authenticates and returns Google Drive API service.
+    Reads token from local token.json or Render's GDRIVE_TOKEN_JSON secret env var.
+    Never attempts to launch a local browser popup.
     """
     creds = None
 
@@ -107,56 +120,42 @@ def get_drive_service():
     if creds and creds.expired and creds.refresh_token:
         try:
             creds.refresh(Request())
-            # Save updated refreshed token back to disk if token.json exists
             if os.path.exists('token.json'):
                 with open('token.json', 'w') as token_file:
                     token_file.write(creds.to_json())
         except Exception as e:
-            logger.error(f"[GDRIVE] Failed refreshing access token: {e}")
+            logger.error(f"[GDRIVE] Token refresh error: {e}")
             creds = None
 
     if not creds or not creds.valid:
         raise RuntimeError(
             "[GDRIVE ERROR] Missing or invalid 'token.json'. "
-            "Add token.json to Render Secret Files or set GDRIVE_TOKEN_JSON in Environment Variables."
+            "Ensure token.json exists in Render Secret Files or GDRIVE_TOKEN_JSON is configured."
         )
 
     return build('drive', 'v3', credentials=creds)
 
-def get_folder_id(service, folder_name):
-    """Searches Drive for the folder; prints accessible folders if missing."""
+def get_folder_id(service, folder_name: str):
+    """Searches Drive for the parent folder."""
     query = f"name='{folder_name}' and mimeType='application/vnd.google-apps.folder' and trashed=false"
     results = service.files().list(q=query, spaces='drive', fields='files(id, name)').execute()
     folders = results.get('files', [])
-    
     if folders:
         return folders[0]['id']
-    
-    print(f"\n[INFO] Could not find folder '{folder_name}'. Listing accessible folders:")
-    all_folders = service.files().list(
-        q="mimeType='application/vnd.google-apps.folder' and trashed=false",
-        spaces='drive',
-        pageSize=30,
-        fields='files(id, name)'
-    ).execute().get('files', [])
-    
-    for f in all_folders:
-        print(f"  [Folder] {f['name']} (ID: {f['id']})")
-    print()
     return None
 
-def get_file_id(service, folder_id, file_name):
-    """Locates a file inside the parent folder."""
+def get_file_id(service, folder_id: str, file_name: str):
+    """Finds target file within specified folder."""
     query = f"name='{file_name}' and '{folder_id}' in parents and trashed=false"
     results = service.files().list(q=query, spaces='drive', fields='files(id, name)').execute()
     files = results.get('files', [])
     return files[0]['id'] if files else None
 
 # ==========================================
-# 3. FIREBASE SETUP & PRIMARY KEY DERIVATION
+# 3. FIREBASE SETUP & PRIMARY KEY HELPERS
 # ==========================================
 def init_firebase():
-    """Initializes Firebase Admin SDK for Realtime Database."""
+    """Initializes Firebase Admin SDK if not already active."""
     if not firebase_admin._apps:
         if os.path.exists(FIREBASE_KEY_FILE):
             cred = credentials.Certificate(FIREBASE_KEY_FILE)
@@ -164,24 +163,24 @@ def init_firebase():
             key_dict = json.loads(os.environ["FIREBASE_SERVICE_ACCOUNT_KEY"])
             cred = credentials.Certificate(key_dict)
         else:
-            raise FileNotFoundError("Firebase service account credentials not found.")
+            raise FileNotFoundError(f"Firebase credentials not found ({FIREBASE_KEY_FILE}).")
 
         firebase_admin.initialize_app(cred, {
             'databaseURL': FIREBASE_DB_URL
         })
 
 def sanitize_firebase_key(key: str) -> str:
-    """Strips forbidden Firebase Realtime Database characters: . $ # [ ] / and trims."""
+    """Strips invalid Firebase RTDB characters (. # $ / [ ]) and trims."""
     if not key:
         return ""
     return re.sub(r'[.#$\[\]/]', '', str(key)).strip().upper()
 
 def derive_primary_key(bse: str, nse: str, name: str) -> str:
     """
-    Selects primary identifier:
+    Derives primary key:
     1. NSE Code
-    2. BSE Code (fallback if NSE missing)
-    3. Name (fallback if both missing)
+    2. BSE Code (if NSE missing)
+    3. Name (fallback)
     """
     nse_clean = str(nse).strip() if pd.notna(nse) else ""
     bse_clean = str(bse).strip() if pd.notna(bse) else ""
@@ -197,7 +196,7 @@ def derive_primary_key(bse: str, nse: str, name: str) -> str:
     return sanitize_firebase_key(chosen)
 
 # ==========================================
-# 4. EXECUTION PIPELINE
+# 4. MAIN PIPELINE EXECUTION
 # ==========================================
 def run_pipeline():
     print("[INFO] Connecting to Google Drive...")
@@ -225,11 +224,11 @@ def run_pipeline():
     df = pd.read_csv(fh)
     print(f"[OK] Successfully loaded CSV ({len(df)} rows).")
 
-    # Column filtering & renaming
+    # Filter columns to only those defined in the mapping
     valid_cols = [c for c in column_mapping.keys() if c in df.columns]
     extracted_df = df[valid_cols].rename(columns=column_mapping)
 
-    # Derive Primary Key 'CODE'
+    # Resolve primary key CODE column
     bse_col = extracted_df["BSE"] if "BSE" in extracted_df.columns else [""] * len(extracted_df)
     nse_col = extracted_df["NSE"] if "NSE" in extracted_df.columns else [""] * len(extracted_df)
     name_col = extracted_df["Name"] if "Name" in extracted_df.columns else [""] * len(extracted_df)
@@ -239,15 +238,15 @@ def run_pipeline():
         for b, n, nm in zip(bse_col, nse_col, name_col)
     ]
 
-    # Purge empty keys and duplicates
+    # Remove invalid or duplicate codes
     extracted_df = extracted_df[extracted_df["CODE"] != ""].copy()
     extracted_df = extracted_df.drop_duplicates(subset=["CODE"], keep="first")
 
-    # Sanitize invalid float/NaN/inf values for JSON serialization
+    # Sanitize infinities and NaNs for JSON serialization
     cleaned_df = extracted_df.replace([np.inf, -np.inf], np.nan)
     cleaned_df = cleaned_df.astype(object).where(pd.notnull(cleaned_df), None)
 
-    # Convert DataFrame to a keyed dictionary: { "CODE": { ...stock record... } }
+    # Convert DataFrame to a keyed dictionary: { "CODE": { ...fields... } }
     keyed_records = cleaned_df.set_index("CODE", drop=False).to_dict(orient="index")
 
     print("[INFO] Uploading keyed dictionary to Firebase Realtime Database...")
@@ -255,7 +254,7 @@ def run_pipeline():
     ref = db.reference(FIREBASE_TARGET_NODE)
     ref.set(keyed_records)
 
-    # Write explicit timestamp status so updates are immediately verifiable
+    # Update real-time sync telemetry
     now_ist = datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S IST")
     db.reference("system_status/screener_sync").set({
         "last_updated": now_ist,
@@ -270,3 +269,4 @@ if __name__ == "__main__":
         run_pipeline()
     except Exception as e:
         print(f"[ERROR] Execution failed: {e}")
+        raise
