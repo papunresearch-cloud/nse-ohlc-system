@@ -74,7 +74,8 @@ column_mapping = {
     "Promoter holding": "PRH",
     "Change in promoter holding": "DPRH",
     "YOY Quarterly sales growth": "YSG",
-    "YOY Quarterly profit growth": "YPG"
+    "YOY Quarterly profit growth": "YPG",
+    "Last result date": "C-QTR"
 }
 
 # ==========================================
