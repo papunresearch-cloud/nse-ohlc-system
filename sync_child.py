@@ -1,13 +1,15 @@
 """
 CHILD-1: Historical Synchronization Engine.
-- Maintains historical records up to TARGET_OHLC_COUNT under keys '1' upwards.
+- Maintains up to TARGET_OHLC_COUNT historical records under keys '1' through 'N'.
+- Uses sanitized primary identifier (CODE) for Firebase Realtime Database compatibility.
 - Decouples historical verification from live-tracking permission.
-- Features an NSE Bhavcopy fallback bridge to immediately resolve Yahoo vendor lag.
-- Sanitizes NaN/Inf floating point prices for Firebase JSON compliance.
+- Features a 7-day NSE Bhavcopy fallback bridge to resolve Yahoo vendor lag.
+- Sanitizes NaN/Inf floating-point prices for Firebase JSON compliance.
 - Never mutates Index '0' (reserved exclusively for CHILD-2 live updates).
 """
 import io
 import math
+import re
 from datetime import datetime, date, timedelta
 import pandas as pd
 import pytz
@@ -20,7 +22,7 @@ from config import (
     TIMEZONE,
     logger
 )
-from firebase_manager import get_stock_ohlc, write_full_ohlc, sanitize_key
+from firebase_manager import get_stock_ohlc, write_full_ohlc
 from yahoo_manager import download_historical_daily
 from market_calendar import MarketCalendar
 
@@ -29,8 +31,14 @@ IST = pytz.timezone(TIMEZONE)
 NSE_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "en-US,en;q=0.9",
 }
+
+
+def sanitize_key(key: str) -> str:
+    """Removes or replaces forbidden Firebase RTDB path characters."""
+    if not key:
+        return ""
+    return re.sub(r'[.#$\[\]/]', '', str(key)).strip().upper()
 
 
 # =====================================================================
@@ -46,9 +54,7 @@ def fetch_nse_bhavcopy_candle(ticker: str, trade_date: date) -> dict | None:
     url = f"https://archives.nseindia.com/products/content/sec_bhavdata_full_{date_str}.csv"
 
     try:
-        session = requests.Session()
-        session.headers.update(NSE_HEADERS)
-        resp = session.get(url, timeout=12)
+        resp = requests.get(url, headers=NSE_HEADERS, timeout=12)
         if resp.status_code != 200:
             return None
 
@@ -76,7 +82,6 @@ def fetch_nse_bhavcopy_candle(ticker: str, trade_date: date) -> dict | None:
         except (ValueError, TypeError):
             volume_val = 0
 
-        # Strict candle logic validation
         if o <= 0 or h <= 0 or l <= 0 or c <= 0 or (h < l):
             return None
 
@@ -133,12 +138,15 @@ def patch_recent_vendor_lag(merged_records: list[dict], ticker: str, calendar: M
 
 def sync_historical_script(display_name: str, ticker: str, gap_trading_days: int = 0, calendar: MarketCalendar = None) -> tuple[bool, str]:
     """
-    Coordinates historical catch-up and returns live-readiness status:
-    - Returns (True, msg) if stock is safe for live updates (VERIFIED, RECOVERED, or VENDOR_LAG with valid baseline).
-    - Returns (False, msg) only if baseline is completely missing or structurally invalid.
+    Coordinates historical catch-up against /stocks/<CODE> and returns live-readiness status.
+    Uses sanitize_key to enforce clean CODE lookup and storage.
     """
     try:
-        safe_name = sanitize_key(display_name)
+        # Guarantee database target key is sanitized CODE
+        target_code = sanitize_key(display_name)
+        if not target_code:
+            return False, "Invalid empty stock code/name provided"
+
         if calendar is None:
             calendar = MarketCalendar()
 
@@ -146,7 +154,7 @@ def sync_historical_script(display_name: str, ticker: str, gap_trading_days: int
         expected_latest_date = _get_expected_latest_date(calendar, now_ist)
         expected_latest_str = expected_latest_date.strftime("%Y-%m-%d")
 
-        existing_ohlc = get_stock_ohlc(safe_name)
+        existing_ohlc = get_stock_ohlc(target_code)
         existing_records = _parse_firebase_historical_records(existing_ohlc)
 
         # 1. Inspect Current Firebase Baseline
@@ -177,7 +185,7 @@ def sync_historical_script(display_name: str, ticker: str, gap_trading_days: int
         else:
             if not is_empty_bootstrap:
                 logger.warning(
-                    f"[{display_name}] Vendor lagging (Got: {merged_records[0]['date'] if merged_records else 'None'}, "
+                    f"[{target_code}] Vendor lagging (Got: {merged_records[0]['date'] if merged_records else 'None'}, "
                     f"Expected: {expected_latest_str}). Retrying with 30-day fetch..."
                 )
                 df_deep = download_historical_daily(ticker, days_needed=30)
@@ -201,42 +209,40 @@ def sync_historical_script(display_name: str, ticker: str, gap_trading_days: int
 
             valid, err_msg = validate_historical_payload(indexed_db)
             if not valid:
-                logger.error(f"[{display_name}] Sanity validation rejected: {err_msg}. Firebase untouched.")
+                logger.error(f"[{target_code}] Sanity validation rejected: {err_msg}. Firebase untouched.")
                 return False, f"Validation Rejected: {err_msg}"
 
-            if write_full_ohlc(safe_name, indexed_db):
+            if write_full_ohlc(target_code, indexed_db):
                 return True, f"{sync_state}: {len(indexed_db)} bars committed (Index 1: {expected_latest_str})"
             return False, "Firebase write failed"
 
-        # 5. Handle VENDOR_LAG: Decouple Live Permission & Support Initial Bootstrap
+        # 5. Handle VENDOR_LAG
         valid_existing, _ = validate_historical_payload(
             {str(idx + HISTORICAL_START_INDEX): c for idx, c in enumerate(existing_records)}
         ) if existing_records else (False, "No records")
 
-        # Condition A: Preserved valid baseline exists in Firebase
         if valid_existing:
             stale_date = existing_records[0].get("date")
             logger.warning(
-                f"[{display_name}] VENDOR_LAG: Session {expected_latest_str} omitted. "
+                f"[{target_code}] VENDOR_LAG: Session {expected_latest_str} omitted. "
                 f"Firebase untouched (retaining baseline from {stale_date}). CHILD-2 live tracking permitted."
             )
             return True, f"VENDOR_LAG: Baseline preserved at {stale_date}; Live tracking allowed"
 
-        # Condition B: If Firebase is empty, seed with best available vendor records
         if is_empty_bootstrap and merged_records:
             final_candles = merged_records[:TARGET_OHLC_COUNT]
             indexed_db = {str(idx + HISTORICAL_START_INDEX): c for idx, c in enumerate(final_candles)}
             valid, err_msg = validate_historical_payload(indexed_db)
-            if valid and write_full_ohlc(safe_name, indexed_db):
+            if valid and write_full_ohlc(target_code, indexed_db):
                 seeded_date = indexed_db[str(HISTORICAL_START_INDEX)]["date"]
                 logger.warning(
-                    f"[{display_name}] VENDOR_LAG_BOOTSTRAP: Initial baseline seeded with {len(indexed_db)} bars "
+                    f"[{target_code}] VENDOR_LAG_BOOTSTRAP: Initial baseline seeded with {len(indexed_db)} bars "
                     f"(Latest available: {seeded_date}). CHILD-2 live tracking permitted."
                 )
                 return True, f"VENDOR_LAG: Bootstrapped at {seeded_date}; Live tracking allowed"
 
         msg = f"INITIAL_SYNC_FAILED: Missing {expected_latest_str} and no usable data returned."
-        logger.error(f"[{display_name}] {msg}. Firebase untouched.")
+        logger.error(f"[{target_code}] {msg}. Firebase untouched.")
         return False, msg
 
     except Exception as e:
@@ -249,7 +255,6 @@ def sync_historical_script(display_name: str, ticker: str, gap_trading_days: int
 # =====================================================================
 
 def _clean_price(val) -> float:
-    """Converts price to clean float, replacing NaN/Inf with 0.0."""
     try:
         f = float(val)
         return 0.0 if (math.isnan(f) or math.isinf(f)) else f
@@ -258,7 +263,6 @@ def _clean_price(val) -> float:
 
 
 def _get_expected_latest_date(calendar: MarketCalendar, now_ist: datetime) -> date:
-    """Calculates the date of the latest fully finalized market session."""
     today = now_ist.date()
     if calendar.is_trading_day(today):
         status, _ = calendar.get_market_status(now_ist)
@@ -269,14 +273,12 @@ def _get_expected_latest_date(calendar: MarketCalendar, now_ist: datetime) -> da
 
 
 def _audit_vendor_freshness(records: list[dict], expected_date_str: str) -> bool:
-    """Checks whether the newest record matches the expected completed date."""
     if not records:
         return False
     return records[0].get("date") == expected_date_str
 
 
 def _parse_firebase_historical_records(raw_data) -> list[dict]:
-    """Extracts only historical keys starting at HISTORICAL_START_INDEX up to TARGET_OHLC_COUNT, discarding '0'."""
     if not raw_data or not isinstance(raw_data, dict):
         return []
     records = []
@@ -288,7 +290,6 @@ def _parse_firebase_historical_records(raw_data) -> list[dict]:
 
 
 def _merge_and_sort_records(existing_records: list[dict], df: pd.DataFrame, calendar: MarketCalendar, now_ist: datetime) -> list[dict]:
-    """Combines existing records with downloaded dataframe, deduplicating strictly by date."""
     date_map = {}
     for r in existing_records:
         d = r.get("date")
@@ -334,7 +335,6 @@ def _merge_and_sort_records(existing_records: list[dict], df: pd.DataFrame, cale
                 "volume": volume_val
             }
 
-    # Exclude ongoing session from historical series during active market hours
     today_date = now_ist.date()
     if calendar.is_trading_day(today_date):
         status, _ = calendar.get_market_status(now_ist)
@@ -348,7 +348,6 @@ def _merge_and_sort_records(existing_records: list[dict], df: pd.DataFrame, cale
 
 
 def validate_historical_payload(payload: dict[str, dict]) -> tuple[bool, str]:
-    """Validates sequential keys starting at HISTORICAL_START_INDEX, price integrity, and descending dates."""
     count = len(payload)
     if count == 0:
         return False, "Historical payload is completely empty"

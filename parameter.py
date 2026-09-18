@@ -2,21 +2,37 @@
 PARAMETER CALCULATION MODULE (parameter.py)
 Fully autonomous calculation engine:
 1. Discovers every active stock from /watchlist, /display_list, /stocks, and fixed indices.
-2. Calculates RSI, 10MA, 25MA, 50MA, 200MA, 52W Extremes, Periodic Returns, and 3yr from SCREENER.
-3. Multi-writes to /param across raw, sanitized, and symbol aliases so frontend fetches never miss.
+2. Prioritizes primary identifier 'CODE' to eliminate dot/underscore mismatch bugs.
+3. Calculates RSI, 10MA, 25MA, 50MA, 200MA, 52W Extremes, Periodic Returns, and 3yr from SCREENER.
+4. Multi-writes to /param across CODE, raw, and sanitized symbol aliases so frontend fetches never miss.
 """
 
 import math
+import re
 from datetime import datetime
 import pytz
 from typing import Any, Dict, List, Optional, Set, Tuple
 from firebase_admin import db
 from config import logger, TIMEZONE
-from firebase_manager import sanitize_key, FIXED_INDICES
 
 IST = pytz.timezone(TIMEZONE)
 
+FIXED_INDICES = {
+    "NIFTY 50": "^NSEI",
+    "NIFTY 500": "^CRSLDX",
+    "NIFTY 100": "^CNX100",
+    "NIFTY MIDCAP 150": "NIFTYMIDCAP150.NS",
+    "NIFTY SMALLCAP 250": "NIFTYSMLCAP250.NS"
+}
+
 _SCREENER_CACHE: Optional[Dict[str, Any]] = None
+
+
+def sanitize_key(key: Any) -> str:
+    """Removes or replaces forbidden Firebase Realtime Database path characters."""
+    if not key:
+        return ""
+    return re.sub(r'[.#$\[\]/]', '', str(key)).strip().upper()
 
 
 def safe_round(val: Any, decimals: int = 2) -> Any:
@@ -56,7 +72,7 @@ def parse_price(candle: Optional[Dict[str, Any]], field: str) -> Optional[float]
 
 
 def get_screener_map() -> Dict[str, Any]:
-    """Caches /SCREENER array to map records by Name, NSE, BSE, and CODE."""
+    """Caches /SCREENER table indexed by CODE, Name, NSE, and BSE."""
     global _SCREENER_CACHE
     if _SCREENER_CACHE is not None:
         return _SCREENER_CACHE
@@ -73,15 +89,17 @@ def get_screener_map() -> Dict[str, Any]:
 
         for rec in records:
             keys_to_index = [
-                rec.get("Name"),
+                rec.get("CODE"),
                 rec.get("NSE"),
                 rec.get("BSE"),
-                rec.get("CODE")
+                rec.get("Name")
             ]
             for k in keys_to_index:
                 if k:
-                    k_str = str(k).strip().upper()
+                    k_str = str(k).strip()
+                    k_upper = k_str.upper()
                     screener_map[k_str] = rec
+                    screener_map[k_upper] = rec
                     screener_map[sanitize_key(k_str)] = rec
 
         _SCREENER_CACHE = screener_map
@@ -93,7 +111,7 @@ def get_screener_map() -> Dict[str, Any]:
 
 
 def fetch_detailed_metrics(aliases: List[str]) -> Dict[str, Any]:
-    """Fetches static 3yr metric primarily from /SCREENER with fallback to detailedDb."""
+    """Fetches static 3yr metric from /SCREENER or fallback to detailedDb."""
     screener_map = get_screener_map()
     ret_3yr = None
 
@@ -109,11 +127,12 @@ def fetch_detailed_metrics(aliases: List[str]) -> Dict[str, Any]:
 
     if ret_3yr is None:
         for alias in aliases:
+            clean_alias = sanitize_key(alias)
             data = (
-                db.reference(f"watchlist/detailedDb/{alias}").get()
+                db.reference(f"watchlist/detailedDb/{clean_alias}").get()
+                or db.reference(f"watchlist/detailedDb/{alias}").get()
+                or db.reference(f"detailedDb/{clean_alias}").get()
                 or db.reference(f"detailedDb/{alias}").get()
-                or db.reference(f"watchlist/detailedDb/{sanitize_key(alias)}").get()
-                or db.reference(f"detailedDb/{sanitize_key(alias)}").get()
             )
             if isinstance(data, dict):
                 val = data.get("3yr") or data.get("3YR") or data.get("3Yr")
@@ -125,11 +144,17 @@ def fetch_detailed_metrics(aliases: List[str]) -> Dict[str, Any]:
 
 
 def fetch_candles_for_aliases(aliases: List[str]) -> Tuple[List[Dict[str, Any]], Optional[str]]:
-    """Tries all alias variations to find candles in /stocks."""
+    """Tries primary CODE and alias variations to find candles in /stocks."""
+    checked: Set[str] = set()
     for key in aliases:
         if not key:
             continue
-        for candidate in [key, sanitize_key(key)]:
+        candidates = [key, sanitize_key(key)]
+        for candidate in candidates:
+            if not candidate or candidate in checked:
+                continue
+            checked.add(candidate)
+
             stock_data = db.reference(f"stocks/{candidate}").get()
             if not stock_data:
                 continue
@@ -194,10 +219,10 @@ def process_target_group(aliases: List[str]) -> bool:
         return False
 
     candles, found_source_key = fetch_candles_for_aliases(clean_aliases)
-    primary_name = clean_aliases[0]
+    primary_code = clean_aliases[0]
 
     if not candles:
-        logger.warning(f"[{primary_name}] Skipped: No candle history found in /stocks under {clean_aliases}")
+        logger.warning(f"[{primary_code}] Skipped: No candle history found in /stocks under {clean_aliases}")
         return False
 
     c_0 = candles[0] if len(candles) > 0 else None
@@ -262,7 +287,8 @@ def process_target_group(aliases: List[str]) -> bool:
     current_date_str = str(c_0.get("date", now_ist.strftime("%Y-%m-%d"))) if c_0 else now_ist.strftime("%Y-%m-%d")
 
     payload = {
-        # Old File Keys (Stock_window.jsx and Index_window.jsx primary)
+        # Standard Keys (Stock_window.jsx and Index_window.jsx primary)
+        "CODE": primary_code,
         "date": current_date_str,
         "RSI": rsi,
         "10ma": ma10,
@@ -282,7 +308,7 @@ def process_target_group(aliases: List[str]) -> bool:
         "updated_at": f"{current_date_str} {current_time_str}",
 
         # Uppercase Schema Aliases
-        "Name": primary_name,
+        "Name": primary_code,
         "CMP": close_0 if close_0 is not None else "N/A",
         "PREV_CLOSE": c_1 if c_1 is not None else "N/A",
         "Tdy-%chng": chng_2dy,
@@ -302,60 +328,47 @@ def process_target_group(aliases: List[str]) -> bool:
         "TIME": current_time_str
     }
 
-    # 1. Mirror payload across all alias keys in /param
+    # 1. Mirror payload across all valid alias keys in /param
     write_keys: Set[str] = set()
     for a in clean_aliases:
-        write_keys.add(a)
         write_keys.add(sanitize_key(a))
+        # Keep original alias only if it contains no forbidden characters
+        if not re.search(r'[.#$\[\]/]', a):
+            write_keys.add(a.strip())
 
     for wkey in write_keys:
-        try:
-            db.reference(f"param/{wkey}").set(payload)
-        except Exception:
-            pass
+        if wkey:
+            try:
+                db.reference(f"param/{wkey}").set(payload)
+            except Exception as e:
+                logger.debug(f"[PARAM] Failed to mirror /param/{wkey}: {e}")
 
     # 2. Mirror indices if applicable
     for a in clean_aliases:
         if a in FIXED_INDICES:
             try:
-                db.reference(f"indices/{a}").set(payload)
                 db.reference(f"indices/{sanitize_key(a)}").set(payload)
             except Exception:
                 pass
 
-    # 3. Ensure live /stocks nodes exist for every alias so c0/c1 fetches resolve
-    for alias in clean_aliases:
-        if alias != found_source_key:
-            try:
-                if c_0:
-                    ref_idx0 = db.reference(f"stocks/{alias}/0")
-                    if not ref_idx0.get():
-                        ref_idx0.set(c_0)
-                if c_1_candle:
-                    ref_idx1 = db.reference(f"stocks/{alias}/1")
-                    if not ref_idx1.get():
-                        ref_idx1.set(c_1_candle)
-            except Exception:
-                pass
-
-    logger.info(f"[{primary_name}] Successfully updated /param across: {list(write_keys)}")
+    logger.info(f"[{primary_code}] Successfully updated /param across: {list(write_keys)}")
     return True
 
 
 def discover_all_system_targets() -> List[List[str]]:
-    """Discovers every target group across /stocks, /watchlist, /display_list, and FIXED_INDICES."""
+    """Discovers every target group across /stocklist, /watchlist, /display_list, and FIXED_INDICES."""
     targets: List[List[str]] = []
 
     # 1. Fixed market indices
     for idx_name, idx_ticker in FIXED_INDICES.items():
         targets.append([idx_name, idx_ticker, sanitize_key(idx_name), sanitize_key(idx_ticker)])
 
-    # 2. All stocks currently populated under /stocks
+    # 2. Stocklist node (Primary mapping { CODE: TICKER })
     try:
-        stocks_root = db.reference("stocks").shallow().get() or {}
-        if isinstance(stocks_root, dict):
-            for stock_k in stocks_root.keys():
-                targets.append([stock_k, sanitize_key(stock_k)])
+        sl = db.reference("stocklist").get() or {}
+        if isinstance(sl, dict):
+            for s_code, s_ticker in sl.items():
+                targets.append([str(s_code).strip(), str(s_ticker).strip(), sanitize_key(s_code)])
     except Exception:
         pass
 
@@ -365,22 +378,23 @@ def discover_all_system_targets() -> List[List[str]]:
         if isinstance(det_db, dict):
             for k, info in det_db.items():
                 if isinstance(info, dict):
-                    aliases = [k, info.get("Name"), info.get("TICKER"), info.get("NSE"), info.get("CODE")]
+                    aliases = [info.get("CODE"), k, info.get("Name"), info.get("TICKER"), info.get("NSE")]
                     targets.append([str(a).strip() for a in aliases if a])
                 else:
                     targets.append([str(k).strip()])
     except Exception:
         pass
 
-    # 4. Watchlist array
+    # 4. Watchlist array (Codes)
     try:
         raw_wl = db.reference("watchlist/watchlist").get() or db.reference("watchlist").get()
         if isinstance(raw_wl, list):
             for item in raw_wl:
                 if isinstance(item, str):
-                    targets.append([item.strip(), f"{item.strip()}.NS"])
+                    clean_c = sanitize_key(item)
+                    targets.append([clean_c, item.strip(), f"{clean_c}.NS"])
                 elif isinstance(item, dict):
-                    aliases = [item.get("Name"), item.get("TICKER"), item.get("NSE")]
+                    aliases = [item.get("CODE"), item.get("Name"), item.get("TICKER")]
                     targets.append([str(a).strip() for a in aliases if a])
     except Exception:
         pass
@@ -392,19 +406,19 @@ def discover_all_system_targets() -> List[List[str]]:
         if isinstance(stk_list, list):
             for s in stk_list:
                 if isinstance(s, str):
-                    targets.append([s.strip()])
+                    targets.append([sanitize_key(s), s.strip()])
                 elif isinstance(s, dict):
-                    aliases = [s.get("Name"), s.get("ticker"), s.get("TICKER")]
+                    aliases = [s.get("CODE"), s.get("Name"), s.get("ticker"), s.get("TICKER")]
                     targets.append([str(a).strip() for a in aliases if a])
     except Exception:
         pass
 
-    # 6. Existing /stocklist
+    # 6. Existing populated /stocks nodes
     try:
-        sl = db.reference("stocklist").get() or {}
-        if isinstance(sl, dict):
-            for s_name, s_ticker in sl.items():
-                targets.append([str(s_name).strip(), str(s_ticker).strip()])
+        stocks_root = db.reference("stocks").shallow().get() or {}
+        if isinstance(stocks_root, dict):
+            for stock_k in stocks_root.keys():
+                targets.append([sanitize_key(stock_k), stock_k])
     except Exception:
         pass
 
@@ -424,11 +438,18 @@ def discover_all_system_targets() -> List[List[str]]:
         else:
             merged.append(grp_set)
 
-    return [list(s) for s in merged]
+    # Sort each group so the cleanest sanitized uppercase CODE is placed first
+    result_groups: List[List[str]] = []
+    for s in merged:
+        items = list(s)
+        items.sort(key=lambda x: ('.' in x, '_' in x, len(x)))
+        result_groups.append(items)
+
+    return result_groups
 
 
 def update_all_parameters(scripts: Optional[List[str]] = None) -> None:
-    """Executes parameters cycle across all discovered system assets."""
+    """Executes parameters calculation across all discovered assets."""
     global _SCREENER_CACHE
     _SCREENER_CACHE = None
     get_screener_map()
@@ -449,7 +470,8 @@ def update_all_parameters(scripts: Optional[List[str]] = None) -> None:
 
 def calculate_single_script_parameters(script: str) -> bool:
     try:
-        return process_target_group([script, sanitize_key(script)])
+        clean_code = sanitize_key(script)
+        return process_target_group([clean_code, script])
     except Exception as e:
         logger.error(f"[PARAM] Error on single script {script}: {e}")
         return False
