@@ -5,7 +5,7 @@ MASTER ORCHESTRATOR (Primary Key Architecture: CODE)
 * Coordinates live OHLC backfills, indicators, and HTTP control signals.
 * Keyed exclusively by stock CODE across /stocks/<CODE> and /param/<CODE>.
 * Listens to /system_commands/stock_event dispatched from Watchlist.jsx.
-* Embeds HTTP server on port 10000 with CORS, HEAD support, and /sync-screener ETL integration.
+* Embeds HTTP server on port 10000 with CORS, HEAD, GET, and POST support.
 * Maintains real-time Firebase /system_status heartbeat telemetry every 300s.
 """
 
@@ -92,7 +92,10 @@ except ImportError:
     try:
         from BASIC import run_pipeline as run_screener_pipeline
     except ImportError:
-        run_screener_pipeline = None
+        try:
+            from basic import run_pipeline as run_screener_pipeline
+        except ImportError:
+            run_screener_pipeline = None
 
 IST = pytz.timezone(TIMEZONE)
 _keep_running = True
@@ -142,8 +145,31 @@ class SystemStateBus:
 
 STATE_BUS = SystemStateBus()
 
+def dispatch_screener_sync_job():
+    """Runs screener ETL in a background daemon thread."""
+    if not run_screener_pipeline:
+        logger.error("[SCREENER] Cannot run pipeline: ETL runner not loaded.")
+        return False, "RUN_PIPELINE module not available"
+
+    if not _screener_lock.acquire(blocking=False):
+        logger.warning("[SCREENER] Pipeline sync already in progress.")
+        return False, "Screener pipeline sync already in progress"
+
+    def worker():
+        try:
+            logger.info("[SCREENER] Starting Google Drive -> Firebase ETL...")
+            run_screener_pipeline()
+            logger.info("[SCREENER] Screener ETL completed successfully.")
+        except Exception as ex:
+            logger.error(f"[SCREENER] Error in pipeline: {ex}", exc_info=True)
+        finally:
+            _screener_lock.release()
+
+    threading.Thread(target=worker, daemon=True).start()
+    return True, "Screener ETL pipeline triggered in background"
+
 # =====================================================================
-# HTTP REQUEST HANDLER
+# HTTP REQUEST HANDLER (Supports GET, POST, HEAD, OPTIONS)
 # =====================================================================
 class HealthAndControlHandler(BaseHTTPRequestHandler):
     def _send_cors_headers(self):
@@ -151,13 +177,22 @@ class HealthAndControlHandler(BaseHTTPRequestHandler):
         self.send_header("Access-Control-Allow-Methods", "GET, POST, HEAD, OPTIONS")
         self.send_header("Access-Control-Allow-Headers", "*")
 
+    def _send_json_response(self, code: int, data: dict):
+        payload = json.dumps(data).encode("utf-8")
+        self.send_response(code)
+        self._send_cors_headers()
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
     def do_OPTIONS(self):
         self.send_response(200)
         self._send_cors_headers()
         self.end_headers()
 
     def do_HEAD(self):
-        """Responds 200 OK to keepalive/uptime pings from Cron-Job.org and external bots."""
+        """Responds 200 OK to uptime monitoring bots."""
         self.send_response(200)
         self._send_cors_headers()
         self.send_header("Content-Type", "application/json")
@@ -165,80 +200,81 @@ class HealthAndControlHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         parsed = urlparse(self.path)
-        path = parsed.path.lower()
+        path = parsed.path.lower().rstrip("/")
+        if not path:
+            path = "/"
 
         if path in ["/", "/health", "/ping"]:
-            self.send_response(200)
-            self._send_cors_headers()
-            self.send_header("Content-Type", "application/json")
-            self.end_headers()
             status = {
                 "status": "RUNNING" if STATE_BUS.is_power_on() else "IDLE",
                 "timestamp": datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S IST")
             }
-            self.wfile.write(json.dumps(status).encode("utf-8"))
+            self._send_json_response(200, status)
+
+        elif path in ["/sync", "/api/sync"]:
+            STATE_BUS.trigger_pulse("SYNC")
+            self._send_json_response(200, {"status": "ok", "message": "Historical sync pulse triggered"})
+
+        elif path in ["/sync-screener", "/run-pipeline", "/api/sync-screener"]:
+            started, msg = dispatch_screener_sync_job()
+            code = 200 if started else 409
+            self._send_json_response(code, {"message": msg})
+
+        elif path in ["/start", "/api/start"]:
+            STATE_BUS.trigger_pulse("START")
+            self._send_json_response(200, {"message": "Master engine started"})
+
+        elif path in ["/stop", "/api/stop"]:
+            STATE_BUS.trigger_pulse("STOP")
+            self._send_json_response(200, {"message": "Master engine paused"})
+
         elif path in ["/calc-param", "/api/calc-param"]:
             if update_all_parameters:
                 stock_map = get_stocklist_mapping(force_reconcile=True)
                 threading.Thread(target=update_all_parameters, args=(list(stock_map.keys()),), daemon=True).start()
-                msg = {"status": "started", "message": "Manual parameter calculation started."}
+                self._send_json_response(200, {"status": "started", "message": "Manual parameter calculation started."})
             else:
-                msg = {"error": "parameter module not loaded"}
-            self.send_response(200)
-            self._send_cors_headers()
-            self.send_header("Content-Type", "application/json")
-            self.end_headers()
-            self.wfile.write(json.dumps(msg).encode("utf-8"))
+                self._send_json_response(500, {"error": "parameter module not loaded"})
+
         else:
-            self.send_response(404)
-            self._send_cors_headers()
-            self.end_headers()
+            self._send_json_response(404, {"error": f"Endpoint '{path}' not found"})
 
     def do_POST(self):
         parsed = urlparse(self.path)
-        path = parsed.path.lower()
+        path = parsed.path.lower().rstrip("/")
+        if not path:
+            path = "/"
 
         if path in ["/start", "/api/start"]:
             STATE_BUS.trigger_pulse("START")
-            msg = {"message": "Master engine started"}
+            self._send_json_response(200, {"message": "Master engine started"})
+
         elif path in ["/stop", "/api/stop"]:
             STATE_BUS.trigger_pulse("STOP")
-            msg = {"message": "Master engine paused"}
+            self._send_json_response(200, {"message": "Master engine paused"})
+
         elif path in ["/sync", "/api/sync"]:
             STATE_BUS.trigger_pulse("SYNC")
-            msg = {"message": "Sync pulse triggered"}
-        elif path in ["/sync-screener", "/run-pipeline", "/api/sync-screener"]:
-            if run_screener_pipeline:
-                def run_screener_worker():
-                    if _screener_lock.acquire(blocking=False):
-                        try:
-                            logger.info("[SCREENER] Starting Google Drive -> Firebase ETL...")
-                            run_screener_pipeline()
-                            logger.info("[SCREENER] Screener ETL completed successfully.")
-                        except Exception as ex:
-                            logger.error(f"[SCREENER] Error in pipeline: {ex}", exc_info=True)
-                        finally:
-                            _screener_lock.release()
-                    else:
-                        logger.warning("[SCREENER] Pipeline sync already in progress.")
-                threading.Thread(target=run_screener_worker, daemon=True).start()
-                msg = {"message": "Screener ETL pipeline triggered in background"}
-            else:
-                msg = {"error": "RUN_PIPELINE module not available"}
-        else:
-            self.send_response(404)
-            self._send_cors_headers()
-            self.end_headers()
-            return
+            self._send_json_response(200, {"status": "ok", "message": "Historical sync pulse triggered"})
 
-        self.send_response(200)
-        self._send_cors_headers()
-        self.send_header("Content-Type", "application/json")
-        self.end_headers()
-        self.wfile.write(json.dumps(msg).encode("utf-8"))
+        elif path in ["/sync-screener", "/run-pipeline", "/api/sync-screener"]:
+            started, msg = dispatch_screener_sync_job()
+            code = 200 if started else 409
+            self._send_json_response(code, {"message": msg})
+
+        elif path in ["/calc-param", "/api/calc-param"]:
+            if update_all_parameters:
+                stock_map = get_stocklist_mapping(force_reconcile=True)
+                threading.Thread(target=update_all_parameters, args=(list(stock_map.keys()),), daemon=True).start()
+                self._send_json_response(200, {"status": "started", "message": "Manual parameter calculation started."})
+            else:
+                self._send_json_response(500, {"error": "parameter module not loaded"})
+
+        else:
+            self._send_json_response(404, {"error": f"Endpoint '{path}' not found"})
 
     def log_message(self, format, *args):
-        return
+        logger.info(f"[HTTP] {self.command} {self.path} - {format % args}")
 
 def start_http_listener(port=10000):
     port = int(os.environ.get("PORT", port))
