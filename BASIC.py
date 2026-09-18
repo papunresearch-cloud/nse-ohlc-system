@@ -1,13 +1,12 @@
 """
 ===============================================================================
-SCREENER BASE INGESTION (BASIC.py) - DIRECT REST STREAMING (OPTION 2)
+SCREENER BASE INGESTION (BASIC.py) - DIRECT PUBLIC LINK STREAMING
 ===============================================================================
-* Downloads screener.csv directly via Google Drive v3 REST API using requests.
-* Completely eliminates googleapiclient and google-auth-oauthlib dependencies.
-* Parses CSV into memory (io.BytesIO) and cleans columns.
-* Derives the primary key 'CODE' (NSE > BSE > Name fallback).
-* Overwrites and saves data as a keyed dictionary under /SCREENER/<CODE>.
-* Writes completion telemetry to /system_status/screener_sync.
+* Downloads screener.csv directly from Google Drive using a public share link.
+* Completely eliminates OAuth tokens, browser logins, and googleapiclient.
+* Derives primary key 'CODE' (NSE > BSE > Name fallback).
+* Cleans, sanitizes, and writes directly to Firebase Realtime Database at /SCREENER.
+* Updates /system_status/screener_sync with success timestamp.
 ===============================================================================
 """
 
@@ -15,7 +14,6 @@ import io
 import os
 import re
 import json
-import logging
 from datetime import datetime
 import pytz
 import requests
@@ -24,25 +22,20 @@ import pandas as pd
 
 import firebase_admin
 from firebase_admin import credentials, db
-from google.auth.transport.requests import Request
-from google.oauth2.credentials import Credentials
 
-logger = logging.getLogger("NSE_OHLC_SYSTEM")
+# =====================================================================
+# 1. PASTE YOUR GOOGLE DRIVE LINK HERE
+# =====================================================================
+GDRIVE_SHARE_LINK = "https://drive.google.com/file/d/1hveFXGaHo-eMlQxDcYhanVAQFzHgaXtQ/view?usp=sharing"
 
-# ==========================================
-# 1. CONFIGURATION & CONSTANTS
-# ==========================================
-SCOPES = ['https://www.googleapis.com/auth/drive.readonly', 'https://www.googleapis.com/auth/drive']
-
-GDRIVE_FOLDER_NAME = "SCREENER"
-GDRIVE_FILE_NAME = "screener.csv"
-
+# Firebase Realtime Database Config
 FIREBASE_TARGET_NODE = "SCREENER"
 FIREBASE_KEY_FILE = "serviceAccountKey.json"
 FIREBASE_DB_URL = "https://stock-dashboard-5c25c-default-rtdb.asia-southeast1.firebasedatabase.app"
 TIMEZONE = "Asia/Kolkata"
 IST = pytz.timezone(TIMEZONE)
 
+# Column mapping from screener.csv to database keys
 column_mapping = {
     "Name": "Name",
     "BSE Code": "BSE", 
@@ -97,83 +90,39 @@ column_mapping = {
     "YOY Quarterly profit growth": "YPG"
 }
 
-# ==========================================
-# 2. REST-BASED GOOGLE DRIVE STREAMER
-# ==========================================
-def get_drive_access_token() -> str:
-    """
-    Acquires and refreshes Google OAuth2 access token without
-    relying on local browser popups or googleapiclient.
-    """
-    creds = None
+# =====================================================================
+# 2. HELPER FUNCTIONS
+# =====================================================================
+def extract_file_id(link_or_id: str) -> str:
+    """Extracts the 33-character Google Drive ID from any shared URL."""
+    link_or_id = link_or_id.strip()
+    match = re.search(r'[-\w]{25,}', link_or_id)
+    if match:
+        return match.group(0)
+    return link_or_id
 
-    if os.path.exists('token.json'):
-        creds = Credentials.from_authorized_user_file('token.json', SCOPES)
-    elif os.environ.get('GDRIVE_TOKEN_JSON'):
-        try:
-            token_info = json.loads(os.environ['GDRIVE_TOKEN_JSON'])
-            creds = Credentials.from_authorized_user_info(token_info, SCOPES)
-        except Exception as e:
-            logger.error(f"[GDRIVE] Error parsing GDRIVE_TOKEN_JSON env: {e}")
+def download_csv_from_drive(file_id: str) -> pd.DataFrame:
+    """Streams the CSV into memory using standard HTTP without authentication."""
+    download_url = f"https://drive.google.com/uc?export=download&id={file_id}"
+    session = requests.Session()
+    
+    response = session.get(download_url, stream=True)
+    
+    # Handle Google Drive large-file virus scan confirmation if prompted
+    for key, value in response.cookies.items():
+        if key.startswith('download_warning'):
+            confirm_url = f"{download_url}&confirm={value}"
+            response = session.get(confirm_url, stream=True)
+            break
 
-    if creds and creds.expired and creds.refresh_token:
-        try:
-            creds.refresh(Request())
-            if os.path.exists('token.json'):
-                with open('token.json', 'w') as f:
-                    f.write(creds.to_json())
-        except Exception as e:
-            logger.error(f"[GDRIVE] Token refresh error: {e}")
-            creds = None
-
-    if not creds or not creds.valid:
+    if response.status_code != 200:
         raise RuntimeError(
-            "[GDRIVE ERROR] Missing or invalid 'token.json'. "
-            "Please ensure token.json is configured in Render Secret Files or GDRIVE_TOKEN_JSON."
+            f"Failed to download file from Google Drive (HTTP {response.status_code}). "
+            "Please ensure the file sharing setting is set to 'Anyone with the link can view'."
         )
 
-    return creds.token
+    return pd.read_csv(io.BytesIO(response.content))
 
-def download_screener_dataframe() -> pd.DataFrame:
-    """
-    Directly queries Google Drive v3 REST API via requests
-    and loads the CSV content straight into a pandas DataFrame.
-    """
-    access_token = get_drive_access_token()
-    headers = {"Authorization": f"Bearer {access_token}"}
-
-    # 1. Search for parent folder
-    folder_query = f"name='{GDRIVE_FOLDER_NAME}' and mimeType='application/vnd.google-apps.folder' and trashed=false"
-    folder_url = f"https://www.googleapis.com/drive/v3/files?q={folder_query}"
-    res_folder = requests.get(folder_url, headers=headers)
-    res_folder.raise_for_status()
-    folders = res_folder.json().get('files', [])
-
-    if not folders:
-        raise FileNotFoundError(f"Folder '{GDRIVE_FOLDER_NAME}' was not found in Google Drive.")
-    folder_id = folders[0]['id']
-
-    # 2. Search for screener.csv within the folder
-    file_query = f"name='{GDRIVE_FILE_NAME}' and '{folder_id}' in parents and trashed=false"
-    file_url = f"https://www.googleapis.com/drive/v3/files?q={file_query}"
-    res_file = requests.get(file_url, headers=headers)
-    res_file.raise_for_status()
-    files = res_file.json().get('files', [])
-
-    if not files:
-        raise FileNotFoundError(f"File '{GDRIVE_FILE_NAME}' not found inside folder '{GDRIVE_FOLDER_NAME}'.")
-    file_id = files[0]['id']
-
-    # 3. Stream binary CSV media
-    media_url = f"https://www.googleapis.com/drive/v3/files/{file_id}?alt=media"
-    res_media = requests.get(media_url, headers=headers)
-    res_media.raise_for_status()
-
-    return pd.read_csv(io.BytesIO(res_media.content))
-
-# ==========================================
-# 3. FIREBASE SETUP & PRIMARY KEY HELPERS
-# ==========================================
 def init_firebase():
     """Initializes Firebase Admin SDK if not already active."""
     if not firebase_admin._apps:
@@ -183,25 +132,20 @@ def init_firebase():
             key_dict = json.loads(os.environ["FIREBASE_SERVICE_ACCOUNT_KEY"])
             cred = credentials.Certificate(key_dict)
         else:
-            raise FileNotFoundError(f"Firebase credentials not found ({FIREBASE_KEY_FILE}).")
+            raise FileNotFoundError(f"Firebase credentials not found ({FIREBASE_KEY_FILE})")
 
         firebase_admin.initialize_app(cred, {
             'databaseURL': FIREBASE_DB_URL
         })
 
 def sanitize_firebase_key(key: str) -> str:
-    """Strips invalid Firebase RTDB characters (. # $ / [ ]) and trims."""
+    """Strips forbidden Firebase Realtime Database characters."""
     if not key:
         return ""
     return re.sub(r'[.#$\[\]/]', '', str(key)).strip().upper()
 
 def derive_primary_key(bse: str, nse: str, name: str) -> str:
-    """
-    Derives primary key:
-    1. NSE Code
-    2. BSE Code (if NSE missing)
-    3. Name (fallback)
-    """
+    """Derives primary key: 1. NSE Code, 2. BSE Code, 3. Name."""
     nse_clean = str(nse).strip() if pd.notna(nse) else ""
     bse_clean = str(bse).strip() if pd.notna(bse) else ""
     name_clean = str(name).strip() if pd.notna(name) else ""
@@ -215,15 +159,19 @@ def derive_primary_key(bse: str, nse: str, name: str) -> str:
 
     return sanitize_firebase_key(chosen)
 
-# ==========================================
-# 4. MAIN PIPELINE EXECUTION
-# ==========================================
+# =====================================================================
+# 3. PIPELINE RUNNER
+# =====================================================================
 def run_pipeline():
-    print("[INFO] Fetching screener.csv from Google Drive via REST API...")
-    df = download_screener_dataframe()
-    print(f"[OK] Successfully downloaded and parsed CSV ({len(df)} rows).")
+    file_id = extract_file_id(GDRIVE_SHARE_LINK)
+    if not file_id or "PASTE_YOUR" in file_id:
+        raise ValueError("Please paste your valid Google Drive link in GDRIVE_SHARE_LINK.")
 
-    # Filter columns to only mapped definitions
+    print(f"[INFO] Downloading screener.csv directly via Google Drive link (ID: {file_id})...")
+    df = download_csv_from_drive(file_id)
+    print(f"[OK] Successfully loaded CSV ({len(df)} rows).")
+
+    # Column filtering & renaming
     valid_cols = [c for c in column_mapping.keys() if c in df.columns]
     extracted_df = df[valid_cols].rename(columns=column_mapping)
 
@@ -237,7 +185,7 @@ def run_pipeline():
         for b, n, nm in zip(bse_col, nse_col, name_col)
     ]
 
-    # Remove invalid or duplicate codes
+    # Remove empty or duplicate keys
     extracted_df = extracted_df[extracted_df["CODE"] != ""].copy()
     extracted_df = extracted_df.drop_duplicates(subset=["CODE"], keep="first")
 
