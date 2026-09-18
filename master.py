@@ -5,7 +5,8 @@ MASTER ORCHESTRATOR (Primary Key Architecture: CODE)
 * Coordinates live OHLC backfills, indicators, and HTTP control signals.
 * Keyed exclusively by stock CODE across /stocks/<CODE> and /param/<CODE>.
 * Listens to /system_commands/stock_event dispatched from Watchlist.jsx.
-* Embeds HTTP server on port 10000 with CORS and /sync-screener ETL integration.
+* Embeds HTTP server on port 10000 with CORS, HEAD support, and /sync-screener ETL integration.
+* Maintains real-time Firebase /system_status heartbeat telemetry every 300s.
 """
 
 import os
@@ -23,7 +24,7 @@ import pytz
 # Add project root to path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-# 1. Config imports (FIXED_INDICES is defined locally below to prevent crash)
+# 1. Config imports
 from config import (
     TIMEZONE,
     PATH_STOCKS,
@@ -147,12 +148,19 @@ STATE_BUS = SystemStateBus()
 class HealthAndControlHandler(BaseHTTPRequestHandler):
     def _send_cors_headers(self):
         self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, HEAD, OPTIONS")
         self.send_header("Access-Control-Allow-Headers", "*")
 
     def do_OPTIONS(self):
         self.send_response(200)
         self._send_cors_headers()
+        self.end_headers()
+
+    def do_HEAD(self):
+        """Responds 200 OK to keepalive/uptime pings from Cron-Job.org and external bots."""
+        self.send_response(200)
+        self._send_cors_headers()
+        self.send_header("Content-Type", "application/json")
         self.end_headers()
 
     def do_GET(self):
@@ -248,7 +256,25 @@ class MasterOrchestrator:
         self.calendar = MarketCalendar()
         self.script_status = {}
         self.last_stock_event_ts = time.time() * 1000
+        self.last_heartbeat_time = 0.0
         self.replan_daily_routine()
+
+    def record_heartbeat(self):
+        """Updates /system_status with current heartbeat so frontend sees backend as active."""
+        try:
+            now_epoch = time.time()
+            now_ist_str = datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S IST")
+            power_status = "RUNNING" if STATE_BUS.is_power_on() else "STOPPED"
+
+            db.reference("system_status").update({
+                "backend_power": power_status,
+                "last_heartbeat": now_ist_str,
+                "heartbeat_epoch": now_epoch
+            })
+            self.last_heartbeat_time = now_epoch
+            logger.info(f"[HEARTBEAT] Telemetry updated -> {now_ist_str}")
+        except Exception as e:
+            logger.error(f"[HEARTBEAT] Failed to update telemetry: {e}")
 
     def replan_daily_routine(self):
         """Builds target dictionary keyed exclusively by primary key CODE."""
@@ -369,8 +395,15 @@ class MasterOrchestrator:
         logger.info("[ORCHESTRATOR] Master engine started. Primary key: CODE.")
         last_intraday_tick = 0.0
 
+        # Initial heartbeat write
+        self.record_heartbeat()
+
         while _keep_running:
             now = time.time()
+
+            # Heartbeat Telemetry (Every 300 seconds)
+            if (now - self.last_heartbeat_time) >= 300:
+                self.record_heartbeat()
 
             # 1. Listen for realtime actions from Watchlist.jsx
             has_event, event_payload = self.check_stock_event()
