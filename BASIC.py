@@ -1,5 +1,6 @@
 import io
 import os
+import re
 import firebase_admin
 from firebase_admin import credentials, db
 from google.auth.transport.requests import Request
@@ -97,7 +98,7 @@ def get_drive_service():
     return build('drive', 'v3', credentials=creds)
 
 def get_folder_id(service, folder_name):
-    """Searches Drive for the folder; prints available folders if not found."""
+    """Searches Drive for the folder; prints accessible folders if missing."""
     query = f"name='{folder_name}' and mimeType='application/vnd.google-apps.folder' and trashed=false"
     results = service.files().list(q=query, spaces='drive', fields='files(id, name)').execute()
     folders = results.get('files', [])
@@ -105,7 +106,7 @@ def get_folder_id(service, folder_name):
     if folders:
         return folders[0]['id']
     
-    print(f"\n[INFO] Could not find '{folder_name}'. Listing accessible folders in Google Drive:")
+    print(f"\n[INFO] Could not find folder '{folder_name}'. Listing accessible folders:")
     all_folders = service.files().list(
         q="mimeType='application/vnd.google-apps.folder' and trashed=false",
         spaces='drive',
@@ -126,7 +127,7 @@ def get_file_id(service, folder_id, file_name):
     return files[0]['id'] if files else None
 
 # ==========================================
-# 3. FIREBASE SETUP & PRIMARY KEY HELPERS
+# 3. FIREBASE SETUP & PRIMARY KEY DERIVATION
 # ==========================================
 def init_firebase():
     """Initializes Firebase Admin SDK for Realtime Database."""
@@ -137,26 +138,21 @@ def init_firebase():
         })
 
 def sanitize_firebase_key(key: str) -> str:
-    """Removes or replaces forbidden Firebase RTDB path characters."""
+    """
+    Strips forbidden Firebase Realtime Database path characters:
+    . $ # [ ] / and control characters, trimmed and uppercase.
+    """
     if not key:
         return ""
-    return (
-        str(key)
-        .strip()
-        .replace(".", "_")
-        .replace("#", "_")
-        .replace("$", "_")
-        .replace("/", "_")
-        .replace("[", "_")
-        .replace("]", "_")
-    )
+    cleaned = re.sub(r'[.#$\[\]/]', '', str(key)).strip().upper()
+    return cleaned
 
 def derive_primary_key(bse: str, nse: str, name: str) -> str:
     """
     Selects primary identifier:
-    1. Clean NSE Code (preferred)
-    2. BSE Code (if NSE missing)
-    3. Sanitized Name (fallback if both missing)
+    1. NSE Code (clean alphanumeric symbol e.g., DIXON, RELIANCE)
+    2. BSE Code (if NSE is missing)
+    3. Name (fallback if both missing)
     """
     nse_clean = str(nse).strip() if pd.notna(nse) else ""
     bse_clean = str(bse).strip() if pd.notna(bse) else ""
@@ -204,7 +200,7 @@ def run_pipeline():
     valid_cols = [c for c in column_mapping.keys() if c in df.columns]
     extracted_df = df[valid_cols].rename(columns=column_mapping)
 
-    # 1. Derive Primary Key column 'CODE'
+    # 1. Derive clean Primary Key column 'CODE'
     bse_col = extracted_df["BSE"] if "BSE" in extracted_df.columns else ""
     nse_col = extracted_df["NSE"] if "NSE" in extracted_df.columns else ""
     name_col = extracted_df["Name"] if "Name" in extracted_df.columns else ""
@@ -214,17 +210,17 @@ def run_pipeline():
         for b, n, nm in zip(bse_col, nse_col, name_col)
     ]
 
-    # Remove rows where no valid key could be constructed
+    # Remove rows where no valid primary key could be resolved
     extracted_df = extracted_df[extracted_df["CODE"] != ""].copy()
 
     # Drop duplicate primary keys if any exist in the CSV (keeps first occurrence)
     extracted_df = extracted_df.drop_duplicates(subset=["CODE"], keep="first")
 
-    # Sanitize invalid float/NaN values for clean JSON serialization
+    # Sanitize invalid float/NaN/inf values for clean JSON serialization
     cleaned_df = extracted_df.replace([np.inf, -np.inf], np.nan)
     cleaned_df = cleaned_df.astype(object).where(pd.notnull(cleaned_df), None)
 
-    # 2. Convert DataFrame to a keyed dictionary: { "CODE": { ...record... } }
+    # 2. Convert DataFrame to a keyed dictionary: { "CODE": { ...stock record... } }
     keyed_records = cleaned_df.set_index("CODE", drop=False).to_dict(orient="index")
 
     print("[INFO] Uploading keyed dictionary to Firebase Realtime Database...")
@@ -238,4 +234,4 @@ if __name__ == "__main__":
     try:
         run_pipeline()
     except Exception as e:
-        print(f"[ERROR] Error: {e}")
+        print(f"[ERROR] Execution failed: {e}")
