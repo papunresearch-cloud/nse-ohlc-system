@@ -1,10 +1,10 @@
 """
 ===============================================================================
-SCREENER BASE INGESTION (BASIC.py) - DIRECT PUBLIC LINK STREAMING
+SCREENER BASE INGESTION (BASIC.py) - OPTION 2: SHARED FOLDER STREAMING
 ===============================================================================
-* Downloads screener.csv directly from Google Drive using a public share link.
-* Dumps exact CSV column headers to log for full auditability.
-* Explicit and collision-free matching for roce-0 and roce-3y.
+* Monitors a public Google Drive folder dynamically for 'screener.csv'.
+* Always pulls the freshest daily file without needing code edits or new file IDs.
+* Explicitly extracts and formats 'roce-0' and 'roce-3y'.
 * Formats YYYYMM / float inputs into clean "Month, Year" labels under "Last Qtr".
 * Derives primary key 'CODE' (NSE > BSE > Name fallback).
 * Cleans, sanitizes, and writes directly to Firebase Realtime Database at /SCREENER.
@@ -28,7 +28,9 @@ from firebase_admin import credentials, db
 # =====================================================================
 # 1. CONFIGURATION & CONSTANTS
 # =====================================================================
-GDRIVE_SHARE_LINK = "https://drive.google.com/file/d/1hveFXGaHo-eMlQxDcYhanVAQFzHgaXtQ/view?usp=sharing"
+# Paste your shared public SCREENER folder link here (set once, never change):
+GDRIVE_FOLDER_LINK = "https://drive.google.com/drive/folders/1nPgfQC1mHmmVsND5uzoNQ_Wtt1_-JCt5?usp=drive_link"
+TARGET_FILE_NAME = "screener.csv"
 
 # Firebase Realtime Database Config
 FIREBASE_TARGET_NODE = "SCREENER"
@@ -37,7 +39,7 @@ FIREBASE_DB_URL = "https://stock-dashboard-5c25c-default-rtdb.asia-southeast1.fi
 TIMEZONE = "Asia/Kolkata"
 IST = pytz.timezone(TIMEZONE)
 
-# Standard mapping dictionary
+# Standard Column Mapping
 column_mapping = {
     "Name": "Name",
     "BSE Code": "BSE", 
@@ -97,12 +99,14 @@ column_mapping = {
 # =====================================================================
 # 2. HELPER FUNCTIONS
 # =====================================================================
-def extract_file_id(link_or_id: str) -> str:
+def extract_id(link_or_id: str) -> str:
+    """Extracts alphanumeric ID from Google Drive URL or raw ID."""
     link_or_id = link_or_id.strip()
     match = re.search(r'[-\w]{25,}', link_or_id)
     return match.group(0) if match else link_or_id
 
-def download_csv_from_drive(file_id: str) -> pd.DataFrame:
+def download_file_by_id(file_id: str) -> pd.DataFrame:
+    """Streams CSV directly into pandas memory from Google Drive ID."""
     download_url = f"https://drive.google.com/uc?export=download&id={file_id}"
     session = requests.Session()
     session.headers.update({
@@ -117,9 +121,45 @@ def download_csv_from_drive(file_id: str) -> pd.DataFrame:
             break
 
     if response.status_code != 200:
-        raise RuntimeError(f"Failed to download file from Google Drive (HTTP {response.status_code}).")
+        raise RuntimeError(f"Failed downloading file ID '{file_id}' (HTTP {response.status_code}).")
 
     return pd.read_csv(io.BytesIO(response.content))
+
+def download_latest_screener_csv() -> pd.DataFrame:
+    """Finds 'screener.csv' dynamically inside the shared folder."""
+    target_id = extract_id(GDRIVE_FOLDER_LINK)
+    if not target_id or "PASTE_YOUR" in target_id:
+        raise ValueError("Please paste your public Google Drive folder link in GDRIVE_FOLDER_LINK.")
+
+    # Fallback check if user provided direct file URL
+    if "file/d/" in GDRIVE_FOLDER_LINK:
+        return download_file_by_id(target_id)
+
+    # Inspect public folder HTML view to grab screener.csv file ID
+    folder_url = f"https://drive.google.com/embeddedfolderview?id={target_id}"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+    }
+    res = requests.get(folder_url, headers=headers)
+    
+    if res.status_code != 200:
+        return download_file_by_id(target_id)
+
+    # Primary regex: extracts file ID associated with screener.csv in Drive folder view
+    pattern = rf'data-id="([-\w]{{25,}})"[^>]*>.*?{re.escape(TARGET_FILE_NAME)}'
+    matches = re.findall(pattern, res.text, re.IGNORECASE | re.DOTALL)
+    
+    if not matches:
+        alt_pattern = rf'{re.escape(TARGET_FILE_NAME)}.*?href="[^"]*id=([-\w]{{25,}})"'
+        matches = re.findall(alt_pattern, res.text, re.IGNORECASE | re.DOTALL)
+
+    if matches:
+        latest_file_id = matches[0]
+        print(f"[INFO] Found '{TARGET_FILE_NAME}' in folder (File ID: {latest_file_id})")
+        return download_file_by_id(latest_file_id)
+    else:
+        print("[WARN] Folder index parsing fallback: attempting direct download with target ID...")
+        return download_file_by_id(target_id)
 
 def init_firebase():
     if not firebase_admin._apps:
@@ -189,27 +229,13 @@ def clean_numeric_col(series: pd.Series) -> pd.Series:
 # 3. PIPELINE RUNNER
 # =====================================================================
 def run_pipeline():
-    file_id = extract_file_id(GDRIVE_SHARE_LINK)
-    if not file_id:
-        raise ValueError("Invalid Google Drive link in GDRIVE_SHARE_LINK.")
-
-    print(f"[INFO] Downloading screener.csv directly via Google Drive link (ID: {file_id})...")
-    df = download_csv_from_drive(file_id)
+    print(f"[INFO] Streaming daily screener data automatically from shared folder...")
+    df = download_latest_screener_csv()
     print(f"[OK] Successfully loaded CSV ({len(df)} rows).")
 
-    # Clean non-breaking spaces and BOM from headers
-    df.columns = [
-        str(c).replace('\xa0', ' ').replace('\ufeff', '').strip()
-        for c in df.columns
-    ]
+    # Clean non-breaking spaces, BOM, and whitespace from CSV headers
+    df.columns = [str(c).replace('\xa0', ' ').replace('\ufeff', '').strip() for c in df.columns]
 
-    # Print all raw columns to terminal for definitive diagnosis
-    print("\n[INFO] ALL CSV COLUMNS DETECTED:")
-    for i, c in enumerate(df.columns, 1):
-        print(f"       {i:03d}: {repr(c)}")
-    print("-" * 60)
-
-    # Dictionary to collect mappings: actual_csv_column -> db_target_key
     rename_dict = {}
 
     # 1. Alphanumeric normalized lookup for standard columns
@@ -220,44 +246,30 @@ def run_pipeline():
             actual_col = norm_csv_map[std_norm]
             rename_dict[actual_col] = target_key
 
-    # 2. Targeted and collision-free matching for ROCE and Result Date
+    # 2. Collision-free matching for ROCE and Result Date
     for col in df.columns:
         norm = re.sub(r'[^a-z0-9]', '', col.lower())
 
         # Last Result Date
         if "result" in norm and "date" in norm:
             rename_dict[col] = "Last Qtr"
-            print(f"[MATCH] 'Last Qtr' mapped from: {repr(col)}")
             continue
 
-        # ROCE Detection (Prioritizing 3-Year check first)
+        # ROCE Detection (Checks 3-Year first to avoid collision)
         is_roce = ("capital" in norm and "employed" in norm) or "roce" in norm
         if is_roce:
             if any(term in norm for term in ["3year", "3years", "3yr", "3y"]):
                 rename_dict[col] = "roce-3y"
-                print(f"[MATCH] 'roce-3y' mapped from: {repr(col)}")
             else:
                 rename_dict[col] = "roce-0"
-                print(f"[MATCH] 'roce-0' mapped from:  {repr(col)}")
 
-    # Extract matched columns into extracted_df
     extracted_df = df[list(rename_dict.keys())].rename(columns=rename_dict).copy()
 
-    # Confirm and clean roce-0
+    # Clean numeric fields for ROCE
     if "roce-0" in extracted_df.columns:
         extracted_df["roce-0"] = clean_numeric_col(extracted_df["roce-0"])
-        sample = extracted_df["roce-0"].dropna().iloc[0] if not extracted_df["roce-0"].dropna().empty else "N/A"
-        print(f"[OK] Verified 'roce-0' in dataset! Sample value: {sample}")
-    else:
-        print("[ERROR] 'roce-0' column NOT FOUND in CSV!")
-
-    # Confirm and clean roce-3y
     if "roce-3y" in extracted_df.columns:
         extracted_df["roce-3y"] = clean_numeric_col(extracted_df["roce-3y"])
-        sample = extracted_df["roce-3y"].dropna().iloc[0] if not extracted_df["roce-3y"].dropna().empty else "N/A"
-        print(f"[OK] Verified 'roce-3y' in dataset! Sample value: {sample}")
-    else:
-        print("[ERROR] 'roce-3y' column NOT FOUND in CSV!")
 
     # Format Last Qtr
     if "Last Qtr" in extracted_df.columns:
@@ -283,7 +295,7 @@ def run_pipeline():
     cleaned_df = extracted_df.replace([np.inf, -np.inf], np.nan)
     cleaned_df = cleaned_df.astype(object).where(pd.notnull(cleaned_df), None)
 
-    # Convert to keyed dictionary: { "CODE": { ...fields... } }
+    # Convert to keyed dictionary
     keyed_records = cleaned_df.set_index("CODE", drop=False).to_dict(orient="index")
 
     print("[INFO] Uploading keyed dictionary to Firebase Realtime Database...")
