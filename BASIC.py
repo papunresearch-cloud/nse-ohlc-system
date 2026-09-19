@@ -3,7 +3,8 @@
 SCREENER BASE INGESTION (BASIC.py) - DIRECT PUBLIC LINK STREAMING
 ===============================================================================
 * Downloads screener.csv directly from Google Drive using a public share link.
-* Robust matching for ROCE ("roce-0") and 3-Year ROCE ("roce-3y").
+* Dumps exact CSV column headers to log for full auditability.
+* Explicit and collision-free matching for roce-0 and roce-3y.
 * Formats YYYYMM / float inputs into clean "Month, Year" labels under "Last Qtr".
 * Derives primary key 'CODE' (NSE > BSE > Name fallback).
 * Cleans, sanitizes, and writes directly to Firebase Realtime Database at /SCREENER.
@@ -196,76 +197,67 @@ def run_pipeline():
     df = download_csv_from_drive(file_id)
     print(f"[OK] Successfully loaded CSV ({len(df)} rows).")
 
-    # Clean up whitespace, BOM, and non-breaking spaces from column headers
-    df.columns = [str(c).replace('\xa0', ' ').replace('\ufeff', '').strip() for c in df.columns]
+    # Clean non-breaking spaces and BOM from headers
+    df.columns = [
+        str(c).replace('\xa0', ' ').replace('\ufeff', '').strip()
+        for c in df.columns
+    ]
 
-    # Print matching columns for diagnostics
-    print("[INFO] Auditing capital/roce headers in CSV:")
-    found_any = False
-    for c in df.columns:
-        if any(term in c.lower() for term in ["capital", "roce", "employed"]):
-            print(f"       -> {repr(c)}")
-            found_any = True
-    if not found_any:
-        print("       -> No columns containing 'capital', 'roce', or 'employed' found!")
+    # Print all raw columns to terminal for definitive diagnosis
+    print("\n[INFO] ALL CSV COLUMNS DETECTED:")
+    for i, c in enumerate(df.columns, 1):
+        print(f"       {i:03d}: {repr(c)}")
+    print("-" * 60)
 
-    # Build mapping dictionary: actual_csv_column -> database_key
+    # Dictionary to collect mappings: actual_csv_column -> db_target_key
     rename_dict = {}
 
-    # 1. First map standard keys by normalized match (alphanumeric only)
+    # 1. Alphanumeric normalized lookup for standard columns
     norm_csv_map = {re.sub(r'[^a-z0-9]', '', c.lower()): c for c in df.columns}
-
     for std_name, target_key in column_mapping.items():
         std_norm = re.sub(r'[^a-z0-9]', '', std_name.lower())
         if std_norm in norm_csv_map:
             actual_col = norm_csv_map[std_norm]
             rename_dict[actual_col] = target_key
 
-    # 2. Targeted substring detection for ROCE, ROCE 3Y, and Result Date
+    # 2. Targeted and collision-free matching for ROCE and Result Date
     for col in df.columns:
         norm = re.sub(r'[^a-z0-9]', '', col.lower())
 
-        # Result date
+        # Last Result Date
         if "result" in norm and "date" in norm:
             rename_dict[col] = "Last Qtr"
+            print(f"[MATCH] 'Last Qtr' mapped from: {repr(col)}")
+            continue
 
-        # ROCE fields
-        if ("capital" in norm and "employed" in norm) or "roce" in norm:
-            if "3" in norm:
+        # ROCE Detection (Prioritizing 3-Year check first)
+        is_roce = ("capital" in norm and "employed" in norm) or "roce" in norm
+        if is_roce:
+            if any(term in norm for term in ["3year", "3years", "3yr", "3y"]):
                 rename_dict[col] = "roce-3y"
+                print(f"[MATCH] 'roce-3y' mapped from: {repr(col)}")
             else:
                 rename_dict[col] = "roce-0"
+                print(f"[MATCH] 'roce-0' mapped from:  {repr(col)}")
 
-    # Invert to confirm what matched
-    inverted_matches = {v: k for k, v in rename_dict.items()}
-
-    # Confirm roce-0
-    if "roce-0" in inverted_matches:
-        actual_roce0_name = inverted_matches["roce-0"]
-        print(f"[OK] Mapped 'roce-0' from CSV column: {repr(actual_roce0_name)}")
-    else:
-        print("[ERROR] 'roce-0' column NOT FOUND in CSV!")
-
-    # Confirm roce-3y
-    if "roce-3y" in inverted_matches:
-        actual_roce3y_name = inverted_matches["roce-3y"]
-        print(f"[OK] Mapped 'roce-3y' from CSV column: {repr(actual_roce3y_name)}")
-    else:
-        print("[ERROR] 'roce-3y' column NOT FOUND in CSV!")
-
-    # Extract matched columns
+    # Extract matched columns into extracted_df
     extracted_df = df[list(rename_dict.keys())].rename(columns=rename_dict).copy()
 
-    # Clean numeric fields
+    # Confirm and clean roce-0
     if "roce-0" in extracted_df.columns:
         extracted_df["roce-0"] = clean_numeric_col(extracted_df["roce-0"])
         sample = extracted_df["roce-0"].dropna().iloc[0] if not extracted_df["roce-0"].dropna().empty else "N/A"
-        print(f"[OK] 'roce-0' sample value: {sample}")
+        print(f"[OK] Verified 'roce-0' in dataset! Sample value: {sample}")
+    else:
+        print("[ERROR] 'roce-0' column NOT FOUND in CSV!")
 
+    # Confirm and clean roce-3y
     if "roce-3y" in extracted_df.columns:
         extracted_df["roce-3y"] = clean_numeric_col(extracted_df["roce-3y"])
         sample = extracted_df["roce-3y"].dropna().iloc[0] if not extracted_df["roce-3y"].dropna().empty else "N/A"
-        print(f"[OK] 'roce-3y' sample value: {sample}")
+        print(f"[OK] Verified 'roce-3y' in dataset! Sample value: {sample}")
+    else:
+        print("[ERROR] 'roce-3y' column NOT FOUND in CSV!")
 
     # Format Last Qtr
     if "Last Qtr" in extracted_df.columns:
@@ -273,7 +265,7 @@ def run_pipeline():
     else:
         extracted_df["Last Qtr"] = None
 
-    # Derive Primary Key CODE
+    # Derive primary key 'CODE'
     nse_col = extracted_df["NSE"] if "NSE" in extracted_df.columns else [""] * len(extracted_df)
     bse_col = extracted_df["BSE"] if "BSE" in extracted_df.columns else [""] * len(extracted_df)
     name_col = extracted_df["Name"] if "Name" in extracted_df.columns else [""] * len(extracted_df)
@@ -291,7 +283,7 @@ def run_pipeline():
     cleaned_df = extracted_df.replace([np.inf, -np.inf], np.nan)
     cleaned_df = cleaned_df.astype(object).where(pd.notnull(cleaned_df), None)
 
-    # Convert to keyed dictionary: { "CODE": { ...record... } }
+    # Convert to keyed dictionary: { "CODE": { ...fields... } }
     keyed_records = cleaned_df.set_index("CODE", drop=False).to_dict(orient="index")
 
     print("[INFO] Uploading keyed dictionary to Firebase Realtime Database...")
