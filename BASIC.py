@@ -188,7 +188,7 @@ def run_pipeline():
             value = str(value).strip()
 
             # Handle values such as 202606, 202603, 202612
-            if re.fullmatch(r"\\d{6}", value):
+            if re.fullmatch(r"\d{6}", value):
                 year = value[:4]
                 month = value[4:6]
 
