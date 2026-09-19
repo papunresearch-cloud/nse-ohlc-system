@@ -2,12 +2,10 @@
 ===============================================================================
 SCREENER BASE INGESTION (BASIC.py) - DIRECT PUBLIC LINK STREAMING
 ===============================================================================
-* Downloads screener.csv directly from Google Drive using a public share link.
-* Resolves case and space variations for "Last result date".
-* Formats YYYYMM / float inputs into clean "Month, Year" labels under "Last Qtr".
-* Derives primary key 'CODE' (NSE > BSE > Name fallback).
+* Ingests screener.csv directly from Google Drive link.
+* Explicitly extracts "Return on capital employed" -> roce-0
+* Explicitly extracts "Average return on capital employed 3Years" -> roce-3y
 * Cleans, sanitizes, and writes directly to Firebase Realtime Database at /SCREENER.
-* Updates /system_status/screener_sync with success timestamp.
 ===============================================================================
 """
 
@@ -36,7 +34,7 @@ FIREBASE_DB_URL = "https://stock-dashboard-5c25c-default-rtdb.asia-southeast1.fi
 TIMEZONE = "Asia/Kolkata"
 IST = pytz.timezone(TIMEZONE)
 
-# Column mapping from screener.csv to database keys
+# Explicit column mapping
 column_mapping = {
     "Name": "Name",
     "BSE Code": "BSE", 
@@ -53,6 +51,8 @@ column_mapping = {
     "Return on equity": "roe-0",
     "Return on equity preceding year": "roe-1",
     "Average return on equity 3Years": "roe-3y",
+    "Return on capital employed": "roce-0",
+    "Average return on capital employed 3Years": "roce-3y",
     "Expected quarterly sales growth": "sg-eq",
     "Sales growth": "sg-ttm",
     "Sales growth 3Years": "sg-3y",
@@ -62,8 +62,6 @@ column_mapping = {
     "Return on assets": "roa-0",
     "Return on assets preceding year": "roa-1",
     "Return on assets 3years": "roa-3y",
-    "Return on capital employed": "roce-0",
-    "Average return on capital employed 3Years": "roce-3y",
     "Debt to equity": "DE",
     "Dividend yield": "DY",
     "AVGOPM": "OPM",
@@ -97,15 +95,11 @@ column_mapping = {
 # 2. HELPER FUNCTIONS
 # =====================================================================
 def extract_file_id(link_or_id: str) -> str:
-    """Extracts the Google Drive file ID from any shared URL or raw ID."""
     link_or_id = link_or_id.strip()
     match = re.search(r'[-\w]{25,}', link_or_id)
-    if match:
-        return match.group(0)
-    return link_or_id
+    return match.group(0) if match else link_or_id
 
 def download_csv_from_drive(file_id: str) -> pd.DataFrame:
-    """Streams the CSV into memory using standard HTTP with browser headers."""
     download_url = f"https://drive.google.com/uc?export=download&id={file_id}"
     session = requests.Session()
     session.headers.update({
@@ -113,8 +107,6 @@ def download_csv_from_drive(file_id: str) -> pd.DataFrame:
     })
     
     response = session.get(download_url, stream=True)
-    
-    # Handle Google Drive large-file confirmation tokens if prompted
     for key, value in response.cookies.items():
         if key.startswith('download_warning'):
             confirm_url = f"{download_url}&confirm={value}"
@@ -122,44 +114,32 @@ def download_csv_from_drive(file_id: str) -> pd.DataFrame:
             break
 
     if response.status_code != 200:
-        raise RuntimeError(
-            f"Failed to download file from Google Drive (HTTP {response.status_code}). "
-            "Please ensure the file sharing setting is set to 'Anyone with the link can view'."
-        )
+        raise RuntimeError(f"Failed to download file from Google Drive (HTTP {response.status_code}).")
 
     return pd.read_csv(io.BytesIO(response.content))
 
 def init_firebase():
-    """Initializes Firebase Admin SDK using disk file or Render Environment Variables."""
     if not firebase_admin._apps:
-        if os.path.exists("serviceAccountKey.json"):
-            cred = credentials.Certificate("serviceAccountKey.json")
+        if os.path.exists(FIREBASE_KEY_FILE):
+            cred = credentials.Certificate(FIREBASE_KEY_FILE)
         elif os.environ.get("FIREBASE_SERVICE_ACCOUNT_KEY"):
-            key_dict = json.loads(os.environ["FIREBASE_SERVICE_ACCOUNT_KEY"])
-            cred = credentials.Certificate(key_dict)
+            cred = credentials.Certificate(json.loads(os.environ["FIREBASE_SERVICE_ACCOUNT_KEY"]))
         elif os.environ.get("FIREBASE_CREDENTIALS"):
-            # Check if FIREBASE_CREDENTIALS points to an existing file path or contains raw JSON
-            cred_val = os.environ["FIREBASE_CREDENTIALS"].strip()
-            if os.path.exists(cred_val):
-                cred = credentials.Certificate(cred_val)
-            else:
-                key_dict = json.loads(cred_val)
-                cred = credentials.Certificate(key_dict)
+            val = os.environ["FIREBASE_CREDENTIALS"].strip()
+            cred = credentials.Certificate(val if os.path.exists(val) else json.loads(val))
         else:
-            raise FileNotFoundError("Firebase credentials not found (serviceAccountKey.json)")
+            raise FileNotFoundError(f"Firebase credentials not found ({FIREBASE_KEY_FILE})")
 
         firebase_admin.initialize_app(cred, {
             'databaseURL': FIREBASE_DB_URL.rstrip('/')
         })
 
 def sanitize_firebase_key(key: str) -> str:
-    """Strips forbidden Firebase Realtime Database characters."""
     if not key:
         return ""
     return re.sub(r'[.#$\[\]/]', '', str(key)).strip().upper()
 
 def derive_primary_key(nse: str, bse: str, name: str) -> str:
-    """Derives primary key: 1. NSE Code, 2. BSE Code, 3. Name."""
     nse_clean = str(nse).strip() if pd.notna(nse) else ""
     bse_clean = str(bse).strip() if pd.notna(bse) else ""
     name_clean = str(name).strip() if pd.notna(name) else ""
@@ -174,61 +154,86 @@ def derive_primary_key(nse: str, bse: str, name: str) -> str:
     return sanitize_firebase_key(chosen)
 
 def format_last_qtr(value):
-    """Parses date expressions or integers (e.g. 202606, 202606.0) to 'Month, Year'."""
     if pd.isna(value) or value is None:
         return None
-
     try:
         val_str = str(int(float(value))).strip()
     except (ValueError, TypeError):
         val_str = str(value).strip().split('.')[0]
 
     if len(val_str) == 6 and val_str.isdigit():
-        year = val_str[:4]
-        month = val_str[4:6]
-
+        year, month = val_str[:4], val_str[4:6]
         month_names = {
             "01": "Jan", "02": "Feb", "03": "March", "04": "April",
             "05": "May", "06": "June", "07": "July", "08": "Aug",
             "09": "Sept", "10": "Oct", "11": "Nov", "12": "Dec"
         }
-
         if month in month_names:
             return f"{month_names[month]}, {year}"
-
     return None
+
+def clean_numeric_col(series: pd.Series) -> pd.Series:
+    """Strips %, commas, and converts text to float."""
+    return pd.to_numeric(
+        series.astype(str)
+        .str.replace("%", "", regex=False)
+        .str.replace(",", "", regex=False)
+        .str.strip()
+        .replace(["-", "nan", "None", ""], np.nan),
+        errors="coerce"
+    )
 
 # =====================================================================
 # 3. PIPELINE RUNNER
 # =====================================================================
 def run_pipeline():
     file_id = extract_file_id(GDRIVE_SHARE_LINK)
-    if not file_id or "PASTE_YOUR" in file_id:
-        raise ValueError("Please paste your valid Google Drive link in GDRIVE_SHARE_LINK.")
+    if not file_id:
+        raise ValueError("Invalid Google Drive link in GDRIVE_SHARE_LINK.")
 
     print(f"[INFO] Downloading screener.csv directly via Google Drive link (ID: {file_id})...")
     df = download_csv_from_drive(file_id)
     print(f"[OK] Successfully loaded CSV ({len(df)} rows).")
 
-    # Flexible matching for "Last result date" to prevent casing/space mismatches
+    # Clean whitespace and BOM from column headers
+    df.columns = [c.strip().replace('\ufeff', '') for c in df.columns]
+
+    # Dynamic alias resolution for Result Date, roce-0, and roce-3y
     mapping = column_mapping.copy()
+
     for col in df.columns:
-        norm = str(col).strip().lower()
-        if norm in ["last result date", "latest result date", "result date"]:
+        norm = re.sub(r'[^a-z0-9]', '', col.lower())
+        if norm in ["lastresultdate", "latestresultdate", "resultdate"]:
             mapping[col] = "Last Qtr"
-            break
+        elif norm in ["returnoncapitalemployed", "roce"]:
+            mapping[col] = "roce-0"
+        elif norm in ["averagereturnoncapitalemployed3years", "returnoncapitalemployed3years", "avgroce3years"]:
+            mapping[col] = "roce-3y"
 
-    # Column filtering & renaming
-    valid_cols = [c for c in mapping.keys() if c in df.columns]
-    extracted_df = df[valid_cols].rename(columns=mapping).copy()
+    # Extract matching columns
+    matched_cols = [c for c in mapping.keys() if c in df.columns]
+    extracted_df = df[matched_cols].rename(columns=mapping).copy()
 
-    # Convert Last result date to Last Qtr
+    # Diagnostics to confirm ROCE columns are found
+    if "roce-0" in extracted_df.columns:
+        extracted_df["roce-0"] = clean_numeric_col(extracted_df["roce-0"])
+        print(f"[OK] Successfully mapped and cleaned: 'roce-0' (Sample value: {extracted_df['roce-0'].dropna().iloc[0] if not extracted_df['roce-0'].dropna().empty else 'N/A'})")
+    else:
+        print("[ERROR] 'roce-0' column NOT FOUND in CSV!")
+
+    if "roce-3y" in extracted_df.columns:
+        extracted_df["roce-3y"] = clean_numeric_col(extracted_df["roce-3y"])
+        print(f"[OK] Successfully mapped and cleaned: 'roce-3y' (Sample value: {extracted_df['roce-3y'].dropna().iloc[0] if not extracted_df['roce-3y'].dropna().empty else 'N/A'})")
+    else:
+        print("[ERROR] 'roce-3y' column NOT FOUND in CSV!")
+
+    # Format Last Qtr
     if "Last Qtr" in extracted_df.columns:
         extracted_df["Last Qtr"] = extracted_df["Last Qtr"].apply(format_last_qtr)
     else:
         extracted_df["Last Qtr"] = None
 
-    # Resolve primary key CODE column (Priority: NSE -> BSE -> Name)
+    # Derive Primary Key CODE
     nse_col = extracted_df["NSE"] if "NSE" in extracted_df.columns else [""] * len(extracted_df)
     bse_col = extracted_df["BSE"] if "BSE" in extracted_df.columns else [""] * len(extracted_df)
     name_col = extracted_df["Name"] if "Name" in extracted_df.columns else [""] * len(extracted_df)
@@ -242,11 +247,11 @@ def run_pipeline():
     extracted_df = extracted_df[extracted_df["CODE"] != ""].copy()
     extracted_df = extracted_df.drop_duplicates(subset=["CODE"], keep="first")
 
-    # Sanitize infinities and NaNs for JSON serialization
+    # Sanitize infinities and NaNs
     cleaned_df = extracted_df.replace([np.inf, -np.inf], np.nan)
     cleaned_df = cleaned_df.astype(object).where(pd.notnull(cleaned_df), None)
 
-    # Convert DataFrame to a keyed dictionary: { "CODE": { ...record... } }
+    # Convert to keyed dictionary
     keyed_records = cleaned_df.set_index("CODE", drop=False).to_dict(orient="index")
 
     print("[INFO] Uploading keyed dictionary to Firebase Realtime Database...")
