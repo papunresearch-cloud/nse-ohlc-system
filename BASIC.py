@@ -87,7 +87,8 @@ column_mapping = {
     "Promoter holding": "PRH",
     "Change in promoter holding": "DPRH",
     "YOY Quarterly sales growth": "YSG",
-    "YOY Quarterly profit growth": "YPG"
+    "YOY Quarterly profit growth": "YPG",
+    "Last result date": "Last Qtr"
 }
 
 # =====================================================================
@@ -177,6 +178,33 @@ def run_pipeline():
     # Column filtering & renaming
     valid_cols = [c for c in column_mapping.keys() if c in df.columns]
     extracted_df = df[valid_cols].rename(columns=column_mapping)
+
+    # Convert Last result date (YYYYMM) to Last Qtr (Month, Year)
+    if "Last Qtr" in extracted_df.columns:
+        def format_last_qtr(value):
+            if pd.isna(value):
+                return None
+
+            value = str(value).strip()
+
+            # Handle values such as 202606, 202603, 202612
+            if re.fullmatch(r"\\d{6}", value):
+                year = value[:4]
+                month = value[4:6]
+
+                month_names = {
+                    "03": "March",
+                    "06": "June",
+                    "09": "Sept",
+                    "12": "Dec"
+                }
+
+                if month in month_names:
+                    return f"{month_names[month]}, {year}"
+
+            return None
+
+        extracted_df["Last Qtr"] = extracted_df["Last Qtr"].apply(format_last_qtr)
 
     # Resolve primary key CODE column
     bse_col = extracted_df["BSE"] if "BSE" in extracted_df.columns else [""] * len(extracted_df)
