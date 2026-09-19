@@ -2,10 +2,12 @@
 ===============================================================================
 SCREENER BASE INGESTION (BASIC.py) - DIRECT PUBLIC LINK STREAMING
 ===============================================================================
-* Ingests screener.csv directly from Google Drive link.
-* Explicitly extracts "Return on capital employed" -> roce-0
-* Explicitly extracts "Average return on capital employed 3Years" -> roce-3y
+* Downloads screener.csv directly from Google Drive using a public share link.
+* Explicitly maps:
+    "Return on capital employed" -> "roce-0"
+    "Average return on capital employed 3Years" -> "roce-3y"
 * Cleans, sanitizes, and writes directly to Firebase Realtime Database at /SCREENER.
+* Updates /system_status/screener_sync with success timestamp.
 ===============================================================================
 """
 
@@ -34,7 +36,7 @@ FIREBASE_DB_URL = "https://stock-dashboard-5c25c-default-rtdb.asia-southeast1.fi
 TIMEZONE = "Asia/Kolkata"
 IST = pytz.timezone(TIMEZONE)
 
-# Explicit column mapping
+# Base column mapping
 column_mapping = {
     "Name": "Name",
     "BSE Code": "BSE", 
@@ -173,7 +175,6 @@ def format_last_qtr(value):
     return None
 
 def clean_numeric_col(series: pd.Series) -> pd.Series:
-    """Strips %, commas, and converts text to float."""
     return pd.to_numeric(
         series.astype(str)
         .str.replace("%", "", regex=False)
@@ -195,35 +196,54 @@ def run_pipeline():
     df = download_csv_from_drive(file_id)
     print(f"[OK] Successfully loaded CSV ({len(df)} rows).")
 
-    # Clean whitespace and BOM from column headers
-    df.columns = [c.strip().replace('\ufeff', '') for c in df.columns]
+    # Clean non-breaking spaces, BOM, and whitespace from CSV headers
+    df.columns = [
+        str(c).replace('\xa0', ' ').replace('\ufeff', '').strip()
+        for c in df.columns
+    ]
 
-    # Dynamic alias resolution for Result Date, roce-0, and roce-3y
-    mapping = column_mapping.copy()
+    # Flexible matching dictionary: normalized -> target_key
+    # This matches case-insensitively without spaces
+    normalized_mapping = {
+        re.sub(r'[^a-z0-9]', '', k.lower()): v
+        for k, v in column_mapping.items()
+    }
 
+    # Add flexible variations for ROCE and Result Date
+    normalized_mapping["roce"] = "roce-0"
+    normalized_mapping["returnoncapitalemployed"] = "roce-0"
+    normalized_mapping["roce3y"] = "roce-3y"
+    normalized_mapping["roce3years"] = "roce-3y"
+    normalized_mapping["averagereturnoncapitalemployed3years"] = "roce-3y"
+    normalized_mapping["returnoncapitalemployed3years"] = "roce-3y"
+    normalized_mapping["lastresultdate"] = "Last Qtr"
+    normalized_mapping["latestresultdate"] = "Last Qtr"
+    normalized_mapping["resultdate"] = "Last Qtr"
+
+    # Map actual CSV columns to target database keys
+    rename_dict = {}
     for col in df.columns:
-        norm = re.sub(r'[^a-z0-9]', '', col.lower())
-        if norm in ["lastresultdate", "latestresultdate", "resultdate"]:
-            mapping[col] = "Last Qtr"
-        elif norm in ["returnoncapitalemployed", "roce"]:
-            mapping[col] = "roce-0"
-        elif norm in ["averagereturnoncapitalemployed3years", "returnoncapitalemployed3years", "avgroce3years"]:
-            mapping[col] = "roce-3y"
+        clean_key = re.sub(r'[^a-z0-9]', '', col.lower())
+        if clean_key in normalized_mapping:
+            target_key = normalized_mapping[clean_key]
+            rename_dict[col] = target_key
 
-    # Extract matching columns
-    matched_cols = [c for c in mapping.keys() if c in df.columns]
-    extracted_df = df[matched_cols].rename(columns=mapping).copy()
+    # Extract matched columns
+    extracted_df = df[list(rename_dict.keys())].rename(columns=rename_dict).copy()
 
-    # Diagnostics to confirm ROCE columns are found
+    # Verify and clean roce-0
     if "roce-0" in extracted_df.columns:
         extracted_df["roce-0"] = clean_numeric_col(extracted_df["roce-0"])
-        print(f"[OK] Successfully mapped and cleaned: 'roce-0' (Sample value: {extracted_df['roce-0'].dropna().iloc[0] if not extracted_df['roce-0'].dropna().empty else 'N/A'})")
+        sample = extracted_df["roce-0"].dropna().iloc[0] if not extracted_df["roce-0"].dropna().empty else "N/A"
+        print(f"[OK] Mapped 'roce-0' successfully! Sample value: {sample}")
     else:
         print("[ERROR] 'roce-0' column NOT FOUND in CSV!")
 
+    # Verify and clean roce-3y
     if "roce-3y" in extracted_df.columns:
         extracted_df["roce-3y"] = clean_numeric_col(extracted_df["roce-3y"])
-        print(f"[OK] Successfully mapped and cleaned: 'roce-3y' (Sample value: {extracted_df['roce-3y'].dropna().iloc[0] if not extracted_df['roce-3y'].dropna().empty else 'N/A'})")
+        sample = extracted_df["roce-3y"].dropna().iloc[0] if not extracted_df["roce-3y"].dropna().empty else "N/A"
+        print(f"[OK] Mapped 'roce-3y' successfully! Sample value: {sample}")
     else:
         print("[ERROR] 'roce-3y' column NOT FOUND in CSV!")
 
@@ -247,11 +267,11 @@ def run_pipeline():
     extracted_df = extracted_df[extracted_df["CODE"] != ""].copy()
     extracted_df = extracted_df.drop_duplicates(subset=["CODE"], keep="first")
 
-    # Sanitize infinities and NaNs
+    # Sanitize infinities and NaNs for JSON serialization
     cleaned_df = extracted_df.replace([np.inf, -np.inf], np.nan)
     cleaned_df = cleaned_df.astype(object).where(pd.notnull(cleaned_df), None)
 
-    # Convert to keyed dictionary
+    # Convert to keyed dictionary: { "CODE": { ...record... } }
     keyed_records = cleaned_df.set_index("CODE", drop=False).to_dict(orient="index")
 
     print("[INFO] Uploading keyed dictionary to Firebase Realtime Database...")
