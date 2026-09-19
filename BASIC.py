@@ -97,7 +97,7 @@ column_mapping = {
 # 2. HELPER FUNCTIONS
 # =====================================================================
 def extract_file_id(link_or_id: str) -> str:
-    """Extracts the 33-character Google Drive ID from any shared URL."""
+    """Extracts the Google Drive file ID from any shared URL or raw ID."""
     link_or_id = link_or_id.strip()
     match = re.search(r'[-\w]{25,}', link_or_id)
     if match:
@@ -105,13 +105,16 @@ def extract_file_id(link_or_id: str) -> str:
     return link_or_id
 
 def download_csv_from_drive(file_id: str) -> pd.DataFrame:
-    """Streams the CSV into memory using standard HTTP without authentication."""
+    """Streams the CSV into memory using standard HTTP with browser headers."""
     download_url = f"https://drive.google.com/uc?export=download&id={file_id}"
     session = requests.Session()
+    session.headers.update({
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    })
     
     response = session.get(download_url, stream=True)
     
-    # Handle Google Drive large-file virus scan confirmation if prompted
+    # Handle Google Drive large-file confirmation tokens if prompted
     for key, value in response.cookies.items():
         if key.startswith('download_warning'):
             confirm_url = f"{download_url}&confirm={value}"
@@ -127,7 +130,7 @@ def download_csv_from_drive(file_id: str) -> pd.DataFrame:
     return pd.read_csv(io.BytesIO(response.content))
 
 def init_firebase():
-    """Initializes Firebase Admin SDK using disk file or Render Environment Variable."""
+    """Initializes Firebase Admin SDK using disk file or Render Environment Variables."""
     if not firebase_admin._apps:
         if os.path.exists("serviceAccountKey.json"):
             cred = credentials.Certificate("serviceAccountKey.json")
@@ -135,13 +138,18 @@ def init_firebase():
             key_dict = json.loads(os.environ["FIREBASE_SERVICE_ACCOUNT_KEY"])
             cred = credentials.Certificate(key_dict)
         elif os.environ.get("FIREBASE_CREDENTIALS"):
-            key_dict = json.loads(os.environ["FIREBASE_CREDENTIALS"])
-            cred = credentials.Certificate(key_dict)
+            # Check if FIREBASE_CREDENTIALS points to an existing file path or contains raw JSON
+            cred_val = os.environ["FIREBASE_CREDENTIALS"].strip()
+            if os.path.exists(cred_val):
+                cred = credentials.Certificate(cred_val)
+            else:
+                key_dict = json.loads(cred_val)
+                cred = credentials.Certificate(key_dict)
         else:
             raise FileNotFoundError("Firebase credentials not found (serviceAccountKey.json)")
 
         firebase_admin.initialize_app(cred, {
-            'databaseURL': FIREBASE_DB_URL
+            'databaseURL': FIREBASE_DB_URL.rstrip('/')
         })
 
 def sanitize_firebase_key(key: str) -> str:
@@ -150,7 +158,7 @@ def sanitize_firebase_key(key: str) -> str:
         return ""
     return re.sub(r'[.#$\[\]/]', '', str(key)).strip().upper()
 
-def derive_primary_key(bse: str, nse: str, name: str) -> str:
+def derive_primary_key(nse: str, bse: str, name: str) -> str:
     """Derives primary key: 1. NSE Code, 2. BSE Code, 3. Name."""
     nse_clean = str(nse).strip() if pd.notna(nse) else ""
     bse_clean = str(bse).strip() if pd.notna(bse) else ""
@@ -180,18 +188,9 @@ def format_last_qtr(value):
         month = val_str[4:6]
 
         month_names = {
-            "01": "Jan",
-            "02": "Feb",
-            "03": "March",
-            "04": "April",
-            "05": "May",
-            "06": "June",
-            "07": "July",
-            "08": "Aug",
-            "09": "Sept",
-            "10": "Oct",
-            "11": "Nov",
-            "12": "Dec"
+            "01": "Jan", "02": "Feb", "03": "March", "04": "April",
+            "05": "May", "06": "June", "07": "July", "08": "Aug",
+            "09": "Sept", "10": "Oct", "11": "Nov", "12": "Dec"
         }
 
         if month in month_names:
@@ -214,14 +213,14 @@ def run_pipeline():
     # Flexible matching for "Last result date" to prevent casing/space mismatches
     mapping = column_mapping.copy()
     for col in df.columns:
-        norm = col.strip().lower()
+        norm = str(col).strip().lower()
         if norm in ["last result date", "latest result date", "result date"]:
             mapping[col] = "Last Qtr"
             break
 
     # Column filtering & renaming
     valid_cols = [c for c in mapping.keys() if c in df.columns]
-    extracted_df = df[valid_cols].rename(columns=mapping)
+    extracted_df = df[valid_cols].rename(columns=mapping).copy()
 
     # Convert Last result date to Last Qtr
     if "Last Qtr" in extracted_df.columns:
@@ -229,14 +228,14 @@ def run_pipeline():
     else:
         extracted_df["Last Qtr"] = None
 
-    # Resolve primary key CODE column
-    bse_col = extracted_df["BSE"] if "BSE" in extracted_df.columns else [""] * len(extracted_df)
+    # Resolve primary key CODE column (Priority: NSE -> BSE -> Name)
     nse_col = extracted_df["NSE"] if "NSE" in extracted_df.columns else [""] * len(extracted_df)
+    bse_col = extracted_df["BSE"] if "BSE" in extracted_df.columns else [""] * len(extracted_df)
     name_col = extracted_df["Name"] if "Name" in extracted_df.columns else [""] * len(extracted_df)
 
     extracted_df["CODE"] = [
-        derive_primary_key(b, n, nm)
-        for b, n, nm in zip(bse_col, nse_col, name_col)
+        derive_primary_key(n, b, nm)
+        for n, b, nm in zip(nse_col, bse_col, name_col)
     ]
 
     # Remove empty or duplicate keys
