@@ -1,10 +1,9 @@
 """
 ===============================================================================
-SCREENER BASE INGESTION (BASIC.py) - OPTION 2: SHARED FOLDER STREAMING
+SCREENER BASE INGESTION (BASIC.py) - DIRECT PUBLIC LINK STREAMING
 ===============================================================================
-* Monitors a public Google Drive folder dynamically for 'screener.csv'.
-* Always pulls the freshest daily file without needing code edits or new file IDs.
-* Explicitly extracts and formats 'roce-0' and 'roce-3y'.
+* Downloads screener.csv directly via Google Drive direct export link.
+* Robust matching for ROCE ("roce-0") and 3-Year ROCE ("roce-3y").
 * Formats YYYYMM / float inputs into clean "Month, Year" labels under "Last Qtr".
 * Derives primary key 'CODE' (NSE > BSE > Name fallback).
 * Cleans, sanitizes, and writes directly to Firebase Realtime Database at /SCREENER.
@@ -28,9 +27,8 @@ from firebase_admin import credentials, db
 # =====================================================================
 # 1. CONFIGURATION & CONSTANTS
 # =====================================================================
-# Paste your shared public SCREENER folder link here (set once, never change):
-GDRIVE_FOLDER_LINK = "https://drive.google.com/drive/folders/1nPgfQC1mHmmVsND5uzoNQ_Wtt1_-JCt5?usp=drive_link"
-TARGET_FILE_NAME = "screener.csv"
+# Right-click 'screener.csv' in Drive -> Share -> Copy link. Paste it here once.
+GDRIVE_SHARE_LINK = "https://drive.google.com/file/d/1MaNBVSt3e2w37Hs145U8bZOuqheggBvc/view?usp=sharing"
 
 # Firebase Realtime Database Config
 FIREBASE_TARGET_NODE = "SCREENER"
@@ -99,14 +97,12 @@ column_mapping = {
 # =====================================================================
 # 2. HELPER FUNCTIONS
 # =====================================================================
-def extract_id(link_or_id: str) -> str:
-    """Extracts alphanumeric ID from Google Drive URL or raw ID."""
+def extract_file_id(link_or_id: str) -> str:
     link_or_id = link_or_id.strip()
     match = re.search(r'[-\w]{25,}', link_or_id)
     return match.group(0) if match else link_or_id
 
-def download_file_by_id(file_id: str) -> pd.DataFrame:
-    """Streams CSV directly into pandas memory from Google Drive ID."""
+def download_csv_from_drive(file_id: str) -> pd.DataFrame:
     download_url = f"https://drive.google.com/uc?export=download&id={file_id}"
     session = requests.Session()
     session.headers.update({
@@ -121,45 +117,9 @@ def download_file_by_id(file_id: str) -> pd.DataFrame:
             break
 
     if response.status_code != 200:
-        raise RuntimeError(f"Failed downloading file ID '{file_id}' (HTTP {response.status_code}).")
+        raise RuntimeError(f"Failed downloading file from Google Drive (HTTP {response.status_code}). Check file sharing permissions.")
 
     return pd.read_csv(io.BytesIO(response.content))
-
-def download_latest_screener_csv() -> pd.DataFrame:
-    """Finds 'screener.csv' dynamically inside the shared folder."""
-    target_id = extract_id(GDRIVE_FOLDER_LINK)
-    if not target_id or "PASTE_YOUR" in target_id:
-        raise ValueError("Please paste your public Google Drive folder link in GDRIVE_FOLDER_LINK.")
-
-    # Fallback check if user provided direct file URL
-    if "file/d/" in GDRIVE_FOLDER_LINK:
-        return download_file_by_id(target_id)
-
-    # Inspect public folder HTML view to grab screener.csv file ID
-    folder_url = f"https://drive.google.com/embeddedfolderview?id={target_id}"
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-    }
-    res = requests.get(folder_url, headers=headers)
-    
-    if res.status_code != 200:
-        return download_file_by_id(target_id)
-
-    # Primary regex: extracts file ID associated with screener.csv in Drive folder view
-    pattern = rf'data-id="([-\w]{{25,}})"[^>]*>.*?{re.escape(TARGET_FILE_NAME)}'
-    matches = re.findall(pattern, res.text, re.IGNORECASE | re.DOTALL)
-    
-    if not matches:
-        alt_pattern = rf'{re.escape(TARGET_FILE_NAME)}.*?href="[^"]*id=([-\w]{{25,}})"'
-        matches = re.findall(alt_pattern, res.text, re.IGNORECASE | re.DOTALL)
-
-    if matches:
-        latest_file_id = matches[0]
-        print(f"[INFO] Found '{TARGET_FILE_NAME}' in folder (File ID: {latest_file_id})")
-        return download_file_by_id(latest_file_id)
-    else:
-        print("[WARN] Folder index parsing fallback: attempting direct download with target ID...")
-        return download_file_by_id(target_id)
 
 def init_firebase():
     if not firebase_admin._apps:
@@ -229,16 +189,20 @@ def clean_numeric_col(series: pd.Series) -> pd.Series:
 # 3. PIPELINE RUNNER
 # =====================================================================
 def run_pipeline():
-    print(f"[INFO] Streaming daily screener data automatically from shared folder...")
-    df = download_latest_screener_csv()
+    file_id = extract_file_id(GDRIVE_SHARE_LINK)
+    if not file_id or "PASTE_YOUR" in file_id:
+        raise ValueError("Please provide a valid Google Drive file link in GDRIVE_SHARE_LINK.")
+
+    print(f"[INFO] Downloading screener.csv directly via Google Drive link (ID: {file_id})...")
+    df = download_csv_from_drive(file_id)
     print(f"[OK] Successfully loaded CSV ({len(df)} rows).")
 
-    # Clean non-breaking spaces, BOM, and whitespace from CSV headers
+    # Clean whitespace, BOM, and non-breaking spaces
     df.columns = [str(c).replace('\xa0', ' ').replace('\ufeff', '').strip() for c in df.columns]
 
     rename_dict = {}
 
-    # 1. Alphanumeric normalized lookup for standard columns
+    # 1. Alphanumeric lookup for standard columns
     norm_csv_map = {re.sub(r'[^a-z0-9]', '', c.lower()): c for c in df.columns}
     for std_name, target_key in column_mapping.items():
         std_norm = re.sub(r'[^a-z0-9]', '', std_name.lower())
@@ -250,12 +214,10 @@ def run_pipeline():
     for col in df.columns:
         norm = re.sub(r'[^a-z0-9]', '', col.lower())
 
-        # Last Result Date
         if "result" in norm and "date" in norm:
             rename_dict[col] = "Last Qtr"
             continue
 
-        # ROCE Detection (Checks 3-Year first to avoid collision)
         is_roce = ("capital" in norm and "employed" in norm) or "roce" in norm
         if is_roce:
             if any(term in norm for term in ["3year", "3years", "3yr", "3y"]):
@@ -265,11 +227,20 @@ def run_pipeline():
 
     extracted_df = df[list(rename_dict.keys())].rename(columns=rename_dict).copy()
 
-    # Clean numeric fields for ROCE
+    # Clean numeric fields
     if "roce-0" in extracted_df.columns:
         extracted_df["roce-0"] = clean_numeric_col(extracted_df["roce-0"])
+        sample = extracted_df["roce-0"].dropna().iloc[0] if not extracted_df["roce-0"].dropna().empty else "N/A"
+        print(f"[OK] Verified 'roce-0' in dataset! Sample value: {sample}")
+    else:
+        print("[WARN] 'roce-0' column not detected in CSV")
+
     if "roce-3y" in extracted_df.columns:
         extracted_df["roce-3y"] = clean_numeric_col(extracted_df["roce-3y"])
+        sample = extracted_df["roce-3y"].dropna().iloc[0] if not extracted_df["roce-3y"].dropna().empty else "N/A"
+        print(f"[OK] Verified 'roce-3y' in dataset! Sample value: {sample}")
+    else:
+        print("[WARN] 'roce-3y' column not detected in CSV")
 
     # Format Last Qtr
     if "Last Qtr" in extracted_df.columns:
@@ -287,7 +258,6 @@ def run_pipeline():
         for n, b, nm in zip(nse_col, bse_col, name_col)
     ]
 
-    # Remove empty or duplicate keys
     extracted_df = extracted_df[extracted_df["CODE"] != ""].copy()
     extracted_df = extracted_df.drop_duplicates(subset=["CODE"], keep="first")
 
@@ -295,7 +265,6 @@ def run_pipeline():
     cleaned_df = extracted_df.replace([np.inf, -np.inf], np.nan)
     cleaned_df = cleaned_df.astype(object).where(pd.notnull(cleaned_df), None)
 
-    # Convert to keyed dictionary
     keyed_records = cleaned_df.set_index("CODE", drop=False).to_dict(orient="index")
 
     print("[INFO] Uploading keyed dictionary to Firebase Realtime Database...")
