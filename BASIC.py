@@ -62,6 +62,8 @@ column_mapping = {
     "Return on assets": "roa-0",
     "Return on assets preceding year": "roa-1",
     "Return on assets 3years": "roa-3y",
+    "Return on capital employed": "roce-0",
+    "Average return on capital employed 3Years": "roce-3y",
     "Debt to equity": "DE",
     "Dividend yield": "DY",
     "AVGOPM": "OPM",
