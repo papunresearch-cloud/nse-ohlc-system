@@ -3,7 +3,8 @@
 SCREENER BASE INGESTION (BASIC.py) - DIRECT PUBLIC LINK STREAMING
 ===============================================================================
 * Downloads screener.csv directly from Google Drive using a public share link.
-* Completely eliminates OAuth tokens, browser logins, and googleapiclient.
+* Resolves case and space variations for "Last result date".
+* Formats YYYYMM / float inputs into clean "Month, Year" labels under "Last Qtr".
 * Derives primary key 'CODE' (NSE > BSE > Name fallback).
 * Cleans, sanitizes, and writes directly to Firebase Realtime Database at /SCREENER.
 * Updates /system_status/screener_sync with success timestamp.
@@ -24,7 +25,7 @@ import firebase_admin
 from firebase_admin import credentials, db
 
 # =====================================================================
-# 1. PASTE YOUR GOOGLE DRIVE LINK HERE
+# 1. CONFIGURATION & CONSTANTS
 # =====================================================================
 GDRIVE_SHARE_LINK = "https://drive.google.com/file/d/1hveFXGaHo-eMlQxDcYhanVAQFzHgaXtQ/view?usp=sharing"
 
@@ -87,8 +88,7 @@ column_mapping = {
     "Promoter holding": "PRH",
     "Change in promoter holding": "DPRH",
     "YOY Quarterly sales growth": "YSG",
-    "YOY Quarterly profit growth": "YPG",
-    "Last result date": "Last Qtr"
+    "YOY Quarterly profit growth": "YPG"
 }
 
 # =====================================================================
@@ -163,6 +163,40 @@ def derive_primary_key(bse: str, nse: str, name: str) -> str:
 
     return sanitize_firebase_key(chosen)
 
+def format_last_qtr(value):
+    """Parses date expressions or integers (e.g. 202606, 202606.0) to 'Month, Year'."""
+    if pd.isna(value) or value is None:
+        return None
+
+    try:
+        val_str = str(int(float(value))).strip()
+    except (ValueError, TypeError):
+        val_str = str(value).strip().split('.')[0]
+
+    if len(val_str) == 6 and val_str.isdigit():
+        year = val_str[:4]
+        month = val_str[4:6]
+
+        month_names = {
+            "01": "Jan",
+            "02": "Feb",
+            "03": "March",
+            "04": "April",
+            "05": "May",
+            "06": "June",
+            "07": "July",
+            "08": "Aug",
+            "09": "Sept",
+            "10": "Oct",
+            "11": "Nov",
+            "12": "Dec"
+        }
+
+        if month in month_names:
+            return f"{month_names[month]}, {year}"
+
+    return None
+
 # =====================================================================
 # 3. PIPELINE RUNNER
 # =====================================================================
@@ -175,36 +209,23 @@ def run_pipeline():
     df = download_csv_from_drive(file_id)
     print(f"[OK] Successfully loaded CSV ({len(df)} rows).")
 
+    # Flexible matching for "Last result date" to prevent casing/space mismatches
+    mapping = column_mapping.copy()
+    for col in df.columns:
+        norm = col.strip().lower()
+        if norm in ["last result date", "latest result date", "result date"]:
+            mapping[col] = "Last Qtr"
+            break
+
     # Column filtering & renaming
-    valid_cols = [c for c in column_mapping.keys() if c in df.columns]
-    extracted_df = df[valid_cols].rename(columns=column_mapping)
+    valid_cols = [c for c in mapping.keys() if c in df.columns]
+    extracted_df = df[valid_cols].rename(columns=mapping)
 
-    # Convert Last result date (YYYYMM) to Last Qtr (Month, Year)
+    # Convert Last result date to Last Qtr
     if "Last Qtr" in extracted_df.columns:
-        def format_last_qtr(value):
-            if pd.isna(value):
-                return None
-
-            value = str(value).strip()
-
-            # Handle values such as 202606, 202603, 202612
-            if re.fullmatch(r"\d{6}", value):
-                year = value[:4]
-                month = value[4:6]
-
-                month_names = {
-                    "03": "March",
-                    "06": "June",
-                    "09": "Sept",
-                    "12": "Dec"
-                }
-
-                if month in month_names:
-                    return f"{month_names[month]}, {year}"
-
-            return None
-
         extracted_df["Last Qtr"] = extracted_df["Last Qtr"].apply(format_last_qtr)
+    else:
+        extracted_df["Last Qtr"] = None
 
     # Resolve primary key CODE column
     bse_col = extracted_df["BSE"] if "BSE" in extracted_df.columns else [""] * len(extracted_df)
