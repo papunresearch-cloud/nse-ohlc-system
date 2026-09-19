@@ -3,9 +3,9 @@
 SCREENER BASE INGESTION (BASIC.py) - DIRECT PUBLIC LINK STREAMING
 ===============================================================================
 * Downloads screener.csv directly from Google Drive using a public share link.
-* Explicitly maps:
-    "Return on capital employed" -> "roce-0"
-    "Average return on capital employed 3Years" -> "roce-3y"
+* Robust matching for ROCE ("roce-0") and 3-Year ROCE ("roce-3y").
+* Formats YYYYMM / float inputs into clean "Month, Year" labels under "Last Qtr".
+* Derives primary key 'CODE' (NSE > BSE > Name fallback).
 * Cleans, sanitizes, and writes directly to Firebase Realtime Database at /SCREENER.
 * Updates /system_status/screener_sync with success timestamp.
 ===============================================================================
@@ -36,7 +36,7 @@ FIREBASE_DB_URL = "https://stock-dashboard-5c25c-default-rtdb.asia-southeast1.fi
 TIMEZONE = "Asia/Kolkata"
 IST = pytz.timezone(TIMEZONE)
 
-# Base column mapping
+# Standard mapping dictionary
 column_mapping = {
     "Name": "Name",
     "BSE Code": "BSE", 
@@ -196,56 +196,76 @@ def run_pipeline():
     df = download_csv_from_drive(file_id)
     print(f"[OK] Successfully loaded CSV ({len(df)} rows).")
 
-    # Clean non-breaking spaces, BOM, and whitespace from CSV headers
-    df.columns = [
-        str(c).replace('\xa0', ' ').replace('\ufeff', '').strip()
-        for c in df.columns
-    ]
+    # Clean up whitespace, BOM, and non-breaking spaces from column headers
+    df.columns = [str(c).replace('\xa0', ' ').replace('\ufeff', '').strip() for c in df.columns]
 
-    # Flexible matching dictionary: normalized -> target_key
-    # This matches case-insensitively without spaces
-    normalized_mapping = {
-        re.sub(r'[^a-z0-9]', '', k.lower()): v
-        for k, v in column_mapping.items()
-    }
+    # Print matching columns for diagnostics
+    print("[INFO] Auditing capital/roce headers in CSV:")
+    found_any = False
+    for c in df.columns:
+        if any(term in c.lower() for term in ["capital", "roce", "employed"]):
+            print(f"       -> {repr(c)}")
+            found_any = True
+    if not found_any:
+        print("       -> No columns containing 'capital', 'roce', or 'employed' found!")
 
-    # Add flexible variations for ROCE and Result Date
-    normalized_mapping["roce"] = "roce-0"
-    normalized_mapping["returnoncapitalemployed"] = "roce-0"
-    normalized_mapping["roce3y"] = "roce-3y"
-    normalized_mapping["roce3years"] = "roce-3y"
-    normalized_mapping["averagereturnoncapitalemployed3years"] = "roce-3y"
-    normalized_mapping["returnoncapitalemployed3years"] = "roce-3y"
-    normalized_mapping["lastresultdate"] = "Last Qtr"
-    normalized_mapping["latestresultdate"] = "Last Qtr"
-    normalized_mapping["resultdate"] = "Last Qtr"
-
-    # Map actual CSV columns to target database keys
+    # Build mapping dictionary: actual_csv_column -> database_key
     rename_dict = {}
+
+    # 1. First map standard keys by normalized match (alphanumeric only)
+    norm_csv_map = {re.sub(r'[^a-z0-9]', '', c.lower()): c for c in df.columns}
+
+    for std_name, target_key in column_mapping.items():
+        std_norm = re.sub(r'[^a-z0-9]', '', std_name.lower())
+        if std_norm in norm_csv_map:
+            actual_col = norm_csv_map[std_norm]
+            rename_dict[actual_col] = target_key
+
+    # 2. Targeted substring detection for ROCE, ROCE 3Y, and Result Date
     for col in df.columns:
-        clean_key = re.sub(r'[^a-z0-9]', '', col.lower())
-        if clean_key in normalized_mapping:
-            target_key = normalized_mapping[clean_key]
-            rename_dict[col] = target_key
+        norm = re.sub(r'[^a-z0-9]', '', col.lower())
+
+        # Result date
+        if "result" in norm and "date" in norm:
+            rename_dict[col] = "Last Qtr"
+
+        # ROCE fields
+        if ("capital" in norm and "employed" in norm) or "roce" in norm:
+            if "3" in norm:
+                rename_dict[col] = "roce-3y"
+            else:
+                rename_dict[col] = "roce-0"
+
+    # Invert to confirm what matched
+    inverted_matches = {v: k for k, v in rename_dict.items()}
+
+    # Confirm roce-0
+    if "roce-0" in inverted_matches:
+        actual_roce0_name = inverted_matches["roce-0"]
+        print(f"[OK] Mapped 'roce-0' from CSV column: {repr(actual_roce0_name)}")
+    else:
+        print("[ERROR] 'roce-0' column NOT FOUND in CSV!")
+
+    # Confirm roce-3y
+    if "roce-3y" in inverted_matches:
+        actual_roce3y_name = inverted_matches["roce-3y"]
+        print(f"[OK] Mapped 'roce-3y' from CSV column: {repr(actual_roce3y_name)}")
+    else:
+        print("[ERROR] 'roce-3y' column NOT FOUND in CSV!")
 
     # Extract matched columns
     extracted_df = df[list(rename_dict.keys())].rename(columns=rename_dict).copy()
 
-    # Verify and clean roce-0
+    # Clean numeric fields
     if "roce-0" in extracted_df.columns:
         extracted_df["roce-0"] = clean_numeric_col(extracted_df["roce-0"])
         sample = extracted_df["roce-0"].dropna().iloc[0] if not extracted_df["roce-0"].dropna().empty else "N/A"
-        print(f"[OK] Mapped 'roce-0' successfully! Sample value: {sample}")
-    else:
-        print("[ERROR] 'roce-0' column NOT FOUND in CSV!")
+        print(f"[OK] 'roce-0' sample value: {sample}")
 
-    # Verify and clean roce-3y
     if "roce-3y" in extracted_df.columns:
         extracted_df["roce-3y"] = clean_numeric_col(extracted_df["roce-3y"])
         sample = extracted_df["roce-3y"].dropna().iloc[0] if not extracted_df["roce-3y"].dropna().empty else "N/A"
-        print(f"[OK] Mapped 'roce-3y' successfully! Sample value: {sample}")
-    else:
-        print("[ERROR] 'roce-3y' column NOT FOUND in CSV!")
+        print(f"[OK] 'roce-3y' sample value: {sample}")
 
     # Format Last Qtr
     if "Last Qtr" in extracted_df.columns:
