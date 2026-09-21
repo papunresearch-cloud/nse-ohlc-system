@@ -292,7 +292,8 @@ class MasterOrchestrator:
         init_firebase()
         self.calendar = MarketCalendar()
         self.script_status = {}
-        self.last_stock_event_ts = time.time() * 1000
+        # Initialized to 0.0 so newly queued commands are not ignored on startup
+        self.last_stock_event_ts = 0.0
         self.last_heartbeat_time = 0.0
         self.replan_daily_routine()
 
@@ -419,6 +420,38 @@ class MasterOrchestrator:
         except Exception as e:
             logger.error(f"[ON-DEMAND SYNC] Failed syncing {safe_code}: {e}", exc_info=True)
 
+    def execute_historical_sync(self):
+        """Runs on-demand historical OHLC sync for all active targets."""
+        logger.info(f"[SYNC] Starting historical OHLC sync for {len(self.script_status)} targets...")
+        for safe_code, meta in list(self.script_status.items()):
+            if not _keep_running:
+                break
+            ticker = meta.get("ticker") or f"{safe_code}.NS"
+            try:
+                success, msg = sync_historical_script(safe_code, ticker, gap_trading_days=300, calendar=self.calendar)
+                if success:
+                    meta["synced"] = True
+                    logger.info(f"[SYNC] ✓ {safe_code} ({ticker}): {msg}")
+                    try:
+                        update_live_script(safe_code, ticker)
+                    except Exception as live_err:
+                        logger.warning(f"[SYNC] Live init skipped for {safe_code}: {live_err}")
+                else:
+                    meta["synced"] = False
+                    logger.warning(f"[SYNC] ✗ {safe_code} ({ticker}): {msg}")
+            except Exception as e:
+                logger.error(f"[SYNC] Failed sync for {safe_code}: {e}")
+
+        # Update all technical parameters once OHLC sync completes
+        if update_all_parameters:
+            try:
+                active_codes = [code for code, s in self.script_status.items() if s.get("synced")]
+                if active_codes:
+                    update_all_parameters(active_codes)
+                    logger.info("[SYNC] Parameters recalculated successfully.")
+            except Exception as p_err:
+                logger.error(f"[SYNC] Parameter calculation error: {p_err}")
+
     def execute_live_intraday_cycle(self):
         """Updates live candles for all active stocks."""
         for safe_code, info in list(self.script_status.items()):
@@ -449,7 +482,9 @@ class MasterOrchestrator:
 
             # 2. Check for manual sync pulse via HTTP (/sync)
             if STATE_BUS.check_and_clear_manual_sync():
+                logger.info("[OVERRIDE PULSE] Immediate sync commanded. Running reconciliation and OHLC sync...")
                 self.replan_daily_routine()
+                threading.Thread(target=self.execute_historical_sync, daemon=True, name="ManualSyncWorker").start()
 
             # 3. Intraday tick cycle (every LIVE_UPDATE_INTERVAL_SEC if power latched ON)
             if STATE_BUS.is_power_on() and (now - last_intraday_tick >= LIVE_UPDATE_INTERVAL_SEC):
