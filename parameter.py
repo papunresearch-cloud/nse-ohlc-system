@@ -3,7 +3,8 @@ PARAMETER CALCULATION MODULE (parameter.py)
 Fully autonomous calculation engine:
 1. Discovers every active stock from /watchlist, /display_list, /stocks, and fixed indices.
 2. Prioritizes primary identifier 'CODE' to eliminate dot/underscore mismatch bugs.
-3. Calculates RSI, 10MA, 25MA, 50MA, 200MA, 52W Extremes, Periodic Returns, and 3yr from SCREENER.
+3. Calculates RSI, 10MA, 25MA, 50MA, 200MA, 52W Extremes, Periodic Returns, 
+   100/50/25-day Highs & Lows, and 3yr from SCREENER.
 4. Multi-writes to /param across CODE, raw, and sanitized symbol aliases so frontend fetches never miss.
 """
 
@@ -226,7 +227,6 @@ def process_target_group(aliases: List[str]) -> bool:
         return False
 
     c_0 = candles[0] if len(candles) > 0 else None
-    c_1_candle = candles[1] if len(candles) > 1 else None
 
     close_0 = parse_price(c_0, "close")
     open_0 = parse_price(c_0, "open")
@@ -255,11 +255,27 @@ def process_target_group(aliases: List[str]) -> bool:
     # RSI
     rsi = calculate_rsi(closes, 14)
 
-    # 52-Week Extremes
+    # 52-Week Extremes (252 trading sessions)
     h_slice = highs[:252]
     l_slice = lows[:252]
     w52h = safe_round(max(h_slice), 2) if len(h_slice) >= 10 else "N/A"
     w52l = safe_round(min(l_slice), 2) if len(l_slice) >= 10 else "N/A"
+
+    # Multi-period Extremes (100d, 50d, 25d)
+    h100_slice = highs[:100]
+    l100_slice = lows[:100]
+    h100 = safe_round(max(h100_slice), 2) if len(h100_slice) >= 5 else "N/A"
+    l100 = safe_round(min(l100_slice), 2) if len(l100_slice) >= 5 else "N/A"
+
+    h50_slice = highs[:50]
+    l50_slice = lows[:50]
+    h50 = safe_round(max(h50_slice), 2) if len(h50_slice) >= 5 else "N/A"
+    l50 = safe_round(min(l50_slice), 2) if len(l50_slice) >= 5 else "N/A"
+
+    h25_slice = highs[:25]
+    l25_slice = lows[:25]
+    h25 = safe_round(max(h25_slice), 2) if len(h25_slice) >= 5 else "N/A"
+    l25 = safe_round(min(l25_slice), 2) if len(l25_slice) >= 5 else "N/A"
 
     def get_close(idx: int) -> Optional[float]:
         return closes[idx] if len(closes) > idx else None
@@ -297,6 +313,12 @@ def process_target_group(aliases: List[str]) -> bool:
         "200ma": ma200,
         "52wh": w52h,
         "52wl": w52l,
+        "100h": h100,
+        "100l": l100,
+        "50h": h50,
+        "50l": l50,
+        "25h": h25,
+        "25l": l25,
         "2dy-%chng": chng_2dy,
         "Ydy-%chng": chng_ydy,
         "1wr": ret_1wr,
@@ -319,6 +341,12 @@ def process_target_group(aliases: List[str]) -> bool:
         "200MA": ma200,
         "52WH": w52h,
         "52WL": w52l,
+        "100H": h100,
+        "100L": l100,
+        "50H": h50,
+        "50L": l50,
+        "25H": h25,
+        "25L": l25,
         "1W": ret_1wr,
         "1M": ret_1mr,
         "3M": ret_3mr,
