@@ -26,8 +26,8 @@ from config import (
 FIXED_INDICES = {
     "NIFTY50": "^NSEI",
     "NIFTY100": "^CNX100",
-    "NIFTY MIDCAP 150": "NIFTYMIDCAP150.NS",
-    "NIFTY SMALLCAP 250": "NIFTYSMLCAP250.NS"
+    "NIFTYMID150": "NIFTYMIDCAP150.NS",
+    "NIFTYSM250": "NIFTYSMLCAP250.NS"
 }
 
 
@@ -200,18 +200,27 @@ def reconcile_stocklist_with_watchlist() -> tuple[bool, dict[str, str]]:
             # 1. Update /stocklist with exact active target set
             db.reference(PATH_SCRIPTS).set(safe_master_map)
             
+            # =========================================================
             # 2. Garbage Collector: Purge orphaned /stocks OHLC records
+            # =========================================================
             orphans = set(current_stocklist.keys()) - set(safe_master_map.keys())
             fixed_keys = {sanitize_key(k) for k in FIXED_INDICES.keys()}
 
             for orphan in orphans:
                 if orphan in fixed_keys:
-                    continue  # Guard fixed indices
+                    continue  # Guard fixed indices from deletion
+
                 logger.info(f"[GARBAGE COLLECTOR] Purging historical OHLC for deleted stock: {orphan}")
                 try:
                     db.reference(f"{PATH_STOCKS}/{orphan}").delete()
                 except Exception as del_err:
                     logger.warning(f"[GARBAGE COLLECTOR] Failed to purge {orphan}: {del_err}")
+
+                # Also prune /param for the orphan
+                try:
+                    db.reference(f"param/{orphan}").delete()
+                except Exception as del_param_err:
+                    logger.warning(f"[GARBAGE COLLECTOR] Failed to purge param/{orphan}: {del_param_err}")
 
             logger.info(f"[RECONCILE] /stocklist successfully synchronized with {len(safe_master_map)} targets.")
             return True, safe_master_map

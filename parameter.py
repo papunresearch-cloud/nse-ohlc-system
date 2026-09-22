@@ -129,11 +129,12 @@ def fetch_detailed_metrics(aliases: List[str]) -> Dict[str, Any]:
     if ret_3yr is None:
         for alias in aliases:
             clean_alias = sanitize_key(alias)
+            if not clean_alias:
+                continue
+            # Query ONLY sanitized paths to prevent illegal character crashes (. # $ [ ] /)
             data = (
                 db.reference(f"watchlist/detailedDb/{clean_alias}").get()
-                or db.reference(f"watchlist/detailedDb/{alias}").get()
                 or db.reference(f"detailedDb/{clean_alias}").get()
-                or db.reference(f"detailedDb/{alias}").get()
             )
             if isinstance(data, dict):
                 val = data.get("3yr") or data.get("3YR") or data.get("3Yr")
