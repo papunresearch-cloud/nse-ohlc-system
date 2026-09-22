@@ -36,13 +36,15 @@ from config import (
 )
 
 # Benchmark indices definition
-FIXED_INDICES = {
-    "NIFTY50": "^NSEI",
-    "NIFTY100": "^CNX100",
-    "NIFTY MIDCAP 150": "^CRSLDX",
-    "NIFTY SMALLCAP 250": "^CNXSC"
-}
-
+try:
+    from firebase_manager import FIXED_INDICES
+except ImportError:
+    FIXED_INDICES = {
+        "NIFTY50": "^NSEI",
+        "NIFTY100": "^CNX100",
+        "NIFTYMID150": "NIFTYMIDCAP150.NS",
+        "NIFTYSM250": "NIFTYSMLCAP250.NS"
+    }
 # 2. Firebase Manager imports
 from firebase_manager import (
     init_firebase,
