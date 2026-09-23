@@ -131,7 +131,6 @@ def fetch_detailed_metrics(aliases: List[str]) -> Dict[str, Any]:
             if not clean_alias:
                 continue
             try:
-                # Query ONLY clean paths to avoid illegal character crashes (. # $ [ ] /)
                 data = (
                     db.reference(f"watchlist/detailedDb/{clean_alias}").get()
                     or db.reference(f"detailedDb/{clean_alias}").get()
@@ -159,7 +158,6 @@ def fetch_candles_for_aliases(aliases: List[str]) -> Tuple[List[Dict[str, Any]],
                 continue
             checked.add(candidate)
 
-            # Avoid invalid path characters in query
             if re.search(r'[.#$\[\]/]', candidate):
                 continue
 
@@ -226,19 +224,16 @@ def process_target_group(aliases: List[str]) -> bool:
     if not clean_aliases:
         return False
 
-    # Standardize primary code to the sanitized uppercase identifier
     primary_code = sanitize_key(clean_aliases[0])
     if not primary_code:
         return False
 
     candles, found_source_key = fetch_candles_for_aliases(clean_aliases)
-
     if not candles:
         logger.warning(f"[{primary_code}] Skipped: No candle history found in /stocks under {clean_aliases}")
         return False
 
     c_0 = candles[0] if len(candles) > 0 else None
-
     close_0 = parse_price(c_0, "close")
     open_0 = parse_price(c_0, "open")
 
@@ -266,13 +261,12 @@ def process_target_group(aliases: List[str]) -> bool:
     # RSI
     rsi = calculate_rsi(closes, 14)
 
-    # 52-Week Extremes (252 trading sessions)
-    h_slice = highs[:252]
-    l_slice = lows[:252]
-    w52h = safe_round(max(h_slice), 2) if len(h_slice) >= 10 else "N/A"
-    w52l = safe_round(min(l_slice), 2) if len(l_slice) >= 10 else "N/A"
+    # Extremes
+    h52_slice = highs[:252]
+    l52_slice = lows[:252]
+    w52h = safe_round(max(h52_slice), 2) if len(h52_slice) >= 10 else "N/A"
+    w52l = safe_round(min(l52_slice), 2) if len(l52_slice) >= 10 else "N/A"
 
-    # Multi-period Extremes (100d, 50d, 25d)
     h100_slice = highs[:100]
     l100_slice = lows[:100]
     h100 = safe_round(max(h100_slice), 2) if len(h100_slice) >= 5 else "N/A"
@@ -298,6 +292,7 @@ def process_target_group(aliases: List[str]) -> bool:
     c_121 = get_close(121)
     c_251 = get_close(251) or get_close(250)
 
+    # Single-instance distinct returns
     chng_2dy = safe_div(close_0 - open_0, open_0) if (close_0 is not None and open_0 is not None) else "N/A"
     chng_ydy = safe_div(close_0 - c_1, c_1) if (close_0 is not None and c_1 is not None) else "N/A"
 
@@ -313,39 +308,16 @@ def process_target_group(aliases: List[str]) -> bool:
     current_time_str = now_ist.strftime("%H:%M:%S")
     current_date_str = str(c_0.get("date", now_ist.strftime("%Y-%m-%d"))) if c_0 else now_ist.strftime("%Y-%m-%d")
 
+    # DEDUPLICATED CLEAN PAYLOAD
     payload = {
-        # Standard Keys
         "CODE": primary_code,
-        "date": current_date_str,
-        "RSI": rsi,
-        "10ma": ma10,
-        "25ma": ma25,
-        "50ma": ma50,
-        "200ma": ma200,
-        "52wh": w52h,
-        "52wl": w52l,
-        "100h": h100,
-        "100l": l100,
-        "50h": h50,
-        "50l": l50,
-        "25h": h25,
-        "25l": l25,
-        "2dy-%chng": chng_2dy,
-        "Ydy-%chng": chng_ydy,
-        "1wr": ret_1wr,
-        "1mr": ret_1mr,
-        "3mr": ret_3mr,
-        "6mr": ret_6mr,
-        "1yr": ret_1yr,
-        "3yr": detailed_metrics["3yr"],
-        "updated_at": f"{current_date_str} {current_time_str}",
-
-        # Uppercase Schema Aliases
         "Name": primary_code,
         "CMP": close_0 if close_0 is not None else "N/A",
         "PREV_CLOSE": c_1 if c_1 is not None else "N/A",
-        "Tdy-%chng": chng_2dy,
-        "%Chg (T)": chng_ydy,
+        "DATE": current_date_str,
+        "TIME": current_time_str,
+        "updated_at": f"{current_date_str} {current_time_str}",
+        "RSI": rsi,
         "10MA": ma10,
         "25MA": ma25,
         "50MA": ma50,
@@ -358,21 +330,19 @@ def process_target_group(aliases: List[str]) -> bool:
         "50L": l50,
         "25H": h25,
         "25L": l25,
+        "CHG_DAY": chng_ydy,
+        "CHG_INTRADAY": chng_2dy,
         "1W": ret_1wr,
         "1M": ret_1mr,
         "3M": ret_3mr,
+        "6M": ret_6mr,
         "1YR": ret_1yr,
-        "3YR": detailed_metrics["3yr"],
-        "DATE": current_date_str,
-        "TIME": current_time_str
+        "3YR": detailed_metrics["3yr"]
     }
 
-    # ==============================================================
-    # SINGLE WRITE: Save ONLY in /param/<primary_code>
-    # ==============================================================
     try:
         db.reference(f"param/{primary_code}").set(payload)
-        logger.info(f"[{primary_code}] Successfully saved to /param/{primary_code}")
+        logger.info(f"[{primary_code}] Successfully saved single record to /param/{primary_code}")
         return True
     except Exception as e:
         logger.error(f"[{primary_code}] Failed to save /param/{primary_code}: {e}")
@@ -383,11 +353,9 @@ def discover_all_system_targets() -> List[List[str]]:
     """Discovers targets across nodes and groups them by primary CODE."""
     targets: List[List[str]] = []
 
-    # 1. Fixed market indices (Using synthetic CODE as primary)
     for idx_code, idx_ticker in FIXED_INDICES.items():
         targets.append([idx_code, idx_ticker, sanitize_key(idx_code), sanitize_key(idx_ticker)])
 
-    # 2. Stocklist node ({ CODE: TICKER })
     try:
         sl = db.reference("stocklist").get() or {}
         if isinstance(sl, dict):
@@ -396,7 +364,6 @@ def discover_all_system_targets() -> List[List[str]]:
     except Exception:
         pass
 
-    # 3. Watchlist detailedDb
     try:
         det_db = db.reference("watchlist/detailedDb").get() or {}
         if isinstance(det_db, dict):
@@ -410,7 +377,6 @@ def discover_all_system_targets() -> List[List[str]]:
     except Exception:
         pass
 
-    # 4. Watchlist array
     try:
         raw_wl = db.reference("watchlist/watchlist").get() or db.reference("watchlist").get()
         if isinstance(raw_wl, list):
@@ -425,7 +391,6 @@ def discover_all_system_targets() -> List[List[str]]:
     except Exception:
         pass
 
-    # 5. Display list
     try:
         dl = db.reference("display_list").get() or {}
         stk_list = dl.get("stocks", [])
@@ -440,7 +405,6 @@ def discover_all_system_targets() -> List[List[str]]:
     except Exception:
         pass
 
-    # 6. Populated /stocks nodes
     try:
         stocks_root = db.reference("stocks").shallow().get() or {}
         if isinstance(stocks_root, dict):
@@ -449,7 +413,6 @@ def discover_all_system_targets() -> List[List[str]]:
     except Exception:
         pass
 
-    # Merge overlapping alias sets
     merged: List[Set[str]] = []
     for grp in targets:
         grp_set = {str(x).strip() for x in grp if x and str(x).strip()}
@@ -465,7 +428,6 @@ def discover_all_system_targets() -> List[List[str]]:
         else:
             merged.append(grp_set)
 
-    # Place the clean, shortest, sanitized uppercase CODE first
     result_groups: List[List[str]] = []
     for s in merged:
         items = list(s)
@@ -507,6 +469,6 @@ def calculate_single_script_parameters(script: str) -> bool:
 if __name__ == "__main__":
     from firebase_manager import init_firebase
     init_firebase()
-    print("Initiating parameter calculation (saving strictly under CODE in /param)...")
+    print("Initiating deduplicated parameter calculation (saving strictly under CODE in /param)...")
     update_all_parameters()
     print("Parameter calculation complete.")
