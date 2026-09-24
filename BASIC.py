@@ -7,7 +7,8 @@ SCREENER BASE INGESTION (BASIC.py) - DIRECT PUBLIC LINK STREAMING
 * Formats YYYYMM / float inputs into clean "Month, Year" labels under "Last Qtr".
 * Derives primary key 'CODE' (NSE > BSE > Name fallback).
 * Cleans, sanitizes, and writes directly to Firebase Realtime Database at /SCREENER.
-* Updates /system_status/screener_sync with success timestamp.
+* Updates /system_status/screener_sync with success timestamp and record count,
+  preserving any existing 'Date of database data' field.
 ===============================================================================
 """
 
@@ -272,9 +273,9 @@ def run_pipeline():
     ref = db.reference(FIREBASE_TARGET_NODE)
     ref.set(keyed_records)
 
-    # Write status telemetry timestamp
+    # Update status telemetry timestamp while preserving 'Date of database data'
     now_ist = datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S IST")
-    db.reference("system_status/screener_sync").set({
+    db.reference("system_status/screener_sync").update({
         "last_updated": now_ist,
         "record_count": len(keyed_records),
         "status": "SUCCESS"
