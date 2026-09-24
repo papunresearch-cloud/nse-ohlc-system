@@ -5,7 +5,7 @@ FIREBASE MANAGER
 - Permanent anchoring of 4 master market indices (immune to purging/deletion).
 - Safe targeted mutations for /watchlist/detailedDb and /stocklist.
 - Guarded OHLC access for Child-1 (1 to 300) and Child-2 (index 0).
-- Garbage Collector: purges orphaned OHLC records from /stocks on deletion.
+- Garbage Collector: purges orphaned OHLC records from /stocks, /param, and /alerts on deletion.
 """
 import os
 import json
@@ -170,7 +170,7 @@ def get_current_stocklist() -> dict[str, str]:
 def reconcile_stocklist_with_watchlist() -> tuple[bool, dict[str, str]]:
     """
     Synchronizes /stocklist with active stocks in /watchlist.
-    Purges orphaned OHLC records from /stocks without touching other symbols or indices.
+    Purges orphaned OHLC records from /stocks, /param, and /alerts without touching other symbols.
     """
     init_firebase()
     master_map = get_master_watchlist_mapping()
@@ -200,9 +200,7 @@ def reconcile_stocklist_with_watchlist() -> tuple[bool, dict[str, str]]:
             # 1. Update /stocklist with exact active target set
             db.reference(PATH_SCRIPTS).set(safe_master_map)
             
-            # =========================================================
-            # 2. Garbage Collector: Purge orphaned /stocks OHLC records
-            # =========================================================
+            # 2. Garbage Collector: Purge orphaned records
             orphans = set(current_stocklist.keys()) - set(safe_master_map.keys())
             fixed_keys = {sanitize_key(k) for k in FIXED_INDICES.keys()}
 
@@ -210,19 +208,25 @@ def reconcile_stocklist_with_watchlist() -> tuple[bool, dict[str, str]]:
                 if orphan in fixed_keys:
                     continue  # Guard fixed indices from deletion
 
-                logger.info(f"[GARBAGE COLLECTOR] Purging historical OHLC for deleted stock: {orphan}")
+                logger.info(f"[GARBAGE COLLECTOR] Purging records for deleted stock: {orphan}")
                 try:
                     db.reference(f"{PATH_STOCKS}/{orphan}").delete()
                 except Exception as del_err:
-                    logger.warning(f"[GARBAGE COLLECTOR] Failed to purge {orphan}: {del_err}")
+                    logger.warning(f"[GARBAGE COLLECTOR] Failed to purge {PATH_STOCKS}/{orphan}: {del_err}")
 
-                # Also prune /param for the orphan
                 try:
                     db.reference(f"param/{orphan}").delete()
                 except Exception as del_param_err:
                     logger.warning(f"[GARBAGE COLLECTOR] Failed to purge param/{orphan}: {del_param_err}")
 
-            logger.info(f"[RECONCILE] /stocklist successfully synchronized with {len(safe_master_map)} targets.")
+                # Purge /alerts and /alerts/stock_controls
+                try:
+                    db.reference(f"alerts/{orphan}").delete()
+                    db.reference(f"alerts/stock_controls/{orphan}").delete()
+                except Exception as del_alert_err:
+                    logger.warning(f"[GARBAGE COLLECTOR] Failed to purge alerts for {orphan}: {del_alert_err}")
+
+            logger.info(f"[RECONCILE] /stocklist synchronized with {len(safe_master_map)} targets.")
             return True, safe_master_map
         except Exception as e:
             logger.error(f"[RECONCILE] Failed to write synchronized /stocklist: {e}", exc_info=True)

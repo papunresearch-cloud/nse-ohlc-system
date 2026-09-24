@@ -25,7 +25,6 @@ logger = logging.getLogger("NSE_OHLC_SYSTEM")
 # ==========================================
 # FIREBASE CONFIGURATION
 # ==========================================
-# Trailing slash removed to avoid URL parsing faults
 FIREBASE_DATABASE_URL = os.getenv(
     "FIREBASE_DATABASE_URL",
     "https://stock-dashboard-5c25c-default-rtdb.asia-southeast1.firebasedatabase.app"
@@ -52,10 +51,10 @@ SYNC_WINDOW_START_MIN = 0
 SYNC_WINDOW_DEADLINE_HOUR = 8
 SYNC_WINDOW_DEADLINE_MIN = 30
 
-SYNC_RETRY_INTERVAL_SEC = 300       # Retry failed syncs every 5 mins between 08:00 and 08:30
+SYNC_RETRY_INTERVAL_SEC = 300       # Retry failed syncs every 5 mins
 LIVE_UPDATE_INTERVAL_SEC = 300      # 5 mins live candle refresh
 PULSE_VALIDITY_SEC = 30             # 30-second TTL pulse duration
-HEARTBEAT_TICK_SEC = 10             # Fast main loop poll rate
+HEARTBEAT_TICK_SEC = 300            # Main loop heartbeat rate
 
 # ==========================================
 # YAHOO RATE-LIMIT PROTECTION
@@ -75,3 +74,13 @@ INTRADAY_INDEX = "0"          # Reserved strictly for live intraday market bar
 # SETTINGS FOR PARAMETER.PY
 # ==========================================
 PARAM_UPDATE_INTERVAL_SEC = 900  # 15 minutes
+
+# ==========================================
+# ALERT GATEWAY NOTIFICATION CONFIGURATION
+# ==========================================
+SMTP_SERVER = os.getenv("SMTP_SERVER", "smtp.gmail.com")
+SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
+SENDER_EMAIL = os.getenv("SENDER_EMAIL", "")
+SENDER_APP_PASSWORD = os.getenv("SENDER_APP_PASSWORD", "")
+CALLMEBOT_API_KEY = os.getenv("CALLMEBOT_API_KEY", "")
+ALERT_CHECK_INTERVAL_SEC = 300   # Check triggers every 5 mins during live market

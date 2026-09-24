@@ -2,13 +2,14 @@
 ===============================================================================
 MASTER ORCHESTRATOR (Primary Key Architecture: CODE)
 ===============================================================================
-* Coordinates live OHLC backfills, indicators, and HTTP control signals.
+* Coordinates live OHLC backfills, indicators, alerts, and HTTP control signals.
 * Keyed exclusively by stock CODE across /stocks/<CODE> and /param/<CODE>.
 * Listens to /system_commands/stock_event dispatched from Watchlist.jsx.
 * Embeds HTTP server on port 10000 with CORS, HEAD, GET, and POST support.
 * Self-healing state-machine scheduling: pre-market catch-up, live ticks,
   post-market settlement window, and per-stock quarantine protection.
 * Updates real-time Firebase /system_status telemetry on every cycle and heartbeat.
+* Dispatches background email/WhatsApp price boundary alerts during live market.
 ===============================================================================
 """
 
@@ -36,6 +37,11 @@ from config import (
     PULSE_VALIDITY_SEC,
     logger
 )
+
+try:
+    from config import ALERT_CHECK_INTERVAL_SEC
+except ImportError:
+    ALERT_CHECK_INTERVAL_SEC = 300
 
 # Benchmark indices definition strictly using synthetic uppercase CODEs
 FIXED_INDICES = {
@@ -103,6 +109,13 @@ except ImportError:
         except ImportError:
             run_screener_pipeline = None
 
+# 7. Alert Notification Dispatcher
+try:
+    from alert_notifier import evaluate_market_alerts
+except ImportError:
+    def evaluate_market_alerts():
+        pass
+
 IST = pytz.timezone(TIMEZONE)
 _keep_running = True
 _screener_lock = threading.Lock()
@@ -153,7 +166,7 @@ class SystemStateBus:
 STATE_BUS = SystemStateBus()
 
 def dispatch_screener_sync_job():
-    """Runs screener ETL in a background daemon thread with full trace logging."""
+    """Runs screener ETL in a background daemon thread with trace logging."""
     if not run_screener_pipeline:
         logger.error("[SCREENER] Cannot run pipeline: ETL runner not loaded.")
         return False, "ETL runner module not available"
@@ -329,7 +342,6 @@ class MasterOrchestrator:
 
         stock_map = get_stocklist_mapping(force_reconcile=True)
 
-        # 1. Purge legacy spaced index targets from memory and Firebase
         legacy_keys = [
             "NIFTY MIDCAP 150",
             "NIFTY SMALLCAP 250",
@@ -347,11 +359,9 @@ class MasterOrchestrator:
                 except Exception:
                     pass
 
-        # 2. Merge synthetic fixed market indices
         for k, v in FIXED_INDICES.items():
             stock_map[k] = v
 
-        # Preserve existing sync state if target already verified today
         new_status = {}
         for code, ticker in stock_map.items():
             if code in self.script_status and self.script_status[code].get("synced"):
@@ -409,9 +419,11 @@ class MasterOrchestrator:
             try:
                 db.reference(f"stocks/{safe_code}").delete()
                 db.reference(f"param/{safe_code}").delete()
-                logger.info(f"[DELETE EVENT] Purged /stocks/{safe_code} and /param/{safe_code}")
+                db.reference(f"alerts/{safe_code}").delete()
+                db.reference(f"alerts/stock_controls/{safe_code}").delete()
+                logger.info(f"[DELETE EVENT] Purged /stocks, /param, and /alerts for {safe_code}")
             except Exception as e:
-                logger.error(f"[DELETE EVENT] Error purging /stocks or /param: {e}")
+                logger.error(f"[DELETE EVENT] Error purging data for {safe_code}: {e}")
 
             try:
                 display_ref = db.reference("display_list/stocks")
@@ -473,11 +485,9 @@ class MasterOrchestrator:
                 if not _keep_running:
                     break
 
-                # Skip already verified scripts unless it is an explicit manual forced run
                 if meta.get("synced") and not is_manual:
                     continue
 
-                # Check quarantine status (skip if 3 consecutive failures recorded today)
                 if meta.get("quarantined") and not is_manual:
                     logger.info(f"[SYNC] Skipping quarantined ticker {safe_code}.")
                     continue
@@ -512,7 +522,6 @@ class MasterOrchestrator:
                     meta["failure_count"] = meta.get("failure_count", 0) + 1
                     logger.error(f"[SYNC] Failed sync for {safe_code}: {e}")
 
-            # Recalculate parameters for all verified scripts
             if update_all_parameters:
                 try:
                     active_codes = [c for c, s in self.script_status.items() if s.get("synced")]
@@ -522,7 +531,6 @@ class MasterOrchestrator:
                 except Exception as p_err:
                     logger.error(f"[SYNC] Parameter calculation error: {p_err}")
 
-            # Commit health telemetry to Firebase
             self._commit_sync_telemetry()
 
         finally:
@@ -584,8 +592,9 @@ class MasterOrchestrator:
         logger.info("[ORCHESTRATOR] Master engine started. Primary key: CODE.")
         last_intraday_tick = 0.0
         last_param_calc_tick = 0.0
+        last_alert_eval_tick = 0.0
 
-        # 1. Initial heartbeat write and boot catch-up sync
+        # Initial heartbeat write and boot catch-up sync
         self.record_heartbeat()
         threading.Thread(target=self.execute_historical_sync, kwargs={"is_manual": False}, daemon=True, name="BootSyncWorker").start()
 
@@ -600,7 +609,7 @@ class MasterOrchestrator:
                 if (now_epoch - self.last_heartbeat_time) >= 300:
                     self.record_heartbeat()
 
-                # --- 2. Realtime Stock Events from Watchlist.jsx (Priority 0) ---
+                # --- 2. Realtime Stock Events from Watchlist.jsx ---
                 has_event, event_payload = self.check_stock_event()
                 if has_event:
                     self.handle_stock_event(event_payload)
@@ -626,7 +635,7 @@ class MasterOrchestrator:
 
                 # A. LIVE MARKET WINDOW (09:15 – 15:30 IST)
                 if status == "LIVE":
-                    # Intraday tick cycle (every LIVE_UPDATE_INTERVAL_SEC, e.g. 300s)
+                    # Intraday tick cycle (every 300s)
                     if (now_epoch - last_intraday_tick) >= LIVE_UPDATE_INTERVAL_SEC:
                         self.execute_live_intraday_cycle()
                         last_intraday_tick = now_epoch
@@ -638,6 +647,11 @@ class MasterOrchestrator:
                             threading.Thread(target=update_all_parameters, args=(active_synced,), daemon=True).start()
                         last_param_calc_tick = now_epoch
 
+                    # Alert Notification Evaluator (every 300s, non-blocking)
+                    if (now_epoch - last_alert_eval_tick) >= ALERT_CHECK_INTERVAL_SEC:
+                        threading.Thread(target=evaluate_market_alerts, daemon=True, name="AlertNotifier").start()
+                        last_alert_eval_tick = now_epoch
+
                 # B. POST-MARKET SETTLEMENT WINDOW (15:45 – 16:30 IST)
                 elif dtime(15, 45) <= now_time < dtime(16, 30):
                     if not self.eod_reconciled_today and self.calendar.is_trading_day(today_date):
@@ -648,7 +662,6 @@ class MasterOrchestrator:
                     has_unsynced_and_unquarantined = any(
                         (not s.get("synced") and not s.get("quarantined")) for s in self.script_status.values()
                     )
-                    # Retry unsynced items every 300 seconds if needed
                     if has_unsynced_and_unquarantined and (now_epoch - last_intraday_tick >= 300):
                         logger.info("[SCHEDULE] Pre-market catch-up active. Retrying unsynced targets...")
                         threading.Thread(target=self.execute_historical_sync, kwargs={"is_manual": False}, daemon=True).start()
