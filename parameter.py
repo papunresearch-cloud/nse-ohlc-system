@@ -4,8 +4,9 @@ Autonomous calculation engine:
 1. Discovers every active stock from /stocklist, /watchlist, /display_list, /stocks, and fixed indices.
 2. Identifies and prioritizes primary uppercase 'CODE'.
 3. Calculates RSI, 10MA, 25MA, 50MA, 200MA, 52W Extremes, 100/50/25-day Highs & Lows,
-   Periodic Returns, and 3yr metric.
-4. Saves strictly in one place under the primary CODE: /param/<CODE>
+   Periodic Returns, 3yr metric, and 14D ATR.
+4. Implements Set-Reset Hysteresis Deadband Alerts for Hi & Lo flags.
+5. Saves strictly in one place under the primary CODE: /param/<CODE>
 """
 
 import math
@@ -219,6 +220,135 @@ def calculate_sma(closes_newest_first: List[float], window: int) -> Any:
     return safe_round(sum(sub_slice) / window, 2)
 
 
+def calculate_atr(candles: List[Dict[str, Any]], period: int = 14) -> Optional[float]:
+    """Calculates True Range (TR) and standard 14-day ATR across completed sessions (Index 1+)."""
+    hist_candles = candles[1:] if len(candles) > 1 else []
+    if len(hist_candles) < (period + 1):
+        return None
+
+    true_ranges: List[float] = []
+    for i in range(period):
+        curr = hist_candles[i]
+        prev = hist_candles[i + 1]
+
+        h = parse_price(curr, "high")
+        l = parse_price(curr, "low")
+        pc = parse_price(prev, "close")
+
+        if h is None or l is None or pc is None or h < l:
+            return None
+
+        tr = max(h - l, abs(h - pc), abs(l - pc))
+        true_ranges.append(tr)
+
+    if len(true_ranges) < period:
+        return None
+
+    return round(sum(true_ranges) / period, 2)
+
+
+def evaluate_set_reset_alerts(
+    primary_code: str,
+    cmp: Optional[float],
+    atr_14d: Optional[float],
+    aliases: List[str]
+) -> Tuple[bool, bool]:
+    """
+    Evaluates Set-Reset Hysteresis logic with 14D ATR deadband buffer:
+    - If data is invalid/missing/corrupted -> Frees latched state and returns (False, False).
+    - Only sets Hi or Lo to True when all price metrics are valid and pristine.
+    """
+    if cmp is None or cmp <= 0 or atr_14d is None or atr_14d <= 0:
+        try:
+            db.reference(f"alerts/{primary_code}").update({
+                "latched_state": "NONE",
+                "timestamp": datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S")
+            })
+        except Exception:
+            pass
+        return False, False
+
+    preset_low = 0.0
+    preset_high = 99999999.0
+
+    for alias in aliases:
+        clean_alias = sanitize_key(alias)
+        if not clean_alias:
+            continue
+        try:
+            meta = (
+                db.reference(f"watchlist/detailedDb/{clean_alias}").get()
+                or db.reference(f"detailedDb/{clean_alias}").get()
+            )
+            if isinstance(meta, dict):
+                raw_low = meta.get("preset_low")
+                raw_high = meta.get("preset_high")
+                if raw_low is not None and str(raw_low).strip() != "":
+                    try:
+                        preset_low = float(raw_low)
+                    except (ValueError, TypeError):
+                        pass
+                if raw_high is not None and str(raw_high).strip() != "":
+                    try:
+                        preset_high = float(raw_high)
+                    except (ValueError, TypeError):
+                        pass
+                break
+        except Exception as e:
+            logger.debug(f"[ALERTS] Failed reading presets for {clean_alias}: {e}")
+
+    alert_ref = db.reference(f"alerts/{primary_code}")
+    alert_record = alert_ref.get() or {}
+    curr_latch = alert_record.get("latched_state", "NONE")
+
+    next_latch = curr_latch
+    hi_flag = False
+    lo_flag = False
+
+    # Upper boundary check
+    if preset_high < 99999999.0:
+        high_reset_level = preset_high - atr_14d
+        if curr_latch == "HI":
+            if cmp < high_reset_level:
+                next_latch = "NONE"
+            else:
+                next_latch = "HI"
+                hi_flag = True
+        else:
+            if cmp > preset_high:
+                next_latch = "HI"
+                hi_flag = True
+
+    # Lower boundary check
+    if preset_low > 0.0:
+        low_reset_level = preset_low + atr_14d
+        if curr_latch == "LO":
+            if cmp > low_reset_level:
+                next_latch = "NONE"
+            else:
+                next_latch = "LO"
+                lo_flag = True
+        else:
+            if cmp < preset_low:
+                next_latch = "LO"
+                lo_flag = True
+
+    if next_latch != curr_latch:
+        try:
+            alert_ref.set({
+                "latched_state": next_latch,
+                "cmp": cmp,
+                "atr_14d": atr_14d,
+                "preset_low": preset_low,
+                "preset_high": preset_high,
+                "updated_at": datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S")
+            })
+        except Exception as e:
+            logger.debug(f"[ALERTS] Failed updating latch state for {primary_code}: {e}")
+
+    return hi_flag, lo_flag
+
+
 def process_target_group(aliases: List[str]) -> bool:
     clean_aliases = list(dict.fromkeys([str(a).strip() for a in aliases if a and str(a).strip()]))
     if not clean_aliases:
@@ -260,6 +390,10 @@ def process_target_group(aliases: List[str]) -> bool:
 
     # RSI
     rsi = calculate_rsi(closes, 14)
+
+    # 14D ATR & Alerts
+    atr14 = calculate_atr(candles, 14)
+    hi_flag, lo_flag = evaluate_set_reset_alerts(primary_code, close_0, atr14, clean_aliases)
 
     # Extremes
     h52_slice = highs[:252]
@@ -322,6 +456,9 @@ def process_target_group(aliases: List[str]) -> bool:
         "25MA": ma25,
         "50MA": ma50,
         "200MA": ma200,
+        "ATR14": atr14 if atr14 is not None else "N/A",
+        "Hi": hi_flag,
+        "Lo": lo_flag,
         "52WH": w52h,
         "52WL": w52l,
         "100H": h100,
@@ -342,7 +479,7 @@ def process_target_group(aliases: List[str]) -> bool:
 
     try:
         db.reference(f"param/{primary_code}").set(payload)
-        logger.info(f"[{primary_code}] Successfully saved single record to /param/{primary_code}")
+        logger.info(f"[{primary_code}] Successfully saved single record to /param/{primary_code} (Hi={hi_flag}, Lo={lo_flag})")
         return True
     except Exception as e:
         logger.error(f"[{primary_code}] Failed to save /param/{primary_code}: {e}")
