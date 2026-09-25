@@ -68,21 +68,16 @@ COOLDOWN_ON_429_SEC = int(os.getenv("COOLDOWN_ON_429_SEC", "60"))
 # INDEXING BOUNDARIES
 # ==========================================
 HISTORICAL_START_INDEX = 1
-INTRADAY_INDEX = "0"          # Reserved strictly for live intraday market bar
+INTRADAY_INDEX = "0"                # Reserved strictly for live intraday market bar
 
 # ==========================================
 # SETTINGS FOR PARAMETER.PY
 # ==========================================
-PARAM_UPDATE_INTERVAL_SEC = 900  # 15 minutes
+PARAM_UPDATE_INTERVAL_SEC = 900     # 15 minutes
 
 # ==========================================
-# LIVE NOTIFICATION CHANNELS (SSL & TELEGRAM)
+# TELEGRAM NOTIFICATION CONFIGURATION
 # ==========================================
-SMTP_SERVER = os.getenv("SMTP_SERVER", "smtp.gmail.com")
-SMTP_SSL_PORT = int(os.getenv("SMTP_SSL_PORT", "465"))
-SENDER_EMAIL = os.getenv("SENDER_EMAIL", "")
-SENDER_APP_PASSWORD = os.getenv("SENDER_APP_PASSWORD", "")
-
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 ALERT_CHECK_INTERVAL_SEC = 300      # Evaluate triggers every 5 mins during live market
