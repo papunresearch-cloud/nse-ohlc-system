@@ -76,11 +76,13 @@ INTRADAY_INDEX = "0"          # Reserved strictly for live intraday market bar
 PARAM_UPDATE_INTERVAL_SEC = 900  # 15 minutes
 
 # ==========================================
-# ALERT GATEWAY NOTIFICATION CONFIGURATION
+# LIVE NOTIFICATION CHANNELS (SSL & TELEGRAM)
 # ==========================================
 SMTP_SERVER = os.getenv("SMTP_SERVER", "smtp.gmail.com")
-SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
+SMTP_SSL_PORT = int(os.getenv("SMTP_SSL_PORT", "465"))
 SENDER_EMAIL = os.getenv("SENDER_EMAIL", "")
 SENDER_APP_PASSWORD = os.getenv("SENDER_APP_PASSWORD", "")
-CALLMEBOT_API_KEY = os.getenv("CALLMEBOT_API_KEY", "")
-ALERT_CHECK_INTERVAL_SEC = 300   # Check triggers every 5 mins during live market
+
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+ALERT_CHECK_INTERVAL_SEC = 300      # Evaluate triggers every 5 mins during live market
