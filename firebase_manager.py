@@ -209,15 +209,13 @@ def reconcile_stocklist_with_watchlist() -> tuple[bool, dict[str, str]]:
                     continue  # Guard fixed indices from deletion
 
                 logger.info(f"[GARBAGE COLLECTOR] Purging records for deleted stock: {orphan}")
+                
+                # Purge /stocks and /param
                 try:
                     db.reference(f"{PATH_STOCKS}/{orphan}").delete()
-                except Exception as del_err:
-                    logger.warning(f"[GARBAGE COLLECTOR] Failed to purge {PATH_STOCKS}/{orphan}: {del_err}")
-
-                try:
                     db.reference(f"param/{orphan}").delete()
-                except Exception as del_param_err:
-                    logger.warning(f"[GARBAGE COLLECTOR] Failed to purge param/{orphan}: {del_param_err}")
+                except Exception as del_err:
+                    logger.warning(f"[GARBAGE COLLECTOR] Failed to purge /stocks or /param for {orphan}: {del_err}")
 
                 # Purge /alerts and /alerts/stock_controls
                 try:

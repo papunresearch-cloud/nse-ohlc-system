@@ -257,10 +257,11 @@ def evaluate_set_reset_alerts(
     Evaluates Set-Reset Hysteresis logic with 14D ATR deadband buffer:
     - If data is invalid/missing/corrupted -> Frees latched state and returns (False, False).
     - Only sets Hi or Lo to True when all price metrics are valid and pristine.
+    - Saves state isolated to /alerts/<CODE>/state using .update() to preserve dispatch memory.
     """
     if cmp is None or cmp <= 0 or atr_14d is None or atr_14d <= 0:
         try:
-            db.reference(f"alerts/{primary_code}").update({
+            db.reference(f"alerts/{primary_code}/state").update({
                 "latched_state": "NONE",
                 "timestamp": datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S")
             })
@@ -297,9 +298,9 @@ def evaluate_set_reset_alerts(
         except Exception as e:
             logger.debug(f"[ALERTS] Failed reading presets for {clean_alias}: {e}")
 
-    alert_ref = db.reference(f"alerts/{primary_code}")
-    alert_record = alert_ref.get() or {}
-    curr_latch = alert_record.get("latched_state", "NONE")
+    state_ref = db.reference(f"alerts/{primary_code}/state")
+    state_record = state_ref.get() or {}
+    curr_latch = state_record.get("latched_state", "NONE")
 
     next_latch = curr_latch
     hi_flag = False
@@ -335,7 +336,7 @@ def evaluate_set_reset_alerts(
 
     if next_latch != curr_latch:
         try:
-            alert_ref.set({
+            state_ref.update({
                 "latched_state": next_latch,
                 "cmp": cmp,
                 "atr_14d": atr_14d,
