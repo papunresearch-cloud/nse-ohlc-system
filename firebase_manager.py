@@ -5,7 +5,8 @@ FIREBASE MANAGER
 - Permanent anchoring of 4 master market indices (immune to purging/deletion).
 - Safe targeted mutations for /watchlist/detailedDb and /stocklist.
 - Guarded OHLC access for Child-1 (1 to 300) and Child-2 (index 0).
-- Garbage Collector: purges orphaned OHLC records from /stocks, /param, and /alerts on deletion.
+- Garbage Collector: purges orphaned OHLC records from /stocks, /param, /alerts,
+  /alerts/stock_controls, and /display_list/stocks without touching other symbols.
 """
 import os
 import json
@@ -170,7 +171,8 @@ def get_current_stocklist() -> dict[str, str]:
 def reconcile_stocklist_with_watchlist() -> tuple[bool, dict[str, str]]:
     """
     Synchronizes /stocklist with active stocks in /watchlist.
-    Purges orphaned OHLC records from /stocks, /param, and /alerts without touching other symbols.
+    Purges orphaned records from /stocks, /param, /alerts, /alerts/stock_controls,
+    and /display_list/stocks without touching other symbols or permanent indices.
     """
     init_firebase()
     master_map = get_master_watchlist_mapping()
@@ -204,6 +206,11 @@ def reconcile_stocklist_with_watchlist() -> tuple[bool, dict[str, str]]:
             orphans = set(current_stocklist.keys()) - set(safe_master_map.keys())
             fixed_keys = {sanitize_key(k) for k in FIXED_INDICES.keys()}
 
+            # Fetch display list once to clean array structure if used
+            display_stocks_ref = db.reference("display_list/stocks")
+            raw_display_stocks = display_stocks_ref.get()
+            display_list_modified = False
+
             for orphan in orphans:
                 if orphan in fixed_keys:
                     continue  # Guard fixed indices from deletion
@@ -223,6 +230,21 @@ def reconcile_stocklist_with_watchlist() -> tuple[bool, dict[str, str]]:
                     db.reference(f"alerts/stock_controls/{orphan}").delete()
                 except Exception as del_alert_err:
                     logger.warning(f"[GARBAGE COLLECTOR] Failed to purge alerts for {orphan}: {del_alert_err}")
+
+                # Purge /display_list/stocks
+                try:
+                    if isinstance(raw_display_stocks, list):
+                        raw_display_stocks = [
+                            s for s in raw_display_stocks if sanitize_key(str(s)) != orphan
+                        ]
+                        display_list_modified = True
+                    elif isinstance(raw_display_stocks, dict):
+                        db.reference(f"display_list/stocks/{orphan}").delete()
+                except Exception as del_display_err:
+                    logger.warning(f"[GARBAGE COLLECTOR] Failed to purge display_list for {orphan}: {del_display_err}")
+
+            if display_list_modified and isinstance(raw_display_stocks, list):
+                display_stocks_ref.set(raw_display_stocks if raw_display_stocks else None)
 
             logger.info(f"[RECONCILE] /stocklist synchronized with {len(safe_master_map)} targets.")
             return True, safe_master_map

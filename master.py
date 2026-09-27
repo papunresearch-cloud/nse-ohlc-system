@@ -5,6 +5,8 @@ MASTER ORCHESTRATOR (Primary Key Architecture: CODE)
 * Coordinates live OHLC backfills, indicators, alerts, and HTTP control signals.
 * Keyed exclusively by stock CODE across /stocks/<CODE> and /param/<CODE>.
 * Listens to /system_commands/stock_event dispatched from Watchlist.jsx.
+* Full admin cascade deletion on "DELETE" events across /stocks, /param,
+  /alerts, /alerts/stock_controls, and /display_list/stocks.
 * Embeds HTTP server on port 10000 with CORS, HEAD, GET, and POST support.
 * Self-healing state-machine scheduling: pre-market catch-up, live ticks,
   post-market settlement window, and per-stock quarantine protection.
@@ -416,6 +418,7 @@ class MasterOrchestrator:
             ).start()
 
         elif action == "DELETE":
+            # 1. Admin purge across /stocks, /param, /alerts, and /alerts/stock_controls
             try:
                 db.reference(f"stocks/{safe_code}").delete()
                 db.reference(f"param/{safe_code}").delete()
@@ -425,6 +428,7 @@ class MasterOrchestrator:
             except Exception as e:
                 logger.error(f"[DELETE EVENT] Error purging data for {safe_code}: {e}")
 
+            # 2. Admin purge across /display_list/stocks
             try:
                 display_ref = db.reference("display_list/stocks")
                 current_display = display_ref.get()
@@ -435,10 +439,13 @@ class MasterOrchestrator:
                     logger.info(f"[DELETE EVENT] Removed {safe_code} from array /display_list/stocks")
                 elif isinstance(current_display, dict):
                     db.reference(f"display_list/stocks/{safe_code}").delete()
+                    if stock_code in current_display:
+                        db.reference(f"display_list/stocks/{stock_code}").delete()
                     logger.info(f"[DELETE EVENT] Removed {safe_code} from map /display_list/stocks")
             except Exception as e:
                 logger.error(f"[DELETE EVENT] Error updating display_list: {e}")
 
+            # 3. Clean local orchestrator tracking
             if safe_code in self.script_status:
                 del self.script_status[safe_code]
 
@@ -565,7 +572,7 @@ class MasterOrchestrator:
             except Exception as e:
                 logger.debug(f"[LIVE CYCLE] Live update skipped for {safe_code}: {e}")
 
-    def execute_eod_reconciliation(self):
+    def execute_eOD_reconciliation(self):
         """Post-Market settlement: ensures closed candle is Index 1, clears Index 0, and updates params."""
         logger.info("[EOD-SETTLEMENT] Initiating post-market data reconciliation...")
         try:
@@ -594,7 +601,6 @@ class MasterOrchestrator:
         last_param_calc_tick = 0.0
         last_alert_eval_tick = 0.0
 
-        # Initial heartbeat write and boot catch-up sync
         self.record_heartbeat()
         threading.Thread(target=self.execute_historical_sync, kwargs={"is_manual": False}, daemon=True, name="BootSyncWorker").start()
 
@@ -655,7 +661,7 @@ class MasterOrchestrator:
                 # B. POST-MARKET SETTLEMENT WINDOW (15:45 – 16:30 IST)
                 elif dtime(15, 45) <= now_time < dtime(16, 30):
                     if not self.eod_reconciled_today and self.calendar.is_trading_day(today_date):
-                        threading.Thread(target=self.execute_eod_reconciliation, daemon=True, name="EODWorker").start()
+                        threading.Thread(target=self.execute_eOD_reconciliation, daemon=True, name="EODWorker").start()
 
                 # C. PRE-MARKET / OFF-HOURS CATCH-UP (Before 09:15 IST)
                 elif now_time < dtime(9, 15):
