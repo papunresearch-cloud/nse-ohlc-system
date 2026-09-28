@@ -41,6 +41,11 @@ from config import (
 )
 
 try:
+    from config import PARAM_UPDATE_INTERVAL_SEC
+except ImportError:
+    PARAM_UPDATE_INTERVAL_SEC = 300
+
+try:
     from config import ALERT_CHECK_INTERVAL_SEC
 except ImportError:
     ALERT_CHECK_INTERVAL_SEC = 300
@@ -428,7 +433,7 @@ class MasterOrchestrator:
             except Exception as e:
                 logger.error(f"[DELETE EVENT] Error purging data for {safe_code}: {e}")
 
-            # 2. Admin purge across /display_list/stocks
+            # 2. Admin purge across /display_list/stocks (handles array and map structures)
             try:
                 display_ref = db.reference("display_list/stocks")
                 current_display = display_ref.get()
@@ -641,19 +646,19 @@ class MasterOrchestrator:
 
                 # A. LIVE MARKET WINDOW (09:15 – 15:30 IST)
                 if status == "LIVE":
-                    # Intraday tick cycle (every 300s)
+                    # Intraday tick cycle (every LIVE_UPDATE_INTERVAL_SEC, e.g. 300s)
                     if (now_epoch - last_intraday_tick) >= LIVE_UPDATE_INTERVAL_SEC:
                         self.execute_live_intraday_cycle()
                         last_intraday_tick = now_epoch
 
-                    # Parameter engine recalculation (every 15 minutes / 900s)
-                    if (now_epoch - last_param_calc_tick) >= 900:
+                    # Parameter engine recalculation (uses PARAM_UPDATE_INTERVAL_SEC from config.py)
+                    if (now_epoch - last_param_calc_tick) >= PARAM_UPDATE_INTERVAL_SEC:
                         active_synced = [c for c, s in self.script_status.items() if s.get("synced")]
                         if active_synced and update_all_parameters:
                             threading.Thread(target=update_all_parameters, args=(active_synced,), daemon=True).start()
                         last_param_calc_tick = now_epoch
 
-                    # Alert Notification Evaluator (every 300s, non-blocking)
+                    # Alert Notification Evaluator (every ALERT_CHECK_INTERVAL_SEC, e.g. 300s)
                     if (now_epoch - last_alert_eval_tick) >= ALERT_CHECK_INTERVAL_SEC:
                         threading.Thread(target=evaluate_market_alerts, daemon=True, name="AlertNotifier").start()
                         last_alert_eval_tick = now_epoch
