@@ -73,7 +73,7 @@ INTRADAY_INDEX = "0"                # Reserved strictly for live intraday market
 # ==========================================
 # SETTINGS FOR PARAMETER.PY
 # ==========================================
-PARAM_UPDATE_INTERVAL_SEC = 900     # 15 minutes
+PARAM_UPDATE_INTERVAL_SEC = 300     # 5 minutes
 
 # ==========================================
 # TELEGRAM NOTIFICATION CONFIGURATION
