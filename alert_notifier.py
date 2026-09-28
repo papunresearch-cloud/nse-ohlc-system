@@ -1,9 +1,14 @@
 """
-ALERT NOTIFICATION ENGINE (TELEGRAM DIRECT API)
-- Runs during live market hours (09:15 - 15:30 IST).
-- Evaluates Hi/Lo triggers from /param and /watchlist/detailedDb.
-- Dedicated cooldown sub-node: /alerts/<CODE>/dispatch/last_dispatched_date.
-- Automatic midnight re-arm (calendar date comparison).
+===============================================================================
+ALERT NOTIFICATION ENGINE (TELEGRAM DIRECT API - STATE EDGE TRIGGERED)
+===============================================================================
+- Runs during live market hours (09:15 - 15:30 IST) via master.py background thread.
+- Tracks state transitions: HIGH_BREAKOUT, LOW_BREAKDOWN, and NORMAL (reset).
+- Pure Edge-Triggered Architecture: Dispatches immediate Telegram message on
+  EVERY state change (New State != Last Dispatched State).
+- No calendar-day lockout (once-a-day logic completely removed).
+- Isolated tracking node: /alerts/<CODE>/dispatch
+===============================================================================
 """
 
 from datetime import datetime
@@ -22,13 +27,13 @@ from firebase_manager import init_firebase, sanitize_key
 IST = pytz.timezone(TIMEZONE)
 
 
-def send_telegram_alert(target_chat_ids: list, stock_code: str, alert_type: str, cmp_val: float, boundary_val: float):
+def send_telegram_alert(target_chat_ids: list, stock_code: str, alert_type: str, cmp_val: float, boundary_val: float = None):
     """Sends Markdown formatted alert message via official Telegram Bot API."""
     if not TELEGRAM_BOT_TOKEN:
-        logger.warning("[ALERT-TELEGRAM] TELEGRAM_BOT_TOKEN is not set. Skipping.")
+        logger.warning("[ALERT-TELEGRAM] TELEGRAM_BOT_TOKEN is not configured. Skipping dispatch.")
         return
 
-    # Strictly filter for valid numeric Telegram Chat IDs (drop raw phone numbers)
+    # Filter for valid numeric Telegram Chat IDs
     recipients = set()
     for cid in target_chat_ids:
         clean_cid = str(cid).strip()
@@ -42,13 +47,27 @@ def send_telegram_alert(target_chat_ids: list, stock_code: str, alert_type: str,
         logger.warning("[ALERT-TELEGRAM] No valid numeric Telegram Chat IDs found.")
         return
 
-    icon = "🚀" if alert_type == "HIGH_BREAKOUT" else "🔻"
+    # Visual indicators and formatted message construction
+    now_time_str = datetime.now(IST).strftime('%H:%M:%S IST')
+    if alert_type == "HIGH_BREAKOUT":
+        icon = "🚀"
+        signal_title = "HIGH BREAKOUT"
+        detail_line = f"• *Target High Limit:* ₹`{boundary_val:.2f}`\n" if boundary_val else ""
+    elif alert_type == "LOW_BREAKDOWN":
+        icon = "🔻"
+        signal_title = "LOW BREAKDOWN"
+        detail_line = f"• *Target Low Limit:* ₹`{boundary_val:.2f}`\n" if boundary_val else ""
+    else:  # NORMAL / RESET
+        icon = "🟢"
+        signal_title = "CHANNEL RESET (NORMAL)"
+        detail_line = "• *Status:* Price normalized back within preset limits\n"
+
     message = (
         f"{icon} *STOCK ALERT: {stock_code}*\n\n"
-        f"• *Signal:* `{alert_type}`\n"
+        f"• *Signal:* `{signal_title}`\n"
         f"• *CMP:* ₹`{cmp_val:.2f}`\n"
-        f"• *Target Limit:* ₹`{boundary_val:.2f}`\n"
-        f"• *Time:* `{datetime.now(IST).strftime('%H:%M:%S IST')}`\n"
+        f"{detail_line}"
+        f"• *Time:* `{now_time_str}`\n"
     )
 
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
@@ -62,16 +81,17 @@ def send_telegram_alert(target_chat_ids: list, stock_code: str, alert_type: str,
             }
             res = requests.post(url, json=payload, timeout=10)
             if res.status_code == 200:
-                logger.info(f"[ALERT-TELEGRAM] Delivered alert for {stock_code} to Chat ID {chat_id}")
+                logger.info(f"[ALERT-TELEGRAM] Delivered '{signal_title}' for {stock_code} to Chat ID {chat_id}")
             else:
-                logger.warning(f"[ALERT-TELEGRAM] Failed for Chat ID {chat_id} (HTTP {res.status_code}): {res.text}")
+                logger.warning(f"[ALERT-TELEGRAM] Delivery failed for Chat ID {chat_id} (HTTP {res.status_code}): {res.text}")
         except Exception as e:
-            logger.error(f"[ALERT-TELEGRAM] Network error sending to Chat ID {chat_id}: {e}")
+            logger.error(f"[ALERT-TELEGRAM] Network error delivering to Chat ID {chat_id}: {e}")
 
 
 def evaluate_market_alerts():
     """
-    Scans Firebase for price breaches and dispatches Telegram notifications.
+    Evaluates current price states against previous dispatch records.
+    Triggers on edge transitions: NONE -> HI, NONE -> LO, or HI/LO -> NONE.
     """
     init_firebase()
     try:
@@ -81,10 +101,10 @@ def evaluate_market_alerts():
 
         # 1. Global Master Switch
         if bool(alerts_root.get("master_disable", False)):
-            logger.debug("[ALERT-EVAL] Alerts globally disabled (master_disable=True). Skipping.")
+            logger.debug("[ALERT-EVAL] Alerts globally disabled (master_disable=True). Skipping pass.")
             return
 
-        # 2. Extract enabled Chat IDs from Firebase alerts modal
+        # 2. Extract enabled Chat IDs from Firebase alerts configuration
         active_chat_ids = []
         contacts_dict = alerts_root.get("whatsapp", {}) or {}
         if isinstance(contacts_dict, dict):
@@ -105,15 +125,13 @@ def evaluate_market_alerts():
         param_snapshot = db.reference("param").get() or {}
         detailed_snapshot = db.reference("watchlist/detailedDb").get() or {}
 
-        today_str = datetime.now(IST).strftime("%Y-%m-%d")
-
         for stock_code, param_data in param_snapshot.items():
             if not isinstance(param_data, dict):
                 continue
 
             safe_code = sanitize_key(stock_code)
 
-            # Check individual stock toggle
+            # Check per-stock control switch
             stock_cfg = stock_controls.get(safe_code) or stock_controls.get(stock_code) or {}
             if stock_cfg.get("enabled") is False:
                 continue
@@ -123,7 +141,7 @@ def evaluate_market_alerts():
             if cmp_val is None or not isinstance(cmp_val, (int, float)) or cmp_val <= 0:
                 continue
 
-            # Retrieve target thresholds and flags
+            # Retrieve preset boundaries
             stock_details = detailed_snapshot.get(safe_code) or detailed_snapshot.get(stock_code) or {}
             p_high = stock_details.get("preset_high")
             p_low = stock_details.get("preset_low")
@@ -131,42 +149,48 @@ def evaluate_market_alerts():
             hi_flag = param_data.get("Hi") is True
             lo_flag = param_data.get("Lo") is True
 
-            alert_type = None
+            # Determine the current true state of the stock
+            current_state = "NONE"
             boundary_val = 0.0
 
-            # Condition 1: High Breakout
             if (p_high is not None and cmp_val > float(p_high) and float(p_high) < 9999999) or hi_flag:
-                alert_type = "HIGH_BREAKOUT"
+                current_state = "HIGH_BREAKOUT"
                 boundary_val = float(p_high) if p_high is not None else float(cmp_val)
-
-            # Condition 2: Low Breakdown
             elif (p_low is not None and cmp_val < float(p_low) and float(p_low) > 0) or lo_flag:
-                alert_type = "LOW_BREAKDOWN"
+                current_state = "LOW_BREAKDOWN"
                 boundary_val = float(p_low) if p_low is not None else float(cmp_val)
 
-            if not alert_type:
-                continue
-
-            # Check dedicated cooldown sub-node
+            # Fetch previously dispatched state from isolated node
             stock_dispatch_node = (alerts_root.get(safe_code) or {}).get("dispatch", {})
-            last_date = stock_dispatch_node.get("last_dispatched_date")
+            last_state = stock_dispatch_node.get("last_signal")
 
-            if last_date == today_str:
-                continue  # Suppressed: Already alerted today
+            # First run initialization: if no state is recorded yet and stock is normal, initialize silently
+            if last_state is None:
+                if current_state == "NONE":
+                    db.reference(f"alerts/{safe_code}/dispatch").update({
+                        "last_signal": "NONE",
+                        "dispatched_price": cmp_val,
+                        "updated_at": datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S IST")
+                    })
+                    continue
+                else:
+                    # If it boots up already in a breached state, establish baseline as NONE so it triggers
+                    last_state = "NONE"
 
-            logger.info(f"[ALERT-TRIGGER] Firing {alert_type} for {safe_code}: CMP={cmp_val} vs Target={boundary_val}")
+            # Pure Edge Trigger: Execute ONLY on state change
+            if current_state != last_state:
+                logger.info(f"[ALERT-TRIGGER] State change for {safe_code}: {last_state} -> {current_state} (CMP={cmp_val})")
 
-            # Send Telegram alert
-            send_telegram_alert(active_chat_ids, safe_code, alert_type, cmp_val, boundary_val)
+                # Send Telegram message
+                send_telegram_alert(active_chat_ids, safe_code, current_state, cmp_val, boundary_val)
 
-            # Lock alert for today in dedicated /dispatch sub-node
-            db.reference(f"alerts/{safe_code}/dispatch").update({
-                "last_dispatched_date": today_str,
-                "last_signal": alert_type,
-                "dispatched_price": cmp_val,
-                "boundary_value": boundary_val,
-                "updated_at": datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S IST")
-            })
+                # Update the dispatched state in Firebase
+                db.reference(f"alerts/{safe_code}/dispatch").update({
+                    "last_signal": current_state,
+                    "dispatched_price": cmp_val,
+                    "boundary_value": boundary_val,
+                    "updated_at": datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S IST")
+                })
 
     except Exception as e:
-        logger.error(f"[ALERT-ENGINE-ERROR] Evaluation pass failed: {e}", exc_info=True)
+        logger.error(f"[ALERT-ENGINE-ERROR] Alert evaluation pass failed: {e}", exc_info=True)
