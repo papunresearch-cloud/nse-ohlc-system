@@ -1,3 +1,5 @@
+import os
+import json
 import math
 import firebase_admin
 from firebase_admin import credentials, db
@@ -12,138 +14,28 @@ FIREBASE_DB_URL = "https://stock-dashboard-5c25c-default-rtdb.asia-southeast1.fi
 FIREBASE_TARGET_NODE = "SCREENER"
 
 def init_firebase():
-    """Initializes the Firebase Admin SDK if not already active."""
+    """Initializes Firebase Admin SDK from local file or Render Environment Variable."""
     if not firebase_admin._apps:
-        cred = credentials.Certificate(FIREBASE_KEY_FILE)
+        # Check if credential JSON is provided via Render Environment Variable
+        env_cred = os.getenv("FIREBASE_SERVICE_ACCOUNT_JSON")
+        if env_cred:
+            print("[INFO] Authenticating Firebase using environment variable...")
+            cred_dict = json.loads(env_cred)
+            cred = credentials.Certificate(cred_dict)
+        elif os.path.exists(FIREBASE_KEY_FILE):
+            print(f"[INFO] Authenticating Firebase using local file: {FIREBASE_KEY_FILE}...")
+            cred = credentials.Certificate(FIREBASE_KEY_FILE)
+        else:
+            raise FileNotFoundError(
+                f"[ERROR] Service account credentials not found! Neither '{FIREBASE_KEY_FILE}' "
+                "nor 'FIREBASE_SERVICE_ACCOUNT_JSON' environment variable exists."
+            )
+            
         firebase_admin.initialize_app(cred, {
             'databaseURL': FIREBASE_DB_URL
         })
 
-# =====================================================================
-# PART 1: VALIDATION & DATA CHECKS
-# =====================================================================
-def validate_metric(val):
-    """
-    Validates if a metric value is finite and in [-100, 9999] inclusive[cite: 2, 4].
-    Returns: (is_valid: bool, numeric_val: float)
-    """
-    if pd.isna(val):
-        return False, np.nan
-    try:
-        fval = float(val)
-    except (ValueError, TypeError):
-        return False, np.nan
-    
-    if math.isnan(fval) or math.isinf(fval):
-        return False, np.nan
-    if fval < -100 or fval > 9999:
-        return False, fval
-    
-    return True, fval
 
-# =====================================================================
-# PART 2: A4 FUZZY MEMBERSHIP & SUGENO LOGIC
-# =====================================================================
-def compute_a4_cutoffs(series):
-    """
-    Computes Lmn (5th percentile), Umx (95th percentile) via linear interpolation,
-    and M (center of gravity) trimming floor(0.05 * N) from both ends[cite: 2, 4].
-    """
-    vals = np.sort(series.dropna().values)
-    n = len(vals)
-    if n == 0:
-        return np.nan, np.nan, np.nan
-    
-    Lmn = float(np.percentile(vals, 5, method='linear'))
-    Umx = float(np.percentile(vals, 95, method='linear'))
-    
-    trim_k = math.floor(0.05 * n)
-    if trim_k > 0 and (2 * trim_k < n):
-        trimmed_vals = vals[trim_k : n - trim_k]
-    else:
-        trimmed_vals = vals
-        
-    M = float(np.mean(trimmed_vals))
-    return Lmn, Umx, M
-
-
-def calculate_memberships(x, Lmn, Umx, M):
-    """
-    Calculates Bad, Normal, and Good memberships with straight-line transitions[cite: 2, 4].
-    Handles zero-width boundaries and guarantees sum(memberships) == 1.0[cite: 2, 4].
-    """
-    if pd.isna(x):
-        return np.nan, np.nan, np.nan
-    
-    # Special Case: Lmn == Umx[cite: 2, 4]
-    if math.isclose(Lmn, Umx):
-        if math.isclose(x, Lmn):
-            return 0.0, 1.0, 0.0
-        elif x < Lmn:
-            return 1.0, 0.0, 0.0
-        else:
-            return 0.0, 0.0, 1.0
-
-    # Rule 1: x <= Lmn[cite: 2, 4]
-    if x <= Lmn:
-        return 1.0, 0.0, 0.0
-    
-    # Rule 2: Lmn < x < M[cite: 2, 4]
-    if x < M:
-        denom = M - Lmn
-        if math.isclose(denom, 0.0):
-            return 0.0, 1.0, 0.0
-        bad = (M - x) / denom
-        normal = (x - Lmn) / denom
-        return bad, normal, 0.0
-    
-    # Rule 3: x == M[cite: 2, 4]
-    if math.isclose(x, M):
-        return 0.0, 1.0, 0.0
-    
-    # Rule 4: M < x < Umx[cite: 2, 4]
-    if x < Umx:
-        denom = Umx - M
-        if math.isclose(denom, 0.0):
-            return 0.0, 0.0, 1.0
-        normal = (Umx - x) / denom
-        good = (x - M) / denom
-        return 0.0, normal, good
-    
-    # Rule 5: x >= Umx[cite: 2, 4]
-    return 0.0, 0.0, 1.0
-
-
-def evaluate_sugeno_a4(bad_sg, norm_sg, good_sg, bad_pg, norm_pg, good_pg):
-    """
-    Evaluates zero-order Sugeno rules (Columns: SG, Rows: PG)[cite: 2, 4]:
-    Firing strength = product of memberships[cite: 2, 4].
-    """
-    if any(pd.isna([bad_sg, norm_sg, good_sg, bad_pg, norm_pg, good_pg])):
-        return np.nan
-    
-    rules = [
-        (good_pg * good_sg, 100.0),
-        (good_pg * norm_sg, 85.0),
-        (good_pg * bad_sg, 62.0),
-        (norm_pg * good_sg, 75.0),
-        (norm_pg * norm_sg, 50.0),
-        (norm_pg * bad_sg, 25.0),
-        (bad_pg * good_sg, 38.0),
-        (bad_pg * norm_sg, 12.0),
-        (bad_pg * bad_sg, 0.0),
-    ]
-    
-    total_wt = sum(w for w, _ in rules)
-    if total_wt <= 0 or math.isnan(total_wt):
-        return np.nan
-    
-    S = sum(w * score for w, score in rules) / total_wt
-    return S
-
-# =====================================================================
-# PART 3: GROWTH SCORE PIPELINE
-# =====================================================================
 def update_growth_scores():
     print("[INFO] Connecting to Firebase Realtime Database...")
     init_firebase()
@@ -155,29 +47,42 @@ def update_growth_scores():
         print(f"[ERROR] No data found at Firebase node '/{FIREBASE_TARGET_NODE}'.")
         return
 
-    print("[INFO] Loading records into DataFrame...")
-    if isinstance(data, dict):
+    print(f"[INFO] Loaded raw records from Firebase. Total items: {len(data)}")
+    
+    # Preserve original keys (e.g. Stock tickers if data is a dict)
+    is_dict = isinstance(data, dict)
+    if is_dict:
         df = pd.DataFrame.from_dict(data, orient="index")
+        df["_firebase_key"] = df.index  # Keep exact database node key
     else:
         df = pd.DataFrame(data)
+        df["_firebase_key"] = df.index
 
+    # Diagnostic check for required columns
     required_cols = ["pg-1", "pg-3", "sg-eq", "sg-ttm", "sg-3y"]
+    print(f"[INFO] Available columns in database: {list(df.columns)}")
     for col in required_cols:
         if col not in df.columns:
+            print(f"[WARNING] Column '{col}' missing from Firebase data; filling with NaN.")
             df[col] = np.nan
 
-    # 1. Validate metric ranges [-100, 9999][cite: 2, 4]
+    # 1. Validate metric ranges [-100, 9999]
     for col in required_cols:
         res = [validate_metric(v) for v in df[col]]
         df[f"_{col}_valid"] = [r[0] for r in res]
         df[f"_{col}_val"] = [r[1] for r in res]
 
-    # 2. Check G1, G2, and sg-eq eligibility[cite: 2, 4]
+    # 2. Check G1, G2, and sg-eq eligibility
     df["_G1_eligible"] = df["_sg-ttm_valid"] & df["_pg-1_valid"]
     df["_G2_eligible"] = df["_sg-3y_valid"] & df["_pg-3_valid"]
     df["_sgeq_eligible"] = df["_sg-eq_valid"]
 
-    # 3. Calculate SG and PG[cite: 2, 4]
+    g1_count = df["_G1_eligible"].sum()
+    print(f"[INFO] Rows eligible for scoring (G1 passed): {g1_count} out of {len(df)}")
+    if g1_count == 0:
+        print("[WARNING] Zero rows passed G1 eligibility! Check if 'pg-1' and 'sg-ttm' contain numeric values.")
+
+    # 3. Calculate SG and PG
     df["_sg"] = np.nan
     df["_pg"] = np.nan
 
@@ -185,7 +90,7 @@ def update_growth_scores():
         if not r["_G1_eligible"]:
             continue
         
-        # Derived SG[cite: 2, 4]
+        # SG derivation
         if r["_G2_eligible"] and r["_sgeq_eligible"]:
             df.at[idx, "_sg"] = 0.6 * (0.25 * r["_sg-eq_val"] + 0.75 * r["_sg-ttm_val"]) + 0.4 * r["_sg-3y_val"]
         elif r["_G2_eligible"] and not r["_sgeq_eligible"]:
@@ -195,13 +100,13 @@ def update_growth_scores():
         else:
             df.at[idx, "_sg"] = r["_sg-ttm_val"]
 
-        # Derived PG[cite: 2, 4]
+        # PG derivation
         if r["_G2_eligible"]:
             df.at[idx, "_pg"] = 0.6 * r["_pg-1_val"] + 0.4 * r["_pg-3_val"]
         else:
             df.at[idx, "_pg"] = r["_pg-1_val"]
 
-    # 4. Range validation and clipping [-50, 100][cite: 2, 4]
+    # 4. Clipping [-50, 100]
     df["_sgc"] = np.nan
     df["_pgc"] = np.nan
     for idx, r in df.iterrows():
@@ -213,7 +118,7 @@ def update_growth_scores():
         df.at[idx, "_sgc"] = max(-50.0, min(100.0, sg_v))
         df.at[idx, "_pgc"] = max(-50.0, min(100.0, pg_v))
 
-    # 5. Group assignment (A1 to A4)[cite: 2, 4]
+    # 5. Group assignment
     df["_group"] = np.nan
     for idx, r in df.iterrows():
         sgc, pgc = r["_sgc"], r["_pgc"]
@@ -230,7 +135,7 @@ def update_growth_scores():
 
     df["G-score"] = np.nan
 
-    # 6. Scoring Groups A1, A2, and A3[cite: 2, 4]
+    # 6. Scoring Groups A1, A2, and A3
     group_configs = {
         'A1': {'wt_sg': 0.50, 'wt_pg': 0.50, 'base': 0.0, 'scale': 10.0, 'mid': 5.0},
         'A2': {'wt_sg': 0.60, 'wt_pg': 0.40, 'base': 10.01, 'scale': 20.0, 'mid': 20.01},
@@ -248,8 +153,10 @@ def update_growth_scores():
         else:
             df.loc[sub_idx, "G-score"] = cfg['base'] + cfg['scale'] * (raw_vals - min_v) / (max_v - min_v)
 
-    # 7. Scoring Group A4 (Zero-Order Sugeno Fuzzy Model)[cite: 2, 4]
+    # 7. Scoring Group A4 (Sugeno Fuzzy Model)
     a4_idx = df[df["_group"] == "A4"].index
+    print(f"[INFO] Cohort counts: A1={(df['_group']=='A1').sum()}, A2={(df['_group']=='A2').sum()}, A3={(df['_group']=='A3').sum()}, A4={len(a4_idx)}")
+
     if len(a4_idx) > 0:
         a4_sgc = df.loc[a4_idx, "_sgc"]
         a4_pgc = df.loc[a4_idx, "_pgc"]
@@ -281,34 +188,19 @@ def update_growth_scores():
                     g_val = 50.01 + 50.0 * (s_val - s_min) / (s_max - s_min)
                     df.at[idx, "G-score"] = min(100.0, g_val)
 
-    # Round G-score to 2 decimal places
     df["G-score"] = df["G-score"].round(2)
-
-    # 8. Drop all internal/intermediate helper columns[cite: 3]
-    temp_cols = [c for c in df.columns if c.startswith("_")]
-    df.drop(columns=temp_cols, inplace=True, errors="ignore")
-
     scored_count = df["G-score"].notna().sum()
-    print(f"[INFO] G-score calculated for {scored_count} stocks.")
+    print(f"[INFO] G-score successfully calculated for {scored_count} stocks.")
 
-    # 9. Sanitize and write back to Firebase[cite: 3]
-    cleaned_df = df.replace([np.inf, -np.inf], np.nan)
-    cleaned_df = cleaned_df.astype(object).where(pd.notnull(cleaned_df), None)
+    # 8. Update Firebase safely using multi-path update
+    # This prevents replacing the whole node or losing original schema keys
+    updates = {}
+    for _, row in df.iterrows():
+        key = str(row["_firebase_key"])
+        score = row["G-score"]
+        # Firebase skips None; if NaN or unscored, set to None or 0.0 depending on preference
+        updates[f"{key}/G-score"] = None if pd.isna(score) else float(score)
 
-    if "CODE" in cleaned_df.columns:
-        payload = cleaned_df.set_index("CODE", drop=False).to_dict(orient="index")
-    else:
-        payload = cleaned_df.to_dict(orient="index")
-
-    print(f"[INFO] Writing records with updated 'G-score' back to Firebase node '/{FIREBASE_TARGET_NODE}'...")
-    ref.set(payload)
-    print(f"[OK] Success! Single column 'G-score' updated in Firebase.")
-
-# =====================================================================
-# ENTRY POINT
-# =====================================================================
-if __name__ == "__main__":
-    try:
-        update_growth_scores()
-    except Exception as e:
-        print(f"[ERROR] An unexpected error occurred: {e}")
+    print(f"[INFO] Pushing {len(updates)} G-score field updates to Firebase node '/{FIREBASE_TARGET_NODE}'...")
+    ref.update(updates)
+    print(f"[OK] Success! 'G-score' updated across all items in Firebase.")
