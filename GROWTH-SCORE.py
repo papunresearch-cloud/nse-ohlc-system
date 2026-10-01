@@ -1,3 +1,4 @@
+import math
 import firebase_admin
 from firebase_admin import credentials, db
 import numpy as np
@@ -10,10 +11,8 @@ FIREBASE_KEY_FILE = "serviceAccountKey.json"
 FIREBASE_DB_URL = "https://stock-dashboard-5c25c-default-rtdb.asia-southeast1.firebasedatabase.app"
 FIREBASE_TARGET_NODE = "SCREENER"
 
-SG_REFERENCE = 0.25  # Threshold factor for closeness in sg-c
-
 def init_firebase():
-    """Initializes the Firebase Admin SDK if not already active."""
+    """Initializes Firebase Admin SDK if not already active."""
     if not firebase_admin._apps:
         cred = credentials.Certificate(FIREBASE_KEY_FILE)
         firebase_admin.initialize_app(cred, {
@@ -21,125 +20,120 @@ def init_firebase():
         })
 
 # =====================================================================
-# PART 1: PG-C CALCULATION LOGIC
+# 1. VALIDATION & SANITIZATION LOGIC
 # =====================================================================
-def calculate_pg_c(row):
-    pg1, pg3 = row["pg-1"], row["pg-3"]
-    v1, v3 = pd.notna(pg1), pd.notna(pg3)
-    vx = abs(pg1 - pg3) > 100
-
-    if v1 and not v3:
-        return pg1
-    if not v1 and v3:
-        return 0.0
-    if not v1 and not v3:
-        return 0.0
-    if v1 and v3 and vx:
-        return min(pg1, pg3)
-    if v1 and v3 and not vx:
-        return (0.60 * min(pg1, pg3)) + (0.40 * max(pg1, pg3))
-    return 0.0
-
-# =====================================================================
-# PART 2: SG-C CALCULATION LOGIC
-# =====================================================================
-def calculate_sg_c(row):
-    eq, ttm, sg3y = row["sg-eq"], row["sg-ttm"], row["sg-3y"]
-    v_eq, v_ttm, v_3y = pd.notna(eq), pd.notna(ttm), pd.notna(sg3y)
-
-    if not v_eq and not v_ttm and not v_3y:
-        return 0.0
-    if v_ttm and not v_eq and not v_3y:
-        return ttm
-    if v_3y and not v_eq and not v_ttm:
-        return sg3y
-    if v_eq and not v_ttm and not v_3y:
-        return eq
-
-    if not v_3y and v_eq and v_ttm:
-        if abs(ttm - eq) < 0.2 * abs(ttm):
-            return (0.5 * eq) + (0.5 * ttm)
-        return ttm
-    if not v_eq and v_ttm and v_3y:
-        return (0.75 * ttm) + (0.25 * sg3y)
-    if not v_ttm and v_eq and v_3y:
-        return 0.0
-
-    if v_eq and v_ttm and v_3y:
-        x1, x2, x3 = eq, ttm, sg3y
-        x12, x23, x13 = abs(x1 - x2), abs(x2 - x3), abs(x1 - x3)
-        k = min(np.median([x1, x2, x3]) * SG_REFERENCE, 50)
-
-        if (x12 < k) and (x23 < k) and (x13 < k):
-            return (0.2 * x1) + (0.5 * x2) + (0.3 * x3)
-
-        pairs = {"12": x12, "23": x23, "13": x13}
-        closest = min(pairs, key=pairs.get)
-
-        if closest == "12":
-            return (0.6 * x2) + (0.4 * x1)
-        elif closest == "23":
-            return (0.6 * x2) + (0.4 * x3)
-        elif closest == "13":
-            return (0.8 * x3) + (0.2 * x1)
-
-        return np.median([x1, x2, x3])
-
-    return 0.0
+def validate_metric(val):
+    """
+    Validates if a metric value is finite and in [-100, 9999] inclusive.
+    Returns: (is_valid: bool, numeric_val: float)
+    """
+    if pd.isna(val):
+        return False, np.nan
+    try:
+        fval = float(val)
+    except (ValueError, TypeError):
+        return False, np.nan
+    
+    if math.isnan(fval) or math.isinf(fval):
+        return False, np.nan
+    if fval < -100 or fval > 9999:
+        return False, fval
+    
+    return True, fval
 
 # =====================================================================
-# PART 3: GROWTH SCORE (G-SCORE) M & N BUCKETS
+# 2. SUGENO & FUZZY LOGIC FOR GROUP A4
 # =====================================================================
-def pg_score(x):
-    if pd.isna(x):
-        return np.nan
-    if x < -50:
-        return 0
-    elif x < -25:
-        return 1
-    elif x < -10:
-        return 2
-    elif x < 0:
-        return 3
-    elif x < 10:
-        return 4
-    elif x < 20:
-        return 5
-    elif x < 30:
-        return 6
-    elif x < 40:
-        return 7
-    elif x < 50:
-        return 8
+def compute_a4_cutoffs(series):
+    """
+    Computes Lmn (5th percentile), Umx (95th percentile) via linear interpolation,
+    and M (center of gravity) trimming floor(0.05 * N) from both ends.
+    """
+    vals = np.sort(series.dropna().values)
+    n = len(vals)
+    if n == 0:
+        return np.nan, np.nan, np.nan
+    
+    Lmn = float(np.percentile(vals, 5, method='linear'))
+    Umx = float(np.percentile(vals, 95, method='linear'))
+    
+    trim_k = math.floor(0.05 * n)
+    if trim_k > 0 and (2 * trim_k < n):
+        trimmed_vals = vals[trim_k : n - trim_k]
     else:
-        return 9
+        trimmed_vals = vals
+        
+    M = float(np.mean(trimmed_vals))
+    return Lmn, Umx, M
 
-def sg_score(x):
+def calculate_memberships(x, Lmn, Umx, M):
+    """
+    Calculates Bad, Normal, and Good memberships with straight-line transitions.
+    Guarantees sum(memberships) == 1.0.
+    """
     if pd.isna(x):
+        return np.nan, np.nan, np.nan
+    
+    if math.isclose(Lmn, Umx):
+        if math.isclose(x, Lmn):
+            return 0.0, 1.0, 0.0
+        elif x < Lmn:
+            return 1.0, 0.0, 0.0
+        else:
+            return 0.0, 0.0, 1.0
+
+    if x <= Lmn:
+        return 1.0, 0.0, 0.0
+    
+    if x < M:
+        denom = M - Lmn
+        if math.isclose(denom, 0.0):
+            return 0.0, 1.0, 0.0
+        bad = (M - x) / denom
+        normal = (x - Lmn) / denom
+        return bad, normal, 0.0
+    
+    if math.isclose(x, M):
+        return 0.0, 1.0, 0.0
+    
+    if x < Umx:
+        denom = Umx - M
+        if math.isclose(denom, 0.0):
+            return 0.0, 0.0, 1.0
+        normal = (Umx - x) / denom
+        good = (x - M) / denom
+        return 0.0, normal, good
+    
+    return 0.0, 0.0, 1.0
+
+def evaluate_sugeno_a4(bad_sg, norm_sg, good_sg, bad_pg, norm_pg, good_pg):
+    """
+    Evaluates zero-order Sugeno rules (Columns: SG, Rows: PG):
+    Firing strength = product of memberships.
+    """
+    if any(pd.isna([bad_sg, norm_sg, good_sg, bad_pg, norm_pg, good_pg])):
         return np.nan
-    if x < -10:
-        return 0
-    elif x < 0:
-        return 1
-    elif x < 10:
-        return 2
-    elif x < 15:
-        return 3
-    elif x < 20:
-        return 4
-    elif x < 25:
-        return 5
-    elif x < 30:
-        return 6
-    elif x < 35:
-        return 7
-    elif x < 40:
-        return 8
-    else:
-        return 9
+    
+    rules = [
+        (good_pg * good_sg, 100.0),
+        (good_pg * norm_sg, 85.0),
+        (good_pg * bad_sg, 62.0),
+        (norm_pg * good_sg, 75.0),
+        (norm_pg * norm_sg, 50.0),
+        (norm_pg * bad_sg, 25.0),
+        (bad_pg * good_sg, 38.0),
+        (bad_pg * norm_sg, 12.0),
+        (bad_pg * bad_sg, 0.0),
+    ]
+    
+    total_wt = sum(w for w, _ in rules)
+    if total_wt <= 0 or math.isnan(total_wt):
+        return np.nan
+    
+    return sum(w * score for w, score in rules) / total_wt
 
 # =====================================================================
-# MAIN PIPELINE
+# 3. MAIN GROWTH SCORE PIPELINE
 # =====================================================================
 def update_growth_scores():
     print("[INFO] Connecting to Firebase Realtime Database...")
@@ -158,45 +152,153 @@ def update_growth_scores():
     else:
         df = pd.DataFrame(data)
 
-    # 1. Clean input numeric columns
-    for col in ["pg-1", "pg-3", "sg-eq", "sg-ttm", "sg-3y"]:
-        if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
-        else:
+    required_cols = ['sg-eq', 'sg-ttm', 'sg-3y', 'pg-1', 'pg-3']
+    for col in required_cols:
+        if col not in df.columns:
             df[col] = np.nan
 
-    # 2. Compute intermediate metrics
-    df["_pg_c"] = df.apply(calculate_pg_c, axis=1).round(2)
-    df["_sg_c"] = df.apply(calculate_sg_c, axis=1).round(2)
-    df["_m"] = df["_sg_c"].apply(sg_score)
-    df["_n"] = df["_pg_c"].apply(pg_score)
+    # 1. Metric Cell Validation [-100, 9999]
+    for col in required_cols:
+        res = [validate_metric(v) for v in df[col]]
+        df[f"{col}_val"] = [r[1] for r in res]
+        df[f"{col}_valid"] = [r[0] for r in res]
 
-    # 3. Compute G-score
-    df["G-score"] = np.nan
-    valid = df["_m"].notna() & df["_n"].notna()
+    # 2. Eligibility & G1 Gatekeeper
+    df['G1_eligible'] = df['sg-ttm_valid'] & df['pg-1_valid']
+    df['G2_eligible'] = df['sg-3y_valid'] & df['pg-3_valid']
+    df['sgeq_eligible'] = df['sg-eq_valid']
+    df['eligible'] = df['G1_eligible']
 
-    temp = df.loc[valid].copy()
-    temp = temp.sort_values(
-        by=["_m", "_n", "_sg_c"],
-        ascending=[True, True, False]
-    )
+    # 3. Derive SG and PG
+    df['sg'] = np.nan
+    df['pg'] = np.nan
 
-    temp["_position"] = temp.groupby(["_m", "_n"]).cumcount()
-    temp["_group_size"] = temp.groupby(["_m", "_n"])["_m"].transform("size")
-    temp["_p"] = (temp["_position"] + 1) / (temp["_group_size"] + 1)
-    temp["G-score"] = (10 * temp["_m"] + temp["_n"] + temp["_p"]).round(2)
+    for idx, r in df.iterrows():
+        if not r['eligible']:
+            continue
+        
+        # SG Derivation
+        if r['G1_eligible'] and r['G2_eligible'] and r['sgeq_eligible']:
+            df.at[idx, 'sg'] = 0.6 * (0.25 * r['sg-eq_val'] + 0.75 * r['sg-ttm_val']) + 0.4 * r['sg-3y_val']
+        elif r['G1_eligible'] and r['G2_eligible'] and not r['sgeq_eligible']:
+            df.at[idx, 'sg'] = 0.6 * r['sg-ttm_val'] + 0.4 * r['sg-3y_val']
+        elif r['G1_eligible'] and not r['G2_eligible'] and r['sgeq_eligible']:
+            df.at[idx, 'sg'] = 0.6 * r['sg-ttm_val'] + 0.4 * r['sg-eq_val']
+        elif r['G1_eligible'] and not r['G2_eligible'] and not r['sgeq_eligible']:
+            df.at[idx, 'sg'] = r['sg-ttm_val']
+            
+        # PG Derivation
+        if r['G1_eligible'] and r['G2_eligible']:
+            df.at[idx, 'pg'] = 0.6 * r['pg-1_val'] + 0.4 * r['pg-3_val']
+        elif r['G1_eligible'] and not r['G2_eligible']:
+            df.at[idx, 'pg'] = r['pg-1_val']
 
-    df.loc[temp.index, "G-score"] = temp["G-score"]
+    # 4. Clipping to [-50, 100]
+    df['sgc'] = np.nan
+    df['pgc'] = np.nan
 
-    # 4. Drop all temporary/intermediate columns
-    df.drop(
-        columns=["_pg_c", "_sg_c", "_m", "_n", "pg-c", "sg-c"],
-        inplace=True,
-        errors="ignore"
-    )
-    print(f"[INFO] G-score calculated for {len(temp)} stocks.")
+    for idx, r in df.iterrows():
+        if not r['eligible']:
+            continue
+        sg_val, pg_val = r['sg'], r['pg']
+        if pd.isna(sg_val) or math.isinf(sg_val) or sg_val < -100 or sg_val > 9999:
+            df.at[idx, 'eligible'] = False
+            continue
+        if pd.isna(pg_val) or math.isinf(pg_val) or pg_val < -100 or pg_val > 9999:
+            df.at[idx, 'eligible'] = False
+            continue
+            
+        df.at[idx, 'sgc'] = max(-50.0, min(100.0, sg_val))
+        df.at[idx, 'pgc'] = max(-50.0, min(100.0, pg_val))
 
-    # 5. Sanitize and upload to Firebase as keyed dictionary
+    # 5. Group Partitioning (A1, A2, A3, A4)
+    df['group'] = np.nan
+    for idx, r in df.iterrows():
+        if not r['eligible']:
+            continue
+        sgc, pgc = r['sgc'], r['pgc']
+        if sgc <= 0 and pgc <= 0:
+            df.at[idx, 'group'] = 'A1'
+        elif sgc > 0 and pgc <= 0:
+            df.at[idx, 'group'] = 'A2'
+        elif sgc <= 0 and pgc > 0:
+            df.at[idx, 'group'] = 'A3'
+        elif sgc > 0 and pgc > 0:
+            df.at[idx, 'group'] = 'A4'
+
+    # 6. Rescale Groups A1, A2, and A3
+    df['G_score_calc'] = np.nan
+    group_configs = {
+        'A1': {'wt_sg': 0.5, 'wt_pg': 0.5, 'base': 0.0, 'scale': 10.0, 'mid': 5.0},
+        'A2': {'wt_sg': 0.6, 'wt_pg': 0.4, 'base': 10.01, 'scale': 20.0, 'mid': 20.01},
+        'A3': {'wt_sg': 0.25, 'wt_pg': 0.75, 'base': 30.01, 'scale': 20.0, 'mid': 40.01}
+    }
+    
+    for grp, cfg in group_configs.items():
+        sub_idx = df[df['group'] == grp].index
+        if len(sub_idx) == 0:
+            continue
+        
+        raw_vals = cfg['wt_sg'] * df.loc[sub_idx, 'sgc'] + cfg['wt_pg'] * df.loc[sub_idx, 'pgc']
+        min_v = raw_vals.min()
+        max_v = raw_vals.max()
+        
+        if len(sub_idx) == 1 or math.isclose(min_v, max_v):
+            df.loc[sub_idx, 'G_score_calc'] = cfg['mid']
+        else:
+            df.loc[sub_idx, 'G_score_calc'] = cfg['base'] + cfg['scale'] * (raw_vals - min_v) / (max_v - min_v)
+
+    # 7. Score A4 using Sugeno Fuzzy Inference
+    a4_idx = df[df['group'] == 'A4'].index
+    if len(a4_idx) > 0:
+        a4_sgc = df.loc[a4_idx, 'sgc']
+        a4_pgc = df.loc[a4_idx, 'pgc']
+        
+        Lmn_sg, Umx_sg, M_sg = compute_a4_cutoffs(a4_sgc)
+        Lmn_pg, Umx_pg, M_pg = compute_a4_cutoffs(a4_pgc)
+        
+        df['sugeno_S'] = np.nan
+        for idx in a4_idx:
+            sg_val = df.at[idx, 'sgc']
+            pg_val = df.at[idx, 'pgc']
+            
+            b_sg, n_sg, g_sg = calculate_memberships(sg_val, Lmn_sg, Umx_sg, M_sg)
+            b_pg, n_pg, g_pg = calculate_memberships(pg_val, Lmn_pg, Umx_pg, M_pg)
+            
+            S = evaluate_sugeno_a4(b_sg, n_sg, g_sg, b_pg, n_pg, g_pg)
+            if not math.isnan(S):
+                df.at[idx, 'sugeno_S'] = S
+                
+        valid_S = df.loc[a4_idx, 'sugeno_S'].dropna()
+        if len(valid_S) > 0:
+            S_min = valid_S.min()
+            S_max = valid_S.max()
+            
+            for idx in a4_idx:
+                s_val = df.at[idx, 'sugeno_S']
+                if pd.notna(s_val):
+                    if math.isclose(S_min, S_max):
+                        df.at[idx, 'G_score_calc'] = 75.0
+                    else:
+                        g_val = 50.01 + 50.0 * (s_val - S_min) / (S_max - S_min)
+                        df.at[idx, 'G_score_calc'] = min(100.0, g_val)
+
+    # 8. Assign final G-score (rounded to 2 decimal places)
+    df['G-score'] = df['G_score_calc'].round(2)
+    scored_count = df['G-score'].notna().sum()
+    print(f"[INFO] G-score computed for {scored_count} stocks.")
+
+    # 9. Clean up all temporary/intermediate columns
+    calc_cols = [
+        'G1_eligible', 'G2_eligible', 'sgeq_eligible', 'eligible',
+        'sg', 'pg', 'sgc', 'pgc', 'group', 'sugeno_S', 'G_score_calc'
+    ] + [f"{c}_val" for c in required_cols] + [f"{c}_valid" for c in required_cols]
+    
+    # Also drop legacy columns if present
+    calc_cols += ['_pg_c', '_sg_c', '_m', '_n', 'pg-c', 'sg-c']
+    df.drop(columns=calc_cols, inplace=True, errors="ignore")
+
+    # 10. Sanitize and write back to Firebase under <CODE>
     cleaned_df = df.replace([np.inf, -np.inf], np.nan)
     cleaned_df = cleaned_df.astype(object).where(pd.notnull(cleaned_df), None)
 
@@ -205,9 +307,9 @@ def update_growth_scores():
     else:
         payload = cleaned_df.to_dict(orient="index")
 
-    print(f"[INFO] Writing records with 'G-score' back to Firebase node '/{FIREBASE_TARGET_NODE}'...")
+    print(f"[INFO] Writing records with updated 'G-score' to Firebase node '/{FIREBASE_TARGET_NODE}'...")
     ref.set(payload)
-    print(f"[OK] Success! Single column 'G-score' updated in Firebase.")
+    print(f"[OK] Success! Updated 'G-score' in Firebase without modifying any other metrics.")
 
 if __name__ == "__main__":
     try:
