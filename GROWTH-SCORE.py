@@ -133,7 +133,7 @@ def evaluate_sugeno_a4(bad_sg, norm_sg, good_sg, bad_pg, norm_pg, good_pg):
     return sum(w * score for w, score in rules) / total_wt
 
 # =====================================================================
-# 3. MAIN GROWTH SCORE PIPELINE
+# 3. MAIN PIPELINE
 # =====================================================================
 def update_growth_scores():
     print("[INFO] Connecting to Firebase Realtime Database...")
@@ -212,7 +212,8 @@ def update_growth_scores():
         df.at[idx, 'pgc'] = max(-50.0, min(100.0, pg_val))
 
     # 5. Group Partitioning (A1, A2, A3, A4)
-    df['group'] = np.nan
+    # Fix: Explicitly create 'group' as object dtype to prevent float64 assignment error
+    df['group'] = pd.Series(index=df.index, dtype='object')
     for idx, r in df.iterrows():
         if not r['eligible']:
             continue
@@ -283,22 +284,21 @@ def update_growth_scores():
                         g_val = 50.01 + 50.0 * (s_val - S_min) / (S_max - S_min)
                         df.at[idx, 'G_score_calc'] = min(100.0, g_val)
 
-    # 8. Assign final G-score (rounded to 2 decimal places)
+    # 8. Assign final G-score
     df['G-score'] = df['G_score_calc'].round(2)
     scored_count = df['G-score'].notna().sum()
     print(f"[INFO] G-score computed for {scored_count} stocks.")
 
-    # 9. Clean up all temporary/intermediate columns
+    # 9. Clean up all temporary columns
     calc_cols = [
         'G1_eligible', 'G2_eligible', 'sgeq_eligible', 'eligible',
         'sg', 'pg', 'sgc', 'pgc', 'group', 'sugeno_S', 'G_score_calc'
     ] + [f"{c}_val" for c in required_cols] + [f"{c}_valid" for c in required_cols]
-    
-    # Also drop legacy columns if present
     calc_cols += ['_pg_c', '_sg_c', '_m', '_n', 'pg-c', 'sg-c']
+    
     df.drop(columns=calc_cols, inplace=True, errors="ignore")
 
-    # 10. Sanitize and write back to Firebase under <CODE>
+    # 10. Sanitize and write back to Firebase
     cleaned_df = df.replace([np.inf, -np.inf], np.nan)
     cleaned_df = cleaned_df.astype(object).where(pd.notnull(cleaned_df), None)
 
@@ -309,7 +309,7 @@ def update_growth_scores():
 
     print(f"[INFO] Writing records with updated 'G-score' to Firebase node '/{FIREBASE_TARGET_NODE}'...")
     ref.set(payload)
-    print(f"[OK] Success! Updated 'G-score' in Firebase without modifying any other metrics.")
+    print(f"[OK] Success! Single column 'G-score' updated in Firebase.")
 
 if __name__ == "__main__":
     try:
