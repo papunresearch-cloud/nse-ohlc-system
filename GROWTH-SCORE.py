@@ -121,7 +121,7 @@ def update_growth_scores():
         df.at[idx, 'pgc'] = max(-50.0, min(100.0, pg_val))
 
     # =================================================================
-    # REPLACEMENT: CONTINUOUS WEIGHTED G-SCORE CALCULATION
+    # CONTINUOUS WEIGHTED G-SCORE NORMALIZED TO 0 - 100 SCALE
     # =================================================================
     df['G-score'] = np.nan
     eligible_mask = df['eligible'] & df['sgc'].notna() & df['pgc'].notna()
@@ -139,9 +139,19 @@ def update_growth_scores():
         # k = 0.25 + 0.0075 * kf
         k = 0.25 + (0.0075 * kf)
 
-        # G-score = (sgc + k * pgc) / (1 + k)
-        g_scores = (sgc + k * pgc) / (1.0 + k)
-        df.loc[eligible_mask, 'G-score'] = g_scores.round(2)
+        # fv = (sgc + k * pgc) / (1 + k)
+        fv = (sgc + k * pgc) / (1.0 + k)
+
+        # Min-Max Rescaling to 0 - 100 scale
+        fv_min = fv.min()
+        fv_max = fv.max()
+
+        if pd.notna(fv_min) and pd.notna(fv_max):
+            if math.isclose(fv_min, fv_max):
+                df.loc[eligible_mask, 'G-score'] = 50.0
+            else:
+                g_norm = ((fv - fv_min) / (fv_max - fv_min)) * 100.0
+                df.loc[eligible_mask, 'G-score'] = g_norm.round(2)
 
     scored_count = df['G-score'].notna().sum()
     print(f"[INFO] G-score computed for {scored_count} stocks.")
