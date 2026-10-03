@@ -42,98 +42,7 @@ def validate_metric(val):
     return True, fval
 
 # =====================================================================
-# 2. SUGENO & FUZZY LOGIC FOR GROUP A4
-# =====================================================================
-def compute_a4_cutoffs(series):
-    """
-    Computes Lmn (5th percentile), Umx (95th percentile) via linear interpolation,
-    and M (center of gravity) trimming floor(0.05 * N) from both ends.
-    """
-    vals = np.sort(series.dropna().values)
-    n = len(vals)
-    if n == 0:
-        return np.nan, np.nan, np.nan
-    
-    Lmn = float(np.percentile(vals, 5, method='linear'))
-    Umx = float(np.percentile(vals, 95, method='linear'))
-    
-    trim_k = math.floor(0.05 * n)
-    if trim_k > 0 and (2 * trim_k < n):
-        trimmed_vals = vals[trim_k : n - trim_k]
-    else:
-        trimmed_vals = vals
-        
-    M = float(np.mean(trimmed_vals))
-    return Lmn, Umx, M
-
-def calculate_memberships(x, Lmn, Umx, M):
-    """
-    Calculates Bad, Normal, and Good memberships with straight-line transitions.
-    Guarantees sum(memberships) == 1.0.
-    """
-    if pd.isna(x):
-        return np.nan, np.nan, np.nan
-    
-    if math.isclose(Lmn, Umx):
-        if math.isclose(x, Lmn):
-            return 0.0, 1.0, 0.0
-        elif x < Lmn:
-            return 1.0, 0.0, 0.0
-        else:
-            return 0.0, 0.0, 1.0
-
-    if x <= Lmn:
-        return 1.0, 0.0, 0.0
-    
-    if x < M:
-        denom = M - Lmn
-        if math.isclose(denom, 0.0):
-            return 0.0, 1.0, 0.0
-        bad = (M - x) / denom
-        normal = (x - Lmn) / denom
-        return bad, normal, 0.0
-    
-    if math.isclose(x, M):
-        return 0.0, 1.0, 0.0
-    
-    if x < Umx:
-        denom = Umx - M
-        if math.isclose(denom, 0.0):
-            return 0.0, 0.0, 1.0
-        normal = (Umx - x) / denom
-        good = (x - M) / denom
-        return 0.0, normal, good
-    
-    return 0.0, 0.0, 1.0
-
-def evaluate_sugeno_a4(bad_sg, norm_sg, good_sg, bad_pg, norm_pg, good_pg):
-    """
-    Evaluates zero-order Sugeno rules (Columns: SG, Rows: PG):
-    Firing strength = product of memberships.
-    """
-    if any(pd.isna([bad_sg, norm_sg, good_sg, bad_pg, norm_pg, good_pg])):
-        return np.nan
-    
-    rules = [
-        (good_pg * good_sg, 100.0),
-        (good_pg * norm_sg, 85.0),
-        (good_pg * bad_sg, 62.0),
-        (norm_pg * good_sg, 75.0),
-        (norm_pg * norm_sg, 50.0),
-        (norm_pg * bad_sg, 25.0),
-        (bad_pg * good_sg, 38.0),
-        (bad_pg * norm_sg, 12.0),
-        (bad_pg * bad_sg, 0.0),
-    ]
-    
-    total_wt = sum(w for w, _ in rules)
-    if total_wt <= 0 or math.isnan(total_wt):
-        return np.nan
-    
-    return sum(w * score for w, score in rules) / total_wt
-
-# =====================================================================
-# 3. MAIN PIPELINE
+# 2. MAIN PIPELINE
 # =====================================================================
 def update_growth_scores():
     print("[INFO] Connecting to Firebase Realtime Database...")
@@ -211,81 +120,29 @@ def update_growth_scores():
         df.at[idx, 'sgc'] = max(-50.0, min(100.0, sg_val))
         df.at[idx, 'pgc'] = max(-50.0, min(100.0, pg_val))
 
-    # 5. Group Partitioning (A1, A2, A3, A4)
-    # Fix: Explicitly create 'group' as object dtype to prevent float64 assignment error
-    df['group'] = pd.Series(index=df.index, dtype='object')
-    for idx, r in df.iterrows():
-        if not r['eligible']:
-            continue
-        sgc, pgc = r['sgc'], r['pgc']
-        if sgc <= 0 and pgc <= 0:
-            df.at[idx, 'group'] = 'A1'
-        elif sgc > 0 and pgc <= 0:
-            df.at[idx, 'group'] = 'A2'
-        elif sgc <= 0 and pgc > 0:
-            df.at[idx, 'group'] = 'A3'
-        elif sgc > 0 and pgc > 0:
-            df.at[idx, 'group'] = 'A4'
+    # =================================================================
+    # REPLACEMENT: CONTINUOUS WEIGHTED G-SCORE CALCULATION
+    # =================================================================
+    df['G-score'] = np.nan
+    eligible_mask = df['eligible'] & df['sgc'].notna() & df['pgc'].notna()
 
-    # 6. Rescale Groups A1, A2, and A3
-    df['G_score_calc'] = np.nan
-    group_configs = {
-        'A1': {'wt_sg': 0.5, 'wt_pg': 0.5, 'base': 0.0, 'scale': 10.0, 'mid': 5.0},
-        'A2': {'wt_sg': 0.6, 'wt_pg': 0.4, 'base': 10.01, 'scale': 20.0, 'mid': 20.01},
-        'A3': {'wt_sg': 0.25, 'wt_pg': 0.75, 'base': 30.01, 'scale': 20.0, 'mid': 40.01}
-    }
-    
-    for grp, cfg in group_configs.items():
-        sub_idx = df[df['group'] == grp].index
-        if len(sub_idx) == 0:
-            continue
-        
-        raw_vals = cfg['wt_sg'] * df.loc[sub_idx, 'sgc'] + cfg['wt_pg'] * df.loc[sub_idx, 'pgc']
-        min_v = raw_vals.min()
-        max_v = raw_vals.max()
-        
-        if len(sub_idx) == 1 or math.isclose(min_v, max_v):
-            df.loc[sub_idx, 'G_score_calc'] = cfg['mid']
-        else:
-            df.loc[sub_idx, 'G_score_calc'] = cfg['base'] + cfg['scale'] * (raw_vals - min_v) / (max_v - min_v)
+    if eligible_mask.any():
+        sgc = df.loc[eligible_mask, 'sgc']
+        pgc = df.loc[eligible_mask, 'pgc']
 
-    # 7. Score A4 using Sugeno Fuzzy Inference
-    a4_idx = df[df['group'] == 'A4'].index
-    if len(a4_idx) > 0:
-        a4_sgc = df.loc[a4_idx, 'sgc']
-        a4_pgc = df.loc[a4_idx, 'pgc']
-        
-        Lmn_sg, Umx_sg, M_sg = compute_a4_cutoffs(a4_sgc)
-        Lmn_pg, Umx_pg, M_pg = compute_a4_cutoffs(a4_pgc)
-        
-        df['sugeno_S'] = np.nan
-        for idx in a4_idx:
-            sg_val = df.at[idx, 'sgc']
-            pg_val = df.at[idx, 'pgc']
-            
-            b_sg, n_sg, g_sg = calculate_memberships(sg_val, Lmn_sg, Umx_sg, M_sg)
-            b_pg, n_pg, g_pg = calculate_memberships(pg_val, Lmn_pg, Umx_pg, M_pg)
-            
-            S = evaluate_sugeno_a4(b_sg, n_sg, g_sg, b_pg, n_pg, g_pg)
-            if not math.isnan(S):
-                df.at[idx, 'sugeno_S'] = S
-                
-        valid_S = df.loc[a4_idx, 'sugeno_S'].dropna()
-        if len(valid_S) > 0:
-            S_min = valid_S.min()
-            S_max = valid_S.max()
-            
-            for idx in a4_idx:
-                s_val = df.at[idx, 'sugeno_S']
-                if pd.notna(s_val):
-                    if math.isclose(S_min, S_max):
-                        df.at[idx, 'G_score_calc'] = 75.0
-                    else:
-                        g_val = 50.01 + 50.0 * (s_val - S_min) / (S_max - S_min)
-                        df.at[idx, 'G_score_calc'] = min(100.0, g_val)
+        # diff = ABS(sgc - pgc)
+        diff = (sgc - pgc).abs()
 
-    # 8. Assign final G-score
-    df['G-score'] = df['G_score_calc'].round(2)
+        # kf = 100 / (1 + EXP(LN(9) * (diff - 50) / 25))
+        kf = 100.0 / (1.0 + np.exp(np.log(9.0) * (diff - 50.0) / 25.0))
+
+        # k = 0.25 + 0.0075 * kf
+        k = 0.25 + (0.0075 * kf)
+
+        # G-score = (sgc + k * pgc) / (1 + k)
+        g_scores = (sgc + k * pgc) / (1.0 + k)
+        df.loc[eligible_mask, 'G-score'] = g_scores.round(2)
+
     scored_count = df['G-score'].notna().sum()
     print(f"[INFO] G-score computed for {scored_count} stocks.")
 
