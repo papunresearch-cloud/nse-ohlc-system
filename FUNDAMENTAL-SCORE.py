@@ -11,174 +11,115 @@ FIREBASE_KEY_FILE = "serviceAccountKey.json"
 FIREBASE_DB_URL = "https://stock-dashboard-5c25c-default-rtdb.asia-southeast1.firebasedatabase.app"
 FIREBASE_TARGET_NODE = "SCREENER"
 
-REFERENCE = 0.25  # Threshold factor for closeness in roe-c and roa-c
-
-DIV_COLUMN = "advdp"
 OUTPUT_COLUMN = "F-score"
+SENTINEL_DISQUALIFIED = 101.0
 
-# Dividend Model Parameters
-IDEAL_DIV_MIN = 25.0  # when F1 = 0
-IDEAL_DIV_MAX = 65.0  # when F1 = 100
-LEFT_SIGMA = 24.0
-RIGHT_SIGMA = 10.0
-MAX_CORRECTION = 8.0
-SIGMOID_MIDPOINT = 30.0
-SIGMOID_STEEPNESS = 0.14
-SIGMOID_POWER = 3.3
+# Mathematical Model Constants
+L_PARAM = 1.0
+B_PARAM = 0.025
+T0_PARAM = 7.5
+P_PARAM = 25.0
+
 
 def init_firebase():
-    """Initializes the Firebase Admin SDK if not already active."""
+    """Initializes Firebase Admin SDK if not already active."""
     if not firebase_admin._apps:
         cred = credentials.Certificate(FIREBASE_KEY_FILE)
         firebase_admin.initialize_app(cred, {
             'databaseURL': FIREBASE_DB_URL
         })
 
-# =====================================================================
-# PART 1: ROE-C & ROA-C CALCULATION LOGIC
-# =====================================================================
-def calculate_3pt_consensus(r0, r1, r3y):
-    v0, v1, v3y = pd.notna(r0), pd.notna(r1), pd.notna(r3y)
-
-    # All three missing
-    if not v0 and not v1 and not v3y:
-        return 0.0
-
-    # One missing
-    if not v3y and v0 and v1:
-        return (0.55 * r0) + (0.45 * r1)
-    if not v0 and v1 and v3y:
-        return 0.0
-    if not v1 and v0 and v3y:
-        return 0.0
-
-    # Two missing
-    if v0 and not v1 and not v3y:
-        return r0
-    if v1 and not v0 and not v3y:
-        return r1
-    if v3y and not v0 and not v1:
-        return r3y
-
-    # All three available
-    if v0 and v1 and v3y:
-        x1, x2, x3 = r0, r1, r3y
-        x12, x23, x13 = abs(x1 - x2), abs(x2 - x3), abs(x1 - x3)
-        k = np.median([x1, x2, x3]) * REFERENCE
-
-        if (x12 < k) and (x23 < k) and (x13 < k):
-            return (0.2 * x1) + (0.3 * x2) + (0.5 * x3)
-
-        pairs = {"12": x12, "23": x23, "13": x13}
-        closest = min(pairs, key=pairs.get)
-
-        if closest == "12":
-            return (0.55 * x1) + (0.45 * x2)
-        elif closest == "23":
-            return (0.75 * x3) + (0.25 * x2)
-        elif closest == "13":
-            return (0.75 * x3) + (0.25 * x1)
-
-        return np.median([x1, x2, x3])
-
-    return 0.0
 
 # =====================================================================
-# PART 2: 5X5 SUGENO FUZZY ENGINE
+# 1. VALIDATION FUNCTIONS
 # =====================================================================
-def sugeno_fuzzy_engine_5x5(X, Y):
-    if pd.isna(X) or pd.isna(Y):
-        return np.nan
+def validate_value(val):
+    """
+    Validates that a profitability value is a finite real number
+    in the inclusive range [-999, 999]. Missing, NaN, text, and infinities
+    are treated as invalid.
+    """
+    if pd.isna(val) or isinstance(val, bool):
+        return False, np.nan
+    try:
+        fval = float(val)
+    except (ValueError, TypeError):
+        return False, np.nan
 
-    centers = {"LL": 0, "L": 25, "M": 50, "H": 75, "HH": 100}
-    spreads = {"LL": 10.617, "L": 10.617, "M": 10.617, "H": 10.617, "HH": 21.233}
+    if math.isnan(fval) or math.isinf(fval):
+        return False, np.nan
+    if fval < -999.0 or fval > 999.0:
+        return False, np.nan
 
-    Z_LL = min(20, max(0, (0 + 0.50 * (X + Y))))
-    Z_L = min(40, max(20, (20 + 0.50 * (X + Y - 20))))
-    Z_M = min(60, max(40, (40 + 0.50 * (X + Y - 40))))
-    Z_H = min(80, max(60, (60 + 0.50 * (X + Y - 60))))
-    Z_HH = min(100, max(80, (80 + 0.50 * (X + Y - 80))))
+    return True, fval
 
-    def clip(val):
-        return max(0.0, min(100.0, val))
 
-    consequent_outputs = {
-        "LL": clip(Z_LL),
-        "L": clip(Z_L),
-        "M": clip(Z_M),
-        "H": clip(Z_H),
-        "HH": clip(Z_HH),
-    }
+# =====================================================================
+# 2. ROW-LEVEL EVALUATION PIPELINE
+# =====================================================================
+def evaluate_stock_row(row):
+    """
+    Evaluates a single company row:
+    - Atomically validates groups G1 (0-year), G2 (1-year), G3 (3-year).
+    - Rejects the row (sentinel 101) if G1 is invalid.
+    - Cascades G1-only, G1+G2, or G1+G2+G3 based on group validity.
+    - Clamps derived ROE-c and ROA-c into [-25, 50].
+    - Computes logistic K and blended Fv.
+    Returns: (status: 'OK' | 'DISQUALIFIED', fv_value: float)
+    """
+    # Group 1: Latest Year
+    g1_roe_ok, r0 = validate_value(row.get("roe-0"))
+    g1_roa_ok, a0 = validate_value(row.get("roa-0"))
+    g1_valid = g1_roe_ok and g1_roa_ok
 
-    rule_matrix = {
-        ("LL", "LL"): "LL", ("LL", "L"): "LL", ("LL", "M"): "L",  ("LL", "H"): "M",  ("LL", "HH"): "M",
-        ("L", "LL"): "LL",  ("L", "L"): "L",   ("L", "M"): "M",  ("L", "H"): "H",   ("L", "HH"): "H",
-        ("M", "LL"): "L",   ("M", "L"): "L",   ("M", "M"): "M",  ("M", "H"): "H",   ("M", "HH"): "H",
-        ("H", "LL"): "L",   ("H", "L"): "M",   ("H", "M"): "H",  ("H", "H"): "HH",  ("H", "HH"): "HH",
-        ("HH", "LL"): "L",  ("HH", "L"): "M",  ("HH", "M"): "H", ("HH", "H"): "HH", ("HH", "HH"): "HH",
-    }
+    # Rule: If G1 is rejected, do not calculate score for the row
+    if not g1_valid:
+        return "DISQUALIFIED", SENTINEL_DISQUALIFIED
 
-    def gaussian(val, c, k):
-        return math.exp(-((val - c) ** 2) / (2 * (k ** 2)))
+    # Group 2: Preceding Year
+    g2_roe_ok, r1 = validate_value(row.get("roe-1"))
+    g2_roa_ok, a1 = validate_value(row.get("roa-1"))
+    g2_valid = g2_roe_ok and g2_roa_ok
 
-    mu_X = {
-        "LL": 1.0 if X <= 0 else gaussian(X, centers["LL"], spreads["LL"]),
-        "L": gaussian(X, centers["L"], spreads["L"]),
-        "M": gaussian(X, centers["M"], spreads["M"]),
-        "H": gaussian(X, centers["H"], spreads["H"]),
-        "HH": 1.0 if X >= 100 else gaussian(X, centers["HH"], spreads["HH"]),
-    }
+    # Group 3: 3-Year Average
+    g3_roe_ok, r3y = validate_value(row.get("roe-3y"))
+    g3_roa_ok, a3y = validate_value(row.get("roa-3y"))
+    g3_valid = g3_roe_ok and g3_roa_ok
 
-    mu_Y = {
-        "LL": 1.0 if Y <= 0 else gaussian(Y, centers["LL"], spreads["LL"]),
-        "L": gaussian(Y, centers["L"], spreads["L"]),
-        "M": gaussian(Y, centers["M"], spreads["M"]),
-        "H": gaussian(Y, centers["H"], spreads["H"]),
-        "HH": 1.0 if Y >= 100 else gaussian(Y, centers["HH"], spreads["HH"]),
-    }
+    # Cascade logic:
+    # 1. If G1 accepted, G2 rejected -> use G1 only (reject G3 even if valid)
+    # 2. If G1 and G2 accepted, G3 rejected -> use G1 and G2
+    # 3. If all three accepted -> use all three
+    if not g2_valid:
+        roe_raw = r0
+        roa_raw = a0
+    elif not g3_valid:
+        roe_raw = (0.60 * r0) + (0.40 * r1)
+        roa_raw = (0.60 * a0) + (0.40 * a1)
+    else:
+        roe_raw = (0.40 * r0) + (0.35 * r1) + (0.25 * r3y)
+        roa_raw = (0.40 * a0) + (0.35 * a1) + (0.25 * a3y)
 
-    weighted_sum = 0.0
-    total_weight = 0.0
+    # Clamping: Rf = max(-25, min(50, R)) separately for ROE-c & ROA-c
+    roe_c = max(-25.0, min(50.0, roe_raw))
+    roa_c = max(-25.0, min(50.0, roa_raw))
 
-    for x_class, x_mu in mu_X.items():
-        for y_class, y_mu in mu_Y.items():
-            weight = x_mu * y_mu
-            rule_output_class = rule_matrix[(x_class, y_class)]
-            z = consequent_outputs[rule_output_class]
-            weighted_sum += weight * z
-            total_weight += weight
+    # K calculation: K = L / ((1 + exp(-B * (ROA-c - T0))) ^ P)
+    exponent = -B_PARAM * (roa_c - T0_PARAM)
+    # Numerical safeguard for large exp inputs
+    clipped_exp = max(-500.0, min(500.0, exponent))
+    denom_base = 1.0 + math.exp(clipped_exp)
+    k = L_PARAM / (denom_base ** P_PARAM)
 
-    return 0.0 if total_weight == 0 else weighted_sum / total_weight
+    # Fundamental value: Fv = (ROA-c + K * ROE-c) / (1 + K)
+    fv = (roa_c + (k * roe_c)) / (1.0 + k)
 
-# ==========================================================
-# PART 3: DIVIDEND CORRECTION FUNCTIONS
-# ==========================================================
-def clip_dividend(dividend):
-    return np.clip(dividend, 0.0, 100.0)
+    return "OK", fv
 
-def ideal_dividend(f1):
-    return IDEAL_DIV_MIN + (IDEAL_DIV_MAX - IDEAL_DIV_MIN) * (f1 / 100.0)
 
-def dividend_correction(dividend, ideal_div):
-    sigma = np.where(dividend <= ideal_div, LEFT_SIGMA, RIGHT_SIGMA)
-    gaussian = np.exp(-((dividend - ideal_div) ** 2) / (2 * sigma ** 2))
-    return MAX_CORRECTION * (2 * gaussian - 1)
-
-def dividend_weight(f1):
-    sigmoid = 1.0 / (1.0 + np.exp(-SIGMOID_STEEPNESS * (f1 - SIGMOID_MIDPOINT)))
-    return sigmoid ** SIGMOID_POWER
-
-def calculate_f_score(f1, dividend):
-    dividend = clip_dividend(dividend)
-    ideal = ideal_dividend(f1)
-    correction = dividend_correction(dividend, ideal)
-    weight = dividend_weight(f1)
-    f_score = f1 + weight * correction
-    return np.clip(f_score, 0, 100)
-
-# ==========================================================
-# MAIN EXECUTION PIPELINE
-# ==========================================================
+# =====================================================================
+# 3. MAIN EXECUTION PIPELINE
+# =====================================================================
 def run_fundamental_scoring():
     print("[INFO] Connecting to Firebase Realtime Database...")
     init_firebase()
@@ -196,54 +137,56 @@ def run_fundamental_scoring():
     else:
         df = pd.DataFrame(data)
 
-    # 1. Coerce input columns to numeric
-    input_cols = [
-        "roe-0", "roe-1", "roe-3y",
-        "roa-0", "roa-1", "roa-3y",
-        DIV_COLUMN
-    ]
-    for col in input_cols:
-        if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
-        else:
+    profitability_cols = ["roe-0", "roe-1", "roe-3y", "roa-0", "roa-1", "roa-3y"]
+    for col in profitability_cols:
+        if col not in df.columns:
             df[col] = np.nan
 
-    # 2. Derive roe-c and roa-c as internal series
-    roe_c = df.apply(
-        lambda r: calculate_3pt_consensus(r["roe-0"], r["roe-1"], r["roe-3y"]),
-        axis=1
-    ).round(2)
+    print("[INFO] Validating year groups and deriving fundamental value (Fv)...")
+    eval_results = df.apply(evaluate_stock_row, axis=1)
 
-    roa_c = df.apply(
-        lambda r: calculate_3pt_consensus(r["roa-0"], r["roa-1"], r["roa-3y"]),
-        axis=1
-    ).round(2)
+    statuses = [res[0] for res in eval_results]
+    fv_values = [res[1] for res in eval_results]
 
-    # 3. Piecewise mapping normalization
-    x_A = [-1e9, 0, 5, 10, 15, 20, 25, 30, 1e9]
-    y_A = [0, 0, 20, 35, 50, 85, 95, 100, 100]
-    x_B = [-1e9, 0, 1, 2, 5, 10, 15, 20, 1e9]
-    y_B = [0, 0, 20, 30, 50, 80, 90, 100, 100]
+    df["_eval_status"] = statuses
+    df["_fv"] = fv_values
 
-    a_norm = roe_c.apply(lambda v: np.interp(v, x_A, y_A))
-    b_norm = roa_c.apply(lambda v: np.interp(v, x_B, y_B))
+    valid_mask = df["_eval_status"] == "OK"
+    disqualified_mask = df["_eval_status"] == "DISQUALIFIED"
 
-    # 4. Fuzzy inference engine for preliminary score F1
-    f1_scores = [sugeno_fuzzy_engine_5x5(x, y) for x, y in zip(a_norm, b_norm)]
-    f1_series = pd.Series(f1_scores, index=df.index).fillna(0)
+    # Initialize F-score column
+    df[OUTPUT_COLUMN] = np.nan
 
-    # 5. Dividend correction
-    div_series = df[DIV_COLUMN].fillna(0)
-    final_f_scores = calculate_f_score(f1_series, div_series)
+    # Assign sentinel 101 to disqualified rows
+    df.loc[disqualified_mask, OUTPUT_COLUMN] = SENTINEL_DISQUALIFIED
 
-    # 6. Save only the single final target column
-    df[OUTPUT_COLUMN] = final_f_scores.round(2)
-    df.drop(columns=["roe-c", "roa-c"], inplace=True, errors="ignore")
+    # Cross-sectional normalization: F-score 0 to 100 for valid stocks
+    if valid_mask.any():
+        valid_fv = df.loc[valid_mask, "_fv"]
+        fv_min = valid_fv.min()
+        fv_max = valid_fv.max()
 
-    # 7. Clean and serialize to Firebase as keyed dictionary
+        print(f"[INFO] Cross-sectional bounds: Fv_min = {fv_min:.4f}, Fv_max = {fv_max:.4f}")
+
+        if math.isclose(fv_min, fv_max):
+            # Degenerate case fallback
+            df.loc[valid_mask, OUTPUT_COLUMN] = 50.0
+        else:
+            normalized_scores = ((valid_fv - fv_min) / (fv_max - fv_min)) * 100.0
+            df.loc[valid_mask, OUTPUT_COLUMN] = normalized_scores.round(2)
+
+    valid_count = valid_mask.sum()
+    disqualified_count = disqualified_mask.sum()
+    print(f"[INFO] Scoring finished: {valid_count} scored stocks, {disqualified_count} disqualified stocks (assigned 101).")
+
+    # Clean intermediate calculation columns
+    df.drop(columns=["_eval_status", "_fv", "roe-c", "roa-c"], inplace=True, errors="ignore")
+
+    # Sanitize NaN/inf values for JSON serialization
     cleaned_df = df.replace([np.inf, -np.inf], np.nan)
     cleaned_df = cleaned_df.astype(object).where(pd.notnull(cleaned_df), None)
 
+    # Persist keyed dictionary structure using CODE as primary key
     if "CODE" in cleaned_df.columns:
         payload = cleaned_df.set_index("CODE", drop=False).to_dict(orient="index")
     else:
@@ -252,6 +195,7 @@ def run_fundamental_scoring():
     print(f"[INFO] Writing records with '{OUTPUT_COLUMN}' back to Firebase node '/{FIREBASE_TARGET_NODE}'...")
     ref.set(payload)
     print(f"[OK] Success! Single column '{OUTPUT_COLUMN}' updated in Firebase.")
+
 
 if __name__ == "__main__":
     try:
