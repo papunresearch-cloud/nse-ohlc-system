@@ -108,8 +108,8 @@ def evaluate_stock_row(row):
     exponent = -B_PARAM * (roa_c - T0_PARAM)
     # Numerical safeguard for large exp inputs
     clipped_exp = max(-500.0, min(500.0, exponent))
-    denom_base = 1.0 + math.exp(clipped_exp)
-    k = L_PARAM / (denom_base ** P_PARAM)
+    exp_term = math.exp(clipped_exp)
+    k = L_PARAM / (1.0 + exp_term ** P_PARAM)
 
     # Fundamental value: Fv = (ROA-c + K * ROE-c) / (1 + K)
     fv = (roa_c + (k * roe_c)) / (1.0 + k)
