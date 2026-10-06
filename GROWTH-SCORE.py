@@ -153,7 +153,10 @@ def update_growth_scores():
                 g_norm = ((fv - fv_min) / (fv_max - fv_min)) * 100.0
                 df.loc[eligible_mask, 'G-score'] = g_norm.round(2)
 
-    scored_count = df['G-score'].notna().sum()
+    # Convert G-score to numeric, coercing any non-numeric values to NaN, then fill all NaNs/blanks with 101
+    df['G-score'] = pd.to_numeric(df['G-score'], errors='coerce').fillna(101.0)
+
+    scored_count = (df['G-score'] != 101.0).sum()
     print(f"[INFO] G-score computed for {scored_count} stocks.")
 
     # 9. Clean up all temporary columns
