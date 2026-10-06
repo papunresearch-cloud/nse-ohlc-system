@@ -241,6 +241,9 @@ def update_technical_score():
     df["T-score"] = np.nan
     df.loc[valid_mask, "T-score"] = calc_df["T-score"].round(2)
 
+    # Replace blank or any non-number values in T-score with 101.0
+    df["T-score"] = pd.to_numeric(df["T-score"], errors='coerce').fillna(101.0)
+
     # Clean float/NaN/infinite values to None for proper JSON serialization
     cleaned_df = df.replace([np.inf, -np.inf], np.nan)
     cleaned_df = cleaned_df.astype(object).where(pd.notnull(cleaned_df), None)
