@@ -12,6 +12,7 @@ MASTER ORCHESTRATOR (Primary Key Architecture: CODE)
   post-market settlement window, and per-stock quarantine protection.
 * Updates real-time Firebase /system_status telemetry on every cycle and heartbeat.
 * Dispatches background email/WhatsApp price boundary alerts during live market.
+* Supports both Drive sync (/sync-screener) and Local File Upload (/sync-screener-upload).
 ===============================================================================
 """
 
@@ -22,6 +23,8 @@ import signal
 import json
 import logging
 import threading
+import email
+from email.message import Message
 from urllib.parse import urlparse
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from datetime import datetime, time as dtime
@@ -104,17 +107,23 @@ except ImportError:
         update_all_parameters = None
         calculate_single_script_parameters = None
 
-# 6. Screener Pipeline ETL Runner
+# 6. Screener Pipeline ETL Runner & Direct BASIC Runner
 try:
     from RUN_PIPELINE import main as run_screener_pipeline
 except ImportError:
+    run_screener_pipeline = None
+
+try:
+    from BASIC import run_pipeline as run_basic_pipeline
+except ImportError:
     try:
-        from BASIC import run_pipeline as run_screener_pipeline
+        from basic import run_pipeline as run_basic_pipeline
     except ImportError:
-        try:
-            from basic import run_pipeline as run_screener_pipeline
-        except ImportError:
-            run_screener_pipeline = None
+        run_basic_pipeline = None
+
+# Fallback: assign if run_screener_pipeline is absent
+if not run_screener_pipeline:
+    run_screener_pipeline = run_basic_pipeline
 
 # 7. Alert Notification Dispatcher
 try:
@@ -172,9 +181,9 @@ class SystemStateBus:
 
 STATE_BUS = SystemStateBus()
 
-def dispatch_screener_sync_job():
+def dispatch_screener_sync_job(csv_bytes: bytes = None):
     """Runs screener ETL in a background daemon thread with trace logging."""
-    if not run_screener_pipeline:
+    if not run_screener_pipeline and not run_basic_pipeline:
         logger.error("[SCREENER] Cannot run pipeline: ETL runner not loaded.")
         return False, "ETL runner module not available"
 
@@ -184,8 +193,23 @@ def dispatch_screener_sync_job():
 
     def worker():
         try:
-            logger.info("[SCREENER] Starting Google Drive -> Firebase ETL Pipeline...")
-            run_screener_pipeline()
+            if csv_bytes is not None:
+                logger.info("[SCREENER] Starting Local File Stream -> Firebase ETL Pipeline...")
+                if run_basic_pipeline:
+                    run_basic_pipeline(csv_source=csv_bytes)
+                else:
+                    run_screener_pipeline()
+                
+                # Execute pipeline runner if RUN_PIPELINE is loaded
+                if run_screener_pipeline and run_screener_pipeline != run_basic_pipeline:
+                    try:
+                        run_screener_pipeline()
+                    except Exception as pipe_err:
+                        logger.warning(f"[SCREENER] Additional pipeline runner notice: {pipe_err}")
+            else:
+                logger.info("[SCREENER] Starting Google Drive -> Firebase ETL Pipeline...")
+                run_screener_pipeline()
+
             logger.info("[SCREENER] Pipeline successfully written to Firebase /SCREENER.")
         except Exception as ex:
             logger.error(f"[SCREENER] CRASHED WITH ERROR: {ex}", exc_info=True)
@@ -285,9 +309,43 @@ class HealthAndControlHandler(BaseHTTPRequestHandler):
             self._send_json_response(200, {"status": "ok", "message": "Historical sync pulse triggered"})
 
         elif path in ["/sync-screener", "/run-pipeline", "/api/sync-screener"]:
-            started, msg = dispatch_screener_sync_job()
+            started, msg = dispatch_screener_sync_job(csv_bytes=None)
             code = 200 if started else 409
             self._send_json_response(code, {"message": msg})
+
+        elif path in ["/sync-screener-upload", "/api/sync-screener-upload"]:
+            try:
+                content_type = self.headers.get("Content-Type", "")
+                content_length = int(self.headers.get("Content-Length", 0))
+
+                if not content_type.startswith("multipart/form-data") or content_length == 0:
+                    self._send_json_response(400, {"error": "Expected multipart/form-data payload with file."})
+                    return
+
+                raw_body = self.rfile.read(content_length)
+
+                # Standard library multipart message parser
+                msg_data = f"Content-Type: {content_type}\r\nMIME-Version: 1.0\r\n\r\n".encode("utf-8") + raw_body
+                msg = email.message_from_bytes(msg_data)
+
+                csv_file_bytes = None
+                for part in msg.walk():
+                    disposition = part.get("Content-Disposition", "")
+                    if 'name="file"' in disposition or 'filename=' in disposition:
+                        csv_file_bytes = part.get_payload(decode=True)
+                        break
+
+                if not csv_file_bytes:
+                    self._send_json_response(400, {"error": "No file field found in upload payload."})
+                    return
+
+                started, message = dispatch_screener_sync_job(csv_bytes=csv_file_bytes)
+                code = 200 if started else 409
+                self._send_json_response(code, {"message": message})
+
+            except Exception as up_err:
+                logger.error(f"[UPLOAD ERROR] {up_err}", exc_info=True)
+                self._send_json_response(500, {"error": f"Failed processing uploaded CSV: {str(up_err)}"})
 
         elif path in ["/calc-param", "/api/calc-param"]:
             if update_all_parameters:

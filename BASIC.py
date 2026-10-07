@@ -1,8 +1,9 @@
 """
 ===============================================================================
-SCREENER BASE INGESTION (BASIC.py) - DIRECT PUBLIC LINK STREAMING
+SCREENER BASE INGESTION (BASIC.py) - DIRECT PUBLIC LINK & MULTIPART STREAMING
 ===============================================================================
-* Downloads screener.csv directly via Google Drive direct export link.
+* Downloads screener.csv directly via Google Drive direct export link OR reads
+  from an uploaded byte stream / local path.
 * Robust matching for ROCE ("roce-0") and 3-Year ROCE ("roce-3y").
 * Formats YYYYMM / float inputs into clean "Month, Year" labels under "Last Qtr".
 * Derives primary key 'CODE' (NSE > BSE > Name fallback).
@@ -189,13 +190,28 @@ def clean_numeric_col(series: pd.Series) -> pd.Series:
 # =====================================================================
 # 3. PIPELINE RUNNER
 # =====================================================================
-def run_pipeline():
-    file_id = extract_file_id(GDRIVE_SHARE_LINK)
-    if not file_id or "PASTE_YOUR" in file_id:
-        raise ValueError("Please provide a valid Google Drive file link in GDRIVE_SHARE_LINK.")
+def run_pipeline(csv_source=None):
+    """
+    Ingests screener data.
+    - If csv_source is provided (bytes or filepath), it loads the file directly.
+    - If csv_source is None, it downloads the file from GDRIVE_SHARE_LINK.
+    """
+    if csv_source is not None:
+        print("[INFO] Processing uploaded CSV file...")
+        if isinstance(csv_source, bytes):
+            df = pd.read_csv(io.BytesIO(csv_source))
+        elif isinstance(csv_source, str):
+            df = pd.read_csv(csv_source)
+        else:
+            df = pd.read_csv(csv_source)
+    else:
+        file_id = extract_file_id(GDRIVE_SHARE_LINK)
+        if not file_id or "PASTE_YOUR" in file_id:
+            raise ValueError("Please provide a valid Google Drive file link in GDRIVE_SHARE_LINK.")
 
-    print(f"[INFO] Downloading screener.csv directly via Google Drive link (ID: {file_id})...")
-    df = download_csv_from_drive(file_id)
+        print(f"[INFO] Downloading screener.csv directly via Google Drive link (ID: {file_id})...")
+        df = download_csv_from_drive(file_id)
+
     print(f"[OK] Successfully loaded CSV ({len(df)} rows).")
 
     # Clean whitespace, BOM, and non-breaking spaces
