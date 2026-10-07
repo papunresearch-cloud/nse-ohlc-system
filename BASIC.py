@@ -1,9 +1,8 @@
 """
 ===============================================================================
-SCREENER BASE INGESTION (BASIC.py) - DIRECT PUBLIC LINK & MULTIPART STREAMING
+SCREENER BASE INGESTION (BASIC.py) - DIRECT INGESTION ENGINE
 ===============================================================================
-* Downloads screener.csv directly via Google Drive direct export link OR reads
-  from an uploaded byte stream / local path.
+* Accepts raw CSV byte stream or file buffer directly from user upload.
 * Robust matching for ROCE ("roce-0") and 3-Year ROCE ("roce-3y").
 * Formats YYYYMM / float inputs into clean "Month, Year" labels under "Last Qtr".
 * Derives primary key 'CODE' (NSE > BSE > Name fallback).
@@ -19,7 +18,6 @@ import re
 import json
 from datetime import datetime
 import pytz
-import requests
 import numpy as np
 import pandas as pd
 
@@ -29,10 +27,6 @@ from firebase_admin import credentials, db
 # =====================================================================
 # 1. CONFIGURATION & CONSTANTS
 # =====================================================================
-# Right-click 'screener.csv' in Drive -> Share -> Copy link. Paste it here once.
-GDRIVE_SHARE_LINK = "https://drive.google.com/file/d/1MaNBVSt3e2w37Hs145U8bZOuqheggBvc/view?usp=sharing"
-
-# Firebase Realtime Database Config
 FIREBASE_TARGET_NODE = "SCREENER"
 FIREBASE_KEY_FILE = "serviceAccountKey.json"
 FIREBASE_DB_URL = "https://stock-dashboard-5c25c-default-rtdb.asia-southeast1.firebasedatabase.app"
@@ -99,30 +93,6 @@ column_mapping = {
 # =====================================================================
 # 2. HELPER FUNCTIONS
 # =====================================================================
-def extract_file_id(link_or_id: str) -> str:
-    link_or_id = link_or_id.strip()
-    match = re.search(r'[-\w]{25,}', link_or_id)
-    return match.group(0) if match else link_or_id
-
-def download_csv_from_drive(file_id: str) -> pd.DataFrame:
-    download_url = f"https://drive.google.com/uc?export=download&id={file_id}"
-    session = requests.Session()
-    session.headers.update({
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-    })
-    
-    response = session.get(download_url, stream=True)
-    for key, value in response.cookies.items():
-        if key.startswith('download_warning'):
-            confirm_url = f"{download_url}&confirm={value}"
-            response = session.get(confirm_url, stream=True)
-            break
-
-    if response.status_code != 200:
-        raise RuntimeError(f"Failed downloading file from Google Drive (HTTP {response.status_code}). Check file sharing permissions.")
-
-    return pd.read_csv(io.BytesIO(response.content))
-
 def init_firebase():
     if not firebase_admin._apps:
         if os.path.exists(FIREBASE_KEY_FILE):
@@ -192,25 +162,19 @@ def clean_numeric_col(series: pd.Series) -> pd.Series:
 # =====================================================================
 def run_pipeline(csv_source=None):
     """
-    Ingests screener data.
-    - If csv_source is provided (bytes or filepath), it loads the file directly.
-    - If csv_source is None, it downloads the file from GDRIVE_SHARE_LINK.
+    Ingests uploaded screener CSV into Firebase.
+    csv_source can be bytes, a file buffer, or a file path string.
     """
-    if csv_source is not None:
-        print("[INFO] Processing uploaded CSV file...")
-        if isinstance(csv_source, bytes):
-            df = pd.read_csv(io.BytesIO(csv_source))
-        elif isinstance(csv_source, str):
-            df = pd.read_csv(csv_source)
-        else:
-            df = pd.read_csv(csv_source)
-    else:
-        file_id = extract_file_id(GDRIVE_SHARE_LINK)
-        if not file_id or "PASTE_YOUR" in file_id:
-            raise ValueError("Please provide a valid Google Drive file link in GDRIVE_SHARE_LINK.")
+    if csv_source is None:
+        raise ValueError("[ERROR] No CSV source provided to run_pipeline. Uploaded file is required.")
 
-        print(f"[INFO] Downloading screener.csv directly via Google Drive link (ID: {file_id})...")
-        df = download_csv_from_drive(file_id)
+    print("[INFO] Processing uploaded screener CSV...")
+    if isinstance(csv_source, bytes):
+        df = pd.read_csv(io.BytesIO(csv_source))
+    elif isinstance(csv_source, str):
+        df = pd.read_csv(csv_source)
+    else:
+        df = pd.read_csv(csv_source)
 
     print(f"[OK] Successfully loaded CSV ({len(df)} rows).")
 
@@ -227,7 +191,7 @@ def run_pipeline(csv_source=None):
             actual_col = norm_csv_map[std_norm]
             rename_dict[actual_col] = target_key
 
-    # 2. Collision-free matching for ROCE and Result Date
+    # 2. Matching for ROCE and Result Date
     for col in df.columns:
         norm = re.sub(r'[^a-z0-9]', '', col.lower())
 
@@ -289,7 +253,7 @@ def run_pipeline(csv_source=None):
     ref = db.reference(FIREBASE_TARGET_NODE)
     ref.set(keyed_records)
 
-    # Update status telemetry timestamp while preserving 'Date of database data'
+    # Update status telemetry timestamp
     now_ist = datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S IST")
     db.reference("system_status/screener_sync").update({
         "last_updated": now_ist,
@@ -300,8 +264,7 @@ def run_pipeline(csv_source=None):
     print(f"[OK] Success! Uploaded {len(keyed_records)} keyed records to Firebase node: /{FIREBASE_TARGET_NODE}")
 
 if __name__ == "__main__":
-    try:
-        run_pipeline()
-    except Exception as e:
-        print(f"[ERROR] Execution failed: {e}")
-        raise
+    if os.path.exists("screener.csv"):
+        run_pipeline("screener.csv")
+    else:
+        print("[ERROR] Local 'screener.csv' not found for testing.")

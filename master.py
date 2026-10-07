@@ -12,7 +12,7 @@ MASTER ORCHESTRATOR (Primary Key Architecture: CODE)
   post-market settlement window, and per-stock quarantine protection.
 * Updates real-time Firebase /system_status telemetry on every cycle and heartbeat.
 * Dispatches background email/WhatsApp price boundary alerts during live market.
-* Supports both Drive sync (/sync-screener) and Local File Upload (/sync-screener-upload).
+* Direct local file multipart ingestion via POST /sync-screener-upload.
 ===============================================================================
 """
 
@@ -121,10 +121,6 @@ except ImportError:
     except ImportError:
         run_basic_pipeline = None
 
-# Fallback: assign if run_screener_pipeline is absent
-if not run_screener_pipeline:
-    run_screener_pipeline = run_basic_pipeline
-
 # 7. Alert Notification Dispatcher
 try:
     from alert_notifier import evaluate_market_alerts
@@ -181,10 +177,10 @@ class SystemStateBus:
 
 STATE_BUS = SystemStateBus()
 
-def dispatch_screener_sync_job(csv_bytes: bytes = None):
+def dispatch_screener_sync_job(csv_bytes: bytes):
     """Runs screener ETL in a background daemon thread with trace logging."""
-    if not run_screener_pipeline and not run_basic_pipeline:
-        logger.error("[SCREENER] Cannot run pipeline: ETL runner not loaded.")
+    if not run_basic_pipeline:
+        logger.error("[SCREENER] Cannot run pipeline: BASIC runner not loaded.")
         return False, "ETL runner module not available"
 
     if not _screener_lock.acquire(blocking=False):
@@ -193,22 +189,16 @@ def dispatch_screener_sync_job(csv_bytes: bytes = None):
 
     def worker():
         try:
-            if csv_bytes is not None:
-                logger.info("[SCREENER] Starting Local File Stream -> Firebase ETL Pipeline...")
-                if run_basic_pipeline:
-                    run_basic_pipeline(csv_source=csv_bytes)
-                else:
+            logger.info("[SCREENER] Starting uploaded CSV ETL Pipeline...")
+            run_basic_pipeline(csv_source=csv_bytes)
+            
+            # Run downstream scoring scripts if RUN_PIPELINE is loaded
+            if run_screener_pipeline:
+                try:
+                    logger.info("[SCREENER] Running downstream scoring pipeline...")
                     run_screener_pipeline()
-                
-                # Execute pipeline runner if RUN_PIPELINE is loaded
-                if run_screener_pipeline and run_screener_pipeline != run_basic_pipeline:
-                    try:
-                        run_screener_pipeline()
-                    except Exception as pipe_err:
-                        logger.warning(f"[SCREENER] Additional pipeline runner notice: {pipe_err}")
-            else:
-                logger.info("[SCREENER] Starting Google Drive -> Firebase ETL Pipeline...")
-                run_screener_pipeline()
+                except Exception as pipe_err:
+                    logger.warning(f"[SCREENER] Notice from downstream scoring pipeline: {pipe_err}")
 
             logger.info("[SCREENER] Pipeline successfully written to Firebase /SCREENER.")
         except Exception as ex:
@@ -266,11 +256,6 @@ class HealthAndControlHandler(BaseHTTPRequestHandler):
             STATE_BUS.trigger_pulse("SYNC")
             self._send_json_response(200, {"status": "ok", "message": "Historical sync pulse triggered"})
 
-        elif path in ["/sync-screener", "/run-pipeline", "/api/sync-screener"]:
-            started, msg = dispatch_screener_sync_job()
-            code = 200 if started else 409
-            self._send_json_response(code, {"message": msg})
-
         elif path in ["/start", "/api/start"]:
             STATE_BUS.trigger_pulse("START")
             self._send_json_response(200, {"message": "Master engine started"})
@@ -307,11 +292,6 @@ class HealthAndControlHandler(BaseHTTPRequestHandler):
         elif path in ["/sync", "/api/sync"]:
             STATE_BUS.trigger_pulse("SYNC")
             self._send_json_response(200, {"status": "ok", "message": "Historical sync pulse triggered"})
-
-        elif path in ["/sync-screener", "/run-pipeline", "/api/sync-screener"]:
-            started, msg = dispatch_screener_sync_job(csv_bytes=None)
-            code = 200 if started else 409
-            self._send_json_response(code, {"message": msg})
 
         elif path in ["/sync-screener-upload", "/api/sync-screener-upload"]:
             try:
@@ -491,7 +471,7 @@ class MasterOrchestrator:
             except Exception as e:
                 logger.error(f"[DELETE EVENT] Error purging data for {safe_code}: {e}")
 
-            # 2. Admin purge across /display_list/stocks (handles array and map structures)
+            # 2. Admin purge across /display_list/stocks
             try:
                 display_ref = db.reference("display_list/stocks")
                 current_display = display_ref.get()
