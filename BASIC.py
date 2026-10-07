@@ -267,4 +267,4 @@ if __name__ == "__main__":
     if os.path.exists("screener.csv"):
         run_pipeline("screener.csv")
     else:
-        print("[ERROR] Local 'screener.csv' not found for testing.")
+        print("[INFO] Standalone execution finished. Awaiting file upload via /sync-screener-upload.")
