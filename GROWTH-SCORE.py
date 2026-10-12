@@ -190,4 +190,3 @@ if __name__ == "__main__":
         update_growth_scores()
     except Exception as e:
         print(f"[ERROR] An unexpected error occurred: {e}")
-```[cite: 1]
