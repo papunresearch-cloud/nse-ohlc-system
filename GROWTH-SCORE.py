@@ -153,16 +153,20 @@ def update_growth_scores():
                 g_norm = ((fv - fv_min) / (fv_max - fv_min)) * 100.0
                 df.loc[eligible_mask, 'G-score'] = g_norm.round(2)
 
-    # Convert G-score to numeric, coercing any non-numeric values to NaN, then fill all NaNs/blanks with 101
+    # Convert G-score to numeric, fill NaNs/blanks with 101
     df['G-score'] = pd.to_numeric(df['G-score'], errors='coerce').fillna(101.0)
+    
+    # Clean rounding for sgc and pgc
+    df['sgc'] = df['sgc'].round(2)
+    df['pgc'] = df['pgc'].round(2)
 
     scored_count = (df['G-score'] != 101.0).sum()
     print(f"[INFO] G-score computed for {scored_count} stocks.")
 
-    # 9. Clean up all temporary columns
+    # 9. Clean up temporary columns (sgc and pgc retained)
     calc_cols = [
         'G1_eligible', 'G2_eligible', 'sgeq_eligible', 'eligible',
-        'sg', 'pg', 'sgc', 'pgc', 'group', 'sugeno_S', 'G_score_calc'
+        'sg', 'pg', 'group', 'sugeno_S', 'G_score_calc'
     ] + [f"{c}_val" for c in required_cols] + [f"{c}_valid" for c in required_cols]
     calc_cols += ['_pg_c', '_sg_c', '_m', '_n', 'pg-c', 'sg-c']
     
@@ -177,12 +181,13 @@ def update_growth_scores():
     else:
         payload = cleaned_df.to_dict(orient="index")
 
-    print(f"[INFO] Writing records with updated 'G-score' to Firebase node '/{FIREBASE_TARGET_NODE}'...")
+    print(f"[INFO] Writing records with updated 'G-score', 'sgc', and 'pgc' to Firebase node '/{FIREBASE_TARGET_NODE}'...")
     ref.set(payload)
-    print(f"[OK] Success! Single column 'G-score' updated in Firebase.")
+    print(f"[OK] Success! Columns 'G-score', 'sgc', and 'pgc' updated in Firebase.")
 
 if __name__ == "__main__":
     try:
         update_growth_scores()
     except Exception as e:
         print(f"[ERROR] An unexpected error occurred: {e}")
+```[cite: 1]

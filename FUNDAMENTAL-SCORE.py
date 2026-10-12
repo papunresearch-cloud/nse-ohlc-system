@@ -65,7 +65,7 @@ def evaluate_stock_row(row):
     - Cascades G1-only, G1+G2, or G1+G2+G3 based on group validity.
     - Clamps derived ROE-c and ROA-c into [-25, 50].
     - Computes logistic K and blended Fv.
-    Returns: (status: 'OK' | 'DISQUALIFIED', fv_value: float)
+    Returns: (status: 'OK' | 'DISQUALIFIED', fv_value: float, roe_c: float, roa_c: float)
     """
     # Group 1: Latest Year
     g1_roe_ok, r0 = validate_value(row.get("roe-0"))
@@ -74,7 +74,7 @@ def evaluate_stock_row(row):
 
     # Rule: If G1 is rejected, do not calculate score for the row
     if not g1_valid:
-        return "DISQUALIFIED", SENTINEL_DISQUALIFIED
+        return "DISQUALIFIED", SENTINEL_DISQUALIFIED, np.nan, np.nan
 
     # Group 2: Preceding Year
     g2_roe_ok, r1 = validate_value(row.get("roe-1"))
@@ -106,15 +106,14 @@ def evaluate_stock_row(row):
 
     # K calculation: K = L / ((1 + exp(-B * (ROA-c - T0))) ^ P)
     exponent = -B_PARAM * (roa_c - T0_PARAM)
-    # Numerical safeguard for large exp inputs
     clipped_exp = max(-500.0, min(500.0, exponent))
-    exp_term = math.exp(clipped_exp)
-    k = L_PARAM / (1.0 + exp_term ** P_PARAM)
+    denom_base = 1.0 + math.exp(clipped_exp)
+    k = L_PARAM / (denom_base ** P_PARAM)
 
     # Fundamental value: Fv = (ROA-c + K * ROE-c) / (1 + K)
     fv = (roa_c + (k * roe_c)) / (1.0 + k)
 
-    return "OK", fv
+    return "OK", fv, roe_c, roa_c
 
 
 # =====================================================================
@@ -147,9 +146,13 @@ def run_fundamental_scoring():
 
     statuses = [res[0] for res in eval_results]
     fv_values = [res[1] for res in eval_results]
+    roe_c_values = [res[2] for res in eval_results]
+    roa_c_values = [res[3] for res in eval_results]
 
     df["_eval_status"] = statuses
     df["_fv"] = fv_values
+    df["roe-c"] = pd.to_numeric(roe_c_values, errors="coerce").round(2)
+    df["roa-c"] = pd.to_numeric(roa_c_values, errors="coerce").round(2)
 
     valid_mask = df["_eval_status"] == "OK"
     disqualified_mask = df["_eval_status"] == "DISQUALIFIED"
@@ -169,7 +172,6 @@ def run_fundamental_scoring():
         print(f"[INFO] Cross-sectional bounds: Fv_min = {fv_min:.4f}, Fv_max = {fv_max:.4f}")
 
         if math.isclose(fv_min, fv_max):
-            # Degenerate case fallback
             df.loc[valid_mask, OUTPUT_COLUMN] = 50.0
         else:
             normalized_scores = ((valid_fv - fv_min) / (fv_max - fv_min)) * 100.0
@@ -179,8 +181,8 @@ def run_fundamental_scoring():
     disqualified_count = disqualified_mask.sum()
     print(f"[INFO] Scoring finished: {valid_count} scored stocks, {disqualified_count} disqualified stocks (assigned 101).")
 
-    # Clean intermediate calculation columns
-    df.drop(columns=["_eval_status", "_fv", "roe-c", "roa-c"], inplace=True, errors="ignore")
+    # Clean intermediate columns ONLY (roe-c and roa-c are preserved)
+    df.drop(columns=["_eval_status", "_fv"], inplace=True, errors="ignore")
 
     # Sanitize NaN/inf values for JSON serialization
     cleaned_df = df.replace([np.inf, -np.inf], np.nan)
@@ -192,9 +194,9 @@ def run_fundamental_scoring():
     else:
         payload = cleaned_df.to_dict(orient="index")
 
-    print(f"[INFO] Writing records with '{OUTPUT_COLUMN}' back to Firebase node '/{FIREBASE_TARGET_NODE}'...")
+    print(f"[INFO] Writing records with '{OUTPUT_COLUMN}', 'roe-c', and 'roa-c' back to Firebase node '/{FIREBASE_TARGET_NODE}'...")
     ref.set(payload)
-    print(f"[OK] Success! Single column '{OUTPUT_COLUMN}' updated in Firebase.")
+    print(f"[OK] Success! Columns '{OUTPUT_COLUMN}', 'roe-c', and 'roa-c' updated in Firebase.")
 
 
 if __name__ == "__main__":
