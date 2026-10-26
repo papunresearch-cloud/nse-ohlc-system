@@ -1,16 +1,14 @@
 """
 ===============================================================================
-SCREENER AUTOMATED DOWNLOAD & ETL SYNC WORKER (DYNAMIC MARKUP SCANNER)
+SCREENER AUTOMATED DOWNLOAD & ETL SYNC WORKER (WEBSHARE PROXY ENABLED)
 ===============================================================================
 Automates:
-1. Authenticates via Webshare Proxy with credentials / session cookie.
-2. Dynamically scans https://www.screener.in/screens/3271948/ to detect:
-   - Dynamic form actions (<form action="...export...">)
-   - Export download links (<a href="...export...">)
-   - Form-embedded CSRF tokens
-3. Validates content (ensures genuine CSV, prevents HTML error saves).
-4. Feeds screener.csv to Screener ETL pipeline (BASIC.py / RUN_PIPELINE.py).
-5. Updates health telemetry to Firebase and safely deletes temporary files.
+1. Authenticates via Webshare proxy with Screener credentials / session cookie.
+2. Loads https://www.screener.in/screens/3271948/screener/ to obtain fresh CSRF.
+3. Posts to /api/export/screen/3271948/ with matching CSRF and Referer headers.
+4. Validates downloaded CSV content (rejects HTML fallbacks).
+5. Runs Screener ETL pipeline (BASIC.py / RUN_PIPELINE.py).
+6. Updates Firebase telemetry under /system_status/screener_sync and cleans up.
 ===============================================================================
 """
 
@@ -28,9 +26,7 @@ from config import TIMEZONE, logger
 
 IST = pytz.timezone(TIMEZONE)
 
-# =====================================================================
-# CONFIGURATION & CREDENTIALS
-# =====================================================================
+# Clean proxy string and credentials
 RAW_PROXY = os.environ.get("PROXY_URL", "").strip().strip('"').strip("'")
 PROXY_URL = RAW_PROXY if RAW_PROXY.startswith(("http://", "https://", "socks5://")) else f"http://{RAW_PROXY}" if RAW_PROXY else ""
 
@@ -39,7 +35,9 @@ SCREENER_USERNAME = os.environ.get("SCREENER_USERNAME", "").strip()
 SCREENER_PASSWORD = os.environ.get("SCREENER_PASSWORD", "").strip()
 
 SCREENER_LOGIN_URL = "https://www.screener.in/login/"
-SCREENER_PAGE_URL = "https://www.screener.in/screens/3271948/"
+# NOTE: The slug '/screener/' is required by Screener.in to prevent HTTP 404
+SCREENER_PAGE_URL = "https://www.screener.in/screens/3271948/screener/"
+SCREENER_EXPORT_API_URL = "https://www.screener.in/api/export/screen/3271948/"
 
 TEMP_DOWNLOAD_DIR = Path.cwd() / "temp_screener_download"
 OUTPUT_CSV_FILE = TEMP_DOWNLOAD_DIR / "screener.csv"
@@ -58,7 +56,7 @@ except ImportError:
 
 
 def download_screener_csv() -> Path:
-    """Authenticates and dynamically inspects the screen DOM to export CSV."""
+    """Authenticates and downloads screener.csv through proxy."""
     if not PROXY_URL:
         raise ValueError("PROXY_URL is missing. Please set PROXY_URL in Render Environment Variables.")
 
@@ -79,11 +77,9 @@ def download_screener_csv() -> Path:
         "Accept-Language": "en-US,en;q=0.9",
     })
 
-    # -------------------------------------------------------------
-    # Step 1: Authentication (Session Cookie or Form Login)
-    # -------------------------------------------------------------
+    # Step 1: Authentication
     if SCREENER_SESSION_ID:
-        logger.info("[AUTO-SYNC] Using SCREENER_SESSION_ID for direct authenticated session...")
+        logger.info("[AUTO-SYNC] Using SCREENER_SESSION_ID for authentication...")
         session.cookies.set("sessionid", SCREENER_SESSION_ID, domain=".screener.in")
     else:
         if not SCREENER_USERNAME or not SCREENER_PASSWORD:
@@ -122,17 +118,15 @@ def download_screener_csv() -> Path:
 
         logger.info("[AUTO-SYNC] Screener authentication successful.")
 
-    # -------------------------------------------------------------
-    # Step 2: Dynamically Scan Screen HTML Page
-    # -------------------------------------------------------------
-    logger.info(f"[AUTO-SYNC] Scanning screen page HTML at {SCREENER_PAGE_URL}...")
+    # Step 2: Access the screen page (with '/screener/' slug) to get screen CSRF token
+    logger.info(f"[AUTO-SYNC] Accessing screen page: {SCREENER_PAGE_URL}...")
     page_resp = session.get(SCREENER_PAGE_URL, timeout=30)
     if page_resp.status_code != 200:
         raise RuntimeError(f"Failed to access screen page: HTTP {page_resp.status_code}")
 
     html = page_resp.text
 
-    # Extract CSRF token from page DOM if present
+    # Extract CSRF token from page HTML or session cookies
     page_csrf = ""
     csrf_match = re.search(r'name=["\']csrfmiddlewaretoken["\']\s+value=["\']([^"\']+)["\']', html)
     if csrf_match:
@@ -140,61 +134,40 @@ def download_screener_csv() -> Path:
     else:
         page_csrf = session.cookies.get("csrftoken", "")
 
-    # -------------------------------------------------------------
-    # Step 3: Parse Markup to Detect the Export Trigger
-    # -------------------------------------------------------------
-    # Case A: <form action="...export..." method="post">
-    export_form_match = re.search(r'<form[^>]+action=["\']([^"\']*export[^"\']*)["\']', html, re.IGNORECASE)
-    # Case B: <a href="...export...">
-    export_link_match = re.search(r'<a[^>]+href=["\']([^"\']*export[^"\']*)["\']', html, re.IGNORECASE)
-
-    export_url = None
-    is_post = True
-
-    if export_form_match:
-        action = export_form_match.group(1)
+    # Look for the export action form URL inside the page markup
+    export_action_match = re.search(r'<form[^>]+action=["\']([^"\']*export[^"\']*)["\']', html, re.IGNORECASE)
+    if export_action_match:
+        action = export_action_match.group(1)
         export_url = action if action.startswith("http") else f"https://www.screener.in{action}"
-        is_post = True
-        logger.info(f"[AUTO-SYNC] Discovered dynamic export form action: {export_url}")
-    elif export_link_match:
-        link = export_link_match.group(1)
-        export_url = link if link.startswith("http") else f"https://www.screener.in{link}"
-        is_post = False
-        logger.info(f"[AUTO-SYNC] Discovered dynamic export download link: {export_url}")
     else:
-        # Fallback to standard API route if dynamic pattern not matched
-        export_url = "https://www.screener.in/api/export/screen/3271948/"
-        is_post = True
-        logger.warning(f"[AUTO-SYNC] Markup scan did not find export tag. Falling back to default: {export_url}")
+        export_url = SCREENER_EXPORT_API_URL
 
+    logger.info(f"[AUTO-SYNC] Export target endpoint: {export_url}")
+
+    # Step 3: Trigger export POST request
     export_headers = {
         "Referer": SCREENER_PAGE_URL,
         "Origin": "https://www.screener.in"
     }
+    export_payload = {"csrfmiddlewaretoken": page_csrf} if page_csrf else {}
 
-    # -------------------------------------------------------------
-    # Step 4: Execute Download
-    # -------------------------------------------------------------
-    if is_post:
-        export_resp = session.post(
-            export_url,
-            data={"csrfmiddlewaretoken": page_csrf} if page_csrf else {},
-            headers=export_headers,
-            timeout=60
-        )
-    else:
-        export_resp = session.get(export_url, headers=export_headers, timeout=60)
+    export_resp = session.post(
+        export_url,
+        data=export_payload,
+        headers=export_headers,
+        timeout=60
+    )
 
-    # -------------------------------------------------------------
-    # Step 5: Content Verification Guard
-    # -------------------------------------------------------------
-    # Check that response is valid CSV content and not HTML markup
+    # Step 4: Validate content (Must be CSV, not HTML error page)
     content_head = export_resp.content[:200].decode("utf-8", errors="ignore").strip().lower()
-    if content_head.startswith("<!doctype html") or "<html" in content_head or "<body" in content_head:
+    if content_head.startswith("<!doctype html") or "<html" in content_head:
         raise ValueError(
-            "Screener returned HTML webpage instead of CSV. "
-            "The detected export action requires elevated permissions or returned a redirect."
+            f"Export request returned an HTML page instead of CSV (HTTP {export_resp.status_code}). "
+            "Please verify that this Screener account has permission to export this screen."
         )
+
+    if export_resp.status_code != 200:
+        raise RuntimeError(f"Export download failed with HTTP {export_resp.status_code}")
 
     with open(OUTPUT_CSV_FILE, "wb") as f:
         f.write(export_resp.content)
