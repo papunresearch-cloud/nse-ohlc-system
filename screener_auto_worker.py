@@ -1,13 +1,16 @@
 """
 ===============================================================================
-SCREENER AUTOMATED DOWNLOAD & ETL SYNC WORKER (DYNAMIC EXPORT DETECTOR)
+SCREENER AUTOMATED DOWNLOAD & ETL SYNC WORKER (DYNAMIC MARKUP SCANNER)
 ===============================================================================
 Automates:
-1. Authenticated session via Webshare Proxy.
-2. Dynamically scans the screen HTML for the exact Export button / form action.
-3. Verifies that the downloaded content is genuine CSV data (not HTML).
-4. Runs Screener ETL pipeline (BASIC.py / RUN_PIPELINE.py).
-5. Updates Firebase health status and cleans up local storage.
+1. Authenticates via Webshare Proxy with credentials / session cookie.
+2. Dynamically scans https://www.screener.in/screens/3271948/ to detect:
+   - Dynamic form actions (<form action="...export...">)
+   - Export download links (<a href="...export...">)
+   - Form-embedded CSRF tokens
+3. Validates content (ensures genuine CSV, prevents HTML error saves).
+4. Feeds screener.csv to Screener ETL pipeline (BASIC.py / RUN_PIPELINE.py).
+5. Updates health telemetry to Firebase and safely deletes temporary files.
 ===============================================================================
 """
 
@@ -55,7 +58,7 @@ except ImportError:
 
 
 def download_screener_csv() -> Path:
-    """Authenticates and dynamically locates the CSV export link from the screen page."""
+    """Authenticates and dynamically inspects the screen DOM to export CSV."""
     if not PROXY_URL:
         raise ValueError("PROXY_URL is missing. Please set PROXY_URL in Render Environment Variables.")
 
@@ -76,12 +79,17 @@ def download_screener_csv() -> Path:
         "Accept-Language": "en-US,en;q=0.9",
     })
 
-    # Step 1: Establish Authentication
+    # -------------------------------------------------------------
+    # Step 1: Authentication (Session Cookie or Form Login)
+    # -------------------------------------------------------------
     if SCREENER_SESSION_ID:
-        logger.info("[AUTO-SYNC] Using SCREENER_SESSION_ID for authentication...")
+        logger.info("[AUTO-SYNC] Using SCREENER_SESSION_ID for direct authenticated session...")
         session.cookies.set("sessionid", SCREENER_SESSION_ID, domain=".screener.in")
     else:
-        logger.info("[AUTO-SYNC] Authenticating via login form through proxy...")
+        if not SCREENER_USERNAME or not SCREENER_PASSWORD:
+            raise ValueError("Configure SCREENER_SESSION_ID or SCREENER_USERNAME & SCREENER_PASSWORD in Render.")
+
+        logger.info("[AUTO-SYNC] Connecting to Screener login page via proxy...")
         login_page = session.get(SCREENER_LOGIN_URL, timeout=30)
         csrf_token = session.cookies.get("csrftoken") or ""
         if not csrf_token:
@@ -89,79 +97,103 @@ def download_screener_csv() -> Path:
             if match:
                 csrf_token = match.group(1)
 
+        logger.info("[AUTO-SYNC] Authenticating credentials via proxy...")
         login_payload = {
             "username": SCREENER_USERNAME,
             "password": SCREENER_PASSWORD,
             "csrfmiddlewaretoken": csrf_token,
             "next": ""
         }
+        login_headers = {
+            "Referer": SCREENER_LOGIN_URL,
+            "Origin": "https://www.screener.in"
+        }
+
         login_resp = session.post(
             SCREENER_LOGIN_URL,
             data=login_payload,
-            headers={"Referer": SCREENER_LOGIN_URL, "Origin": "https://www.screener.in"},
+            headers=login_headers,
             timeout=30,
             allow_redirects=True
         )
 
         if "sessionid" not in session.cookies:
-            raise RuntimeError("Authentication failed on Screener.in. Check username/password.")
+            raise RuntimeError("Authentication failed on Screener.in. Please check credentials.")
 
-    logger.info("[AUTO-SYNC] Screener authentication established.")
+        logger.info("[AUTO-SYNC] Screener authentication successful.")
 
-    # Step 2: Fetch the Screen Page HTML to extract the exact Export Form/Action
-    logger.info(f"[AUTO-SYNC] Scanning screen page: {SCREENER_PAGE_URL}...")
+    # -------------------------------------------------------------
+    # Step 2: Dynamically Scan Screen HTML Page
+    # -------------------------------------------------------------
+    logger.info(f"[AUTO-SYNC] Scanning screen page HTML at {SCREENER_PAGE_URL}...")
     page_resp = session.get(SCREENER_PAGE_URL, timeout=30)
     if page_resp.status_code != 200:
-        raise RuntimeError(f"Failed to access screen page (HTTP {page_resp.status_code})")
+        raise RuntimeError(f"Failed to access screen page: HTTP {page_resp.status_code}")
 
     html = page_resp.text
-    csrf_token = session.cookies.get("csrftoken", "")
 
-    # Step 3: Discover export endpoints from HTML
-    # Look for: <form action="...export..." or <a href="...export..."
-    export_action_match = re.search(r'<form[^>]+action=["\']([^"\']*export[^"\']*)["\']', html, re.IGNORECASE)
+    # Extract CSRF token from page DOM if present
+    page_csrf = ""
+    csrf_match = re.search(r'name=["\']csrfmiddlewaretoken["\']\s+value=["\']([^"\']+)["\']', html)
+    if csrf_match:
+        page_csrf = csrf_match.group(1)
+    else:
+        page_csrf = session.cookies.get("csrftoken", "")
+
+    # -------------------------------------------------------------
+    # Step 3: Parse Markup to Detect the Export Trigger
+    # -------------------------------------------------------------
+    # Case A: <form action="...export..." method="post">
+    export_form_match = re.search(r'<form[^>]+action=["\']([^"\']*export[^"\']*)["\']', html, re.IGNORECASE)
+    # Case B: <a href="...export...">
     export_link_match = re.search(r'<a[^>]+href=["\']([^"\']*export[^"\']*)["\']', html, re.IGNORECASE)
 
     export_url = None
     is_post = True
 
-    if export_action_match:
-        action = export_action_match.group(1)
+    if export_form_match:
+        action = export_form_match.group(1)
         export_url = action if action.startswith("http") else f"https://www.screener.in{action}"
         is_post = True
-        logger.info(f"[AUTO-SYNC] Detected dynamic export form action: {export_url}")
+        logger.info(f"[AUTO-SYNC] Discovered dynamic export form action: {export_url}")
     elif export_link_match:
         link = export_link_match.group(1)
         export_url = link if link.startswith("http") else f"https://www.screener.in{link}"
         is_post = False
-        logger.info(f"[AUTO-SYNC] Detected export URL link: {export_url}")
+        logger.info(f"[AUTO-SYNC] Discovered dynamic export download link: {export_url}")
     else:
-        # Fallback to standard export route
+        # Fallback to standard API route if dynamic pattern not matched
         export_url = "https://www.screener.in/api/export/screen/3271948/"
-        logger.warning(f"[AUTO-SYNC] Dynamic export element not found in HTML. Using default endpoint: {export_url}")
+        is_post = True
+        logger.warning(f"[AUTO-SYNC] Markup scan did not find export tag. Falling back to default: {export_url}")
 
     export_headers = {
         "Referer": SCREENER_PAGE_URL,
         "Origin": "https://www.screener.in"
     }
 
-    # Step 4: Execute download request
+    # -------------------------------------------------------------
+    # Step 4: Execute Download
+    # -------------------------------------------------------------
     if is_post:
         export_resp = session.post(
             export_url,
-            data={"csrfmiddlewaretoken": csrf_token} if csrf_token else {},
+            data={"csrfmiddlewaretoken": page_csrf} if page_csrf else {},
             headers=export_headers,
             timeout=60
         )
     else:
         export_resp = session.get(export_url, headers=export_headers, timeout=60)
 
-    # Step 5: Validate file content (Ensure it is a valid CSV, not an HTML error page)
-    content_preview = export_resp.content[:150].decode("utf-8", errors="ignore").strip().lower()
-    if content_preview.startswith("<!doctype html") or "<html" in content_preview:
+    # -------------------------------------------------------------
+    # Step 5: Content Verification Guard
+    # -------------------------------------------------------------
+    # Check that response is valid CSV content and not HTML markup
+    content_head = export_resp.content[:200].decode("utf-8", errors="ignore").strip().lower()
+    if content_head.startswith("<!doctype html") or "<html" in content_head or "<body" in content_head:
         raise ValueError(
-            "Screener returned an HTML webpage instead of a CSV file. "
-            "This usually means the screen has no export permission on this account or the endpoint requires a premium tier."
+            "Screener returned HTML webpage instead of CSV. "
+            "The detected export action requires elevated permissions or returned a redirect."
         )
 
     with open(OUTPUT_CSV_FILE, "wb") as f:
@@ -171,16 +203,16 @@ def download_screener_csv() -> Path:
         raise FileNotFoundError("Downloaded screener.csv is empty or missing.")
 
     logger.info(
-        f"[AUTO-SYNC] Valid CSV successfully downloaded: {OUTPUT_CSV_FILE} "
+        f"[AUTO-SYNC] Screener CSV downloaded successfully: {OUTPUT_CSV_FILE} "
         f"({OUTPUT_CSV_FILE.stat().st_size} bytes)"
     )
     return OUTPUT_CSV_FILE
 
 
 def execute_auto_screener_sync(database_date: str = None):
-    """Coordinates download, ETL scoring pipeline, and telemetry updates."""
+    """Coordinates download, ETL pipeline execution, health update, and cleanup."""
     if not run_screener_pipeline:
-        raise RuntimeError("Screener ETL pipeline runner is missing (RUN_PIPELINE.py / BASIC.py).")
+        raise RuntimeError("Screener ETL pipeline runner is missing (RUN_PIPELINE.py or BASIC.py).")
 
     now_ist = datetime.now(IST)
     effective_date = database_date or now_ist.strftime("%Y-%m-%d")
@@ -192,7 +224,7 @@ def execute_auto_screener_sync(database_date: str = None):
         # Step 1: Download validated CSV
         downloaded_file = download_screener_csv()
 
-        # Step 2: Position file for BASIC.py
+        # Step 2: Copy to root cwd for BASIC.py
         shutil.copyfile(downloaded_file, root_screener)
 
         # Step 3: Run existing Screener ETL pipeline
@@ -200,7 +232,7 @@ def execute_auto_screener_sync(database_date: str = None):
         run_screener_pipeline()
         logger.info("[AUTO-SYNC] Pipeline stages finished successfully.")
 
-        # Step 4: Update health telemetry
+        # Step 4: Update health telemetry -> Last Screener DB
         now_ist_str = now_ist.strftime("%Y-%m-%d %H:%M:%S IST")
         db.reference("system_status/screener_sync").update({
             "Date of database data": effective_date,
@@ -223,7 +255,7 @@ def execute_auto_screener_sync(database_date: str = None):
         raise e
 
     finally:
-        # Step 5: Clean up temporary files
+        # Step 5: Clean up temporary screener.csv files from storage
         logger.info("[AUTO-SYNC] Cleaning up temporary storage...")
         try:
             if downloaded_file and downloaded_file.exists():
