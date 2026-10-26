@@ -1,12 +1,13 @@
 """
 ===============================================================================
-SCREENER AUTOMATED DOWNLOAD & ETL SYNC WORKER (SOLUTION B: PROXIED HTTP)
+SCREENER AUTOMATED DOWNLOAD & ETL SYNC WORKER (WEBSHARE PROXY ENABLED)
 ===============================================================================
 Automates:
 1. Proxied login & CSV export from screener.in via requests.Session.
-2. Feeds screener.csv to Screener ETL pipeline (RUN_PIPELINE.py / BASIC.py).
-3. Updates Firebase health telemetry under /system_status/screener_sync.
-4. Clean deletion of temporary files from local storage.
+2. Copies screener.csv to root directory for BASIC.py ingestion.
+3. Runs the Screener ETL pipeline (RUN_PIPELINE.py / BASIC.py).
+4. Updates health telemetry to /system_status/screener_sync ("Last Screener DB").
+5. Deletes temporary files from local storage upon completion.
 ===============================================================================
 """
 
@@ -24,10 +25,15 @@ from config import TIMEZONE, logger
 
 IST = pytz.timezone(TIMEZONE)
 
-# Screener Credentials & Proxy Configuration
-SCREENER_USERNAME = os.environ.get("SCREENER_USERNAME", "")
-SCREENER_PASSWORD = os.environ.get("SCREENER_PASSWORD", "")
-PROXY_URL = os.environ.get("PROXY_URL", "").strip()
+# =====================================================================
+# CONFIGURATION & ENVIRONMENT VARIABLES
+# =====================================================================
+SCREENER_USERNAME = os.environ.get("SCREENER_USERNAME", "").strip()
+SCREENER_PASSWORD = os.environ.get("SCREENER_PASSWORD", "").strip()
+
+# Clean proxy string in case quotes or whitespace were pasted
+RAW_PROXY = os.environ.get("PROXY_URL", "").strip().strip('"').strip("'")
+PROXY_URL = RAW_PROXY if RAW_PROXY.startswith(("http://", "https://", "socks5://")) else f"http://{RAW_PROXY}" if RAW_PROXY else ""
 
 SCREENER_LOGIN_URL = "https://www.screener.in/login/"
 SCREENER_PAGE_URL = "https://www.screener.in/screens/3271948/screener/"
@@ -50,7 +56,7 @@ except ImportError:
 
 
 def download_screener_csv() -> Path:
-    """Authenticates and downloads screener.csv through the configured proxy."""
+    """Authenticates and downloads screener.csv through the Webshare proxy."""
     if not PROXY_URL:
         raise ValueError("PROXY_URL is missing. Please set PROXY_URL in Render Environment Variables.")
     if not SCREENER_USERNAME or not SCREENER_PASSWORD:
@@ -73,8 +79,12 @@ def download_screener_csv() -> Path:
     })
 
     # Step 1: GET login page to obtain initial CSRF token cookie
-    logger.info("[AUTO-SYNC] Fetching login page via proxy...")
+    logger.info("[AUTO-SYNC] Connecting to Screener login page via proxy...")
     login_page = session.get(SCREENER_LOGIN_URL, timeout=30)
+    
+    if login_page.status_code != 200:
+        raise RuntimeError(f"Could not open login page via proxy (HTTP {login_page.status_code}).")
+
     csrf_token = session.cookies.get("csrftoken") or ""
     if not csrf_token:
         match = re.search(r'name=["\']csrfmiddlewaretoken["\']\s+value=["\']([^"\']+)["\']', login_page.text)
@@ -82,7 +92,7 @@ def download_screener_csv() -> Path:
             csrf_token = match.group(1)
 
     # Step 2: POST credentials to authenticate session
-    logger.info("[AUTO-SYNC] Submitting login credentials via proxy...")
+    logger.info("[AUTO-SYNC] Authenticating credentials via proxy...")
     login_payload = {
         "username": SCREENER_USERNAME,
         "password": SCREENER_PASSWORD,
@@ -102,8 +112,8 @@ def download_screener_csv() -> Path:
 
     if "sessionid" not in session.cookies:
         raise RuntimeError(
-            "Failed to authenticate with Screener.in. "
-            "Verify username/password or check if a CAPTCHA was triggered."
+            "Authentication failed on Screener.in. "
+            "Please check SCREENER_USERNAME and SCREENER_PASSWORD in Render Environment."
         )
 
     logger.info("[AUTO-SYNC] Screener authentication successful.")
@@ -122,7 +132,7 @@ def download_screener_csv() -> Path:
         timeout=60
     )
 
-    # Fallback to direct GET export URL if POST returned non-200
+    # Fallback to GET export URL if POST returned non-200
     if export_resp.status_code != 200:
         logger.info("[AUTO-SYNC] POST returned non-200. Attempting direct GET export fallback...")
         fallback_url = "https://www.screener.in/screens/3271948/export/"
@@ -159,7 +169,7 @@ def execute_auto_screener_sync(database_date: str = None):
     root_screener = Path.cwd() / "screener.csv"
 
     try:
-        # Step 1: Direct download screener.csv via proxy
+        # Step 1: Download screener.csv via proxy
         downloaded_file = download_screener_csv()
 
         # Step 2: Copy to root cwd for BASIC.py
