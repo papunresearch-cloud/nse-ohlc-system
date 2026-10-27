@@ -1,6 +1,6 @@
 """
 MASTER ORCHESTRATOR
-- Embedded HTTP server on port 10000 (/health, /start, /stop, /sync, /sync-screener, /auto-sync-screener).
+- Embedded HTTP server on port 10000 (/health, /start, /stop, /sync, /auto-sync-screener, /sync-screener-upload).
 - Real-time command bus listener via Firebase /system_commands/stock_event.
 - Immediate targeted OHLC initialization (historical + live 0) and /param calculation for additions.
 - Admin-level targeted database purge (/stocks, /param, and /display_list/stocks) on deletion.
@@ -14,6 +14,8 @@ import time
 import signal
 import threading
 import json
+import shutil
+from pathlib import Path
 from urllib.parse import urlparse
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from datetime import datetime, date
@@ -61,13 +63,13 @@ except ImportError:
 
 # Screener Pipeline ETL runner
 try:
-    from basic import run_pipeline as run_screener_pipeline
+    from RUN_PIPELINE import main as run_screener_pipeline
 except ImportError:
     try:
-        from BASIC import run_pipeline as run_screener_pipeline
+        from basic import run_pipeline as run_screener_pipeline
     except ImportError:
         try:
-            from RUN_PIPELINE import main as run_screener_pipeline
+            from BASIC import run_pipeline as run_screener_pipeline
         except ImportError:
             run_screener_pipeline = None
             logger.warning("[WARNING] Screener ETL script not found. Pipeline sync will be unavailable.")
@@ -125,31 +127,8 @@ STATE_BUS = SystemStateBus()
 # =====================================================================
 # BACKGROUND ASYNC WORKERS
 # =====================================================================
-def dispatch_screener_sync_job():
-    """Runs screener ETL run_pipeline inside a thread-safe daemon worker."""
-    if not run_screener_pipeline:
-        logger.error("[SCREENER] Cannot run pipeline: ETL runner not loaded.")
-        return
-
-    if not _screener_lock.acquire(blocking=False):
-        logger.warning("[SCREENER] Pipeline sync is already in progress.")
-        return
-
-    def worker():
-        try:
-            logger.info("[SCREENER] Starting Google Drive -> Firebase ETL Pipeline...")
-            run_screener_pipeline()
-            logger.info("[SCREENER] Pipeline successfully completed.")
-        except Exception as e:
-            logger.error(f"[SCREENER] Pipeline error: {e}", exc_info=True)
-        finally:
-            _screener_lock.release()
-
-    threading.Thread(target=worker, daemon=True).start()
-
-
 def dispatch_auto_screener_sync_job(database_date: str = None):
-    """Runs automated Playwright download + ETL pipeline in a background thread."""
+    """Runs automated proxy download + ETL pipeline in a background thread."""
     if not execute_auto_screener_sync:
         logger.error("[AUTO-SYNC] Cannot run auto sync: screener_auto_worker is not loaded.")
         return
@@ -160,12 +139,71 @@ def dispatch_auto_screener_sync_job(database_date: str = None):
 
     def worker():
         try:
-            logger.info("[AUTO-SYNC] Commencing automated Playwright export and sync...")
+            logger.info("[AUTO-SYNC] Commencing automated proxy export and sync...")
             execute_auto_screener_sync(database_date=database_date)
             logger.info("[AUTO-SYNC] Automated sync job finished successfully.")
         except Exception as e:
             logger.error(f"[AUTO-SYNC] Job failed: {e}", exc_info=True)
         finally:
+            _screener_lock.release()
+
+    threading.Thread(target=worker, daemon=True).start()
+
+
+def dispatch_manual_screener_sync_job(csv_bytes: bytes, database_date: str = None):
+    """Handles manual uploaded CSV execution, runs pipeline, updates telemetry, and cleans up."""
+    if not run_screener_pipeline:
+        logger.error("[MANUAL-SYNC] Cannot run pipeline: Screener ETL runner is not loaded.")
+        return
+
+    if not _screener_lock.acquire(blocking=False):
+        logger.warning("[MANUAL-SYNC] A screener sync is already active.")
+        return
+
+    def worker():
+        root_screener = Path.cwd() / "screener.csv"
+        now_ist = datetime.now(IST)
+        effective_date = database_date or now_ist.strftime("%Y-%m-%d")
+
+        try:
+            # 1. Write uploaded bytes directly to root screener.csv
+            with open(root_screener, "wb") as f:
+                f.write(csv_bytes)
+            logger.info(f"[MANUAL-SYNC] Uploaded screener.csv saved ({len(csv_bytes)} bytes).")
+
+            # 2. Run Screener ETL pipeline
+            logger.info("[MANUAL-SYNC] Executing Screener ETL pipeline...")
+            run_screener_pipeline()
+            logger.info("[MANUAL-SYNC] Pipeline stages finished successfully.")
+
+            # 3. Update health telemetry
+            now_ist_str = now_ist.strftime("%Y-%m-%d %H:%M:%S IST")
+            db.reference("system_status/screener_sync").update({
+                "Date of database data": effective_date,
+                "last_screener_db": now_ist_str,
+                "last_sync_time": now_ist_str,
+                "status": "SUCCESS",
+                "sync_source": "MANUAL_UPLOAD"
+            })
+            logger.info(f"[MANUAL-SYNC] Health status updated: Last Screener DB -> {now_ist_str}")
+
+        except Exception as e:
+            logger.error(f"[MANUAL-SYNC] Manual sync failed: {e}", exc_info=True)
+            try:
+                db.reference("system_status/screener_sync").update({
+                    "status": f"FAILED: {str(e)[:100]}",
+                    "last_error_time": datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S IST")
+                })
+            except Exception:
+                pass
+        finally:
+            # 4. Clean up temporary screener.csv
+            try:
+                if root_screener.exists():
+                    root_screener.unlink()
+                logger.info("[MANUAL-SYNC] Local temporary screener.csv cleaned successfully.")
+            except Exception as clean_err:
+                logger.warning(f"[MANUAL-SYNC] Cleanup warning: {clean_err}")
             _screener_lock.release()
 
     threading.Thread(target=worker, daemon=True).start()
@@ -208,9 +246,6 @@ class PulseCommandServer(BaseHTTPRequestHandler):
         elif path in ("/sync", "/api/sync"):
             STATE_BUS.trigger_pulse("SYNC")
             self._send_resp(200, "MANUAL SYNC triggered.\n")
-        elif path in ("/sync-screener", "/run-pipeline", "/api/sync-screener"):
-            dispatch_screener_sync_job()
-            self._send_json_resp(200, {"status": "started", "message": "Screener ETL sync initiated."})
         elif path in ("/auto-sync-screener", "/api/auto-sync-screener"):
             dispatch_auto_screener_sync_job()
             self._send_json_resp(200, {"status": "started", "message": "Automated Screener download and sync initiated."})
@@ -221,7 +256,54 @@ class PulseCommandServer(BaseHTTPRequestHandler):
         parsed_url = urlparse(self.path)
         path = parsed_url.path.lower().strip()
 
-        # Parse JSON body if present
+        # Handle Manual CSV File Upload (multipart/form-data)
+        if path in ("/sync-screener-upload", "/api/sync-screener-upload"):
+            try:
+                content_type = self.headers.get("Content-Type", "")
+                content_length = int(self.headers.get("Content-Length", 0))
+
+                if "multipart/form-data" not in content_type:
+                    self._send_json_resp(400, {"error": "Expected multipart/form-data"})
+                    return
+
+                # Extract multipart boundary delimiter
+                boundary_marker = content_type.split("boundary=")[-1].strip().strip('"').encode("utf-8")
+                body_bytes = self.rfile.read(content_length)
+
+                parts = body_bytes.split(b"--" + boundary_marker)
+                uploaded_csv = None
+                database_date = None
+
+                for part in parts:
+                    if b'name="file"' in part:
+                        # Extract binary body after header boundary
+                        header_and_data = part.split(b"\r\n\r\n", 1)
+                        if len(header_and_data) == 2:
+                            file_bytes = header_and_data[1]
+                            if file_bytes.endswith(b"\r\n"):
+                                file_bytes = file_bytes[:-2]
+                            uploaded_csv = file_bytes
+
+                    elif b'name="database_date"' in part:
+                        header_and_data = part.split(b"\r\n\r\n", 1)
+                        if len(header_and_data) == 2:
+                            val = header_and_data[1].split(b"\r\n")[0].decode("utf-8", errors="ignore").strip()
+                            database_date = val
+
+                if not uploaded_csv:
+                    self._send_json_resp(400, {"error": "No file received in upload payload"})
+                    return
+
+                dispatch_manual_screener_sync_job(csv_bytes=uploaded_csv, database_date=database_date)
+                self._send_json_resp(200, {"status": "started", "message": "Manual CSV uploaded. ETL pipeline started."})
+                return
+
+            except Exception as e:
+                logger.error(f"[MANUAL-SYNC] Upload route error: {e}", exc_info=True)
+                self._send_json_resp(500, {"error": f"Upload processing failed: {str(e)}"})
+                return
+
+        # Parse JSON body for other commands
         content_length = int(self.headers.get("Content-Length", 0))
         payload_data = {}
         if content_length > 0:
@@ -235,9 +317,6 @@ class PulseCommandServer(BaseHTTPRequestHandler):
             target_date = payload_data.get("database_date")
             dispatch_auto_screener_sync_job(database_date=target_date)
             self._send_json_resp(200, {"status": "started", "message": "Automated Screener download & sync initiated."})
-        elif path in ("/sync-screener", "/run-pipeline", "/api/sync-screener"):
-            dispatch_screener_sync_job()
-            self._send_json_resp(200, {"status": "started", "message": "Screener ETL sync initiated."})
         elif path in ("/sync", "/api/sync"):
             STATE_BUS.trigger_pulse("SYNC")
             self._send_resp(200, "MANUAL SYNC triggered via POST.\n")
