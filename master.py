@@ -18,7 +18,7 @@ import shutil
 from pathlib import Path
 from urllib.parse import urlparse
 from http.server import HTTPServer, BaseHTTPRequestHandler
-from datetime import datetime, date
+from datetime import datetime, date, time as dt_time, timedelta
 import pytz
 
 from config import (
@@ -53,6 +53,14 @@ from market_calendar import MarketCalendar
 from sync_child import sync_historical_script
 from live_child import update_live_script
 from yahoo_manager import get_latest_available_trading_date
+
+def add_minutes_to_time(t: dt_time, minutes: int) -> dt_time:
+    dt = datetime.combine(date.today(), t) + timedelta(minutes=minutes)
+    return dt.time()
+
+def subtract_minutes_from_time(t: dt_time, minutes: int) -> dt_time:
+    dt = datetime.combine(date.today(), t) - timedelta(minutes=minutes)
+    return dt.time()
 
 # Parameter calculation functions
 try:
@@ -390,7 +398,25 @@ class MasterOrchestrator:
         self.last_heartbeat_time = 0.0
         self.last_command_ts = time.time() * 1000
 
+        self.post_market_sync_done = False
+        self.post_market_screener_done = False
+        self.post_market_param_done = False
+
         self.script_status = {}
+
+    def purge_live_candles(self):
+        """Clears temporary intraday node 0 across stocks after official session is locked in node 1."""
+        logger.info("[POST-MARKET] Purging intraday live node 0 across database...")
+        cleared = 0
+        for name in list(self.script_status.keys()):
+            try:
+                safe_key = sanitize_key(name)
+                if safe_key:
+                    clear_live_candle(safe_key)
+                    cleared += 1
+            except Exception as e:
+                logger.debug(f"[POST-MARKET] Failed to clear node 0 for {name}: {e}")
+        logger.info(f"[POST-MARKET] Cleared node 0 for {cleared} stocks.")
 
     def record_heartbeat(self):
         try:
@@ -519,9 +545,28 @@ class MasterOrchestrator:
                     time.sleep(5)
                     continue
 
-                sync_start = datetime.strptime(f"{SYNC_WINDOW_START_HOUR}:{SYNC_WINDOW_START_MIN}", "%H:%M").time()
-                sync_cutoff = datetime.strptime(f"{SYNC_WINDOW_DEADLINE_HOUR}:{SYNC_WINDOW_DEADLINE_MIN}", "%H:%M").time()
+                # Derive dynamic session schedule (Regular vs Muhurat vs Override)
+                session_window = self.calendar.get_trading_session_window(today_date)
+                if session_window:
+                    start_time, end_time, session_name = session_window
+                    if start_time == dt_time(9, 15):
+                        sync_start = dt_time(SYNC_WINDOW_START_HOUR, SYNC_WINDOW_START_MIN)
+                        sync_cutoff = dt_time(SYNC_WINDOW_DEADLINE_HOUR, SYNC_WINDOW_DEADLINE_MIN)
+                    else:
+                        sync_start = subtract_minutes_from_time(start_time, 60)
+                        sync_cutoff = subtract_minutes_from_time(start_time, 15)
 
+                    t_post_sync = add_minutes_to_time(end_time, 30)      # 16:00 for regular
+                    t_post_screener = add_minutes_to_time(end_time, 45)  # 16:15 for regular
+                    t_post_param = add_minutes_to_time(end_time, 60)     # 16:30 for regular
+                else:
+                    sync_start = dt_time(SYNC_WINDOW_START_HOUR, SYNC_WINDOW_START_MIN)
+                    sync_cutoff = dt_time(SYNC_WINDOW_DEADLINE_HOUR, SYNC_WINDOW_DEADLINE_MIN)
+                    t_post_sync = dt_time(16, 0)
+                    t_post_screener = dt_time(16, 15)
+                    t_post_param = dt_time(16, 30)
+
+                # Pre-Market Sync Window
                 if sync_start <= now_time < sync_cutoff:
                     has_unsynced = any(not s["synced"] for s in self.script_status.values())
                     if has_unsynced and (now_epoch - self.last_sync_attempt_time >= SYNC_RETRY_INTERVAL_SEC):
@@ -536,6 +581,7 @@ class MasterOrchestrator:
                 self.calendar.refresh_calendar()
                 status, _ = self.calendar.get_market_status()
 
+                # Live Market Hours
                 if status == "LIVE":
                     if (now_epoch - self.last_live_update_time) >= LIVE_UPDATE_INTERVAL_SEC:
                         self.execute_live_updates()
@@ -546,6 +592,42 @@ class MasterOrchestrator:
                         if active_synced:
                             update_all_parameters(active_synced)
                         self.last_param_calc_time = now_epoch
+
+                # Post-Market Automation Pipeline (16:00 -> 16:15 -> 16:30 -> 16:35)
+                if status == "CLOSED":
+                    # Step 1: 16:00 IST - Sync Official Closing Candles into /stocks/<CODE>/1
+                    if now_time >= t_post_sync and not self.post_market_sync_done:
+                        logger.info(f"[POST-MARKET] Triggering 16:00 Post-Market Historical Sync for {today_date}...")
+                        self.post_market_sync_done = True
+                        def _run_post_sync():
+                            self.execute_historical_sync(is_manual=True)
+                            self.purge_live_candles()
+                            logger.info("[POST-MARKET] 16:00 Historical Sync and node 0 cleanup completed. ✅")
+                        threading.Thread(target=_run_post_sync, daemon=True).start()
+
+                    # Step 2: 16:15 IST - Auto-Run Screener Sync (G, F, T scores)
+                    if now_time >= t_post_screener and not self.post_market_screener_done:
+                        logger.info(f"[POST-MARKET] Triggering 16:15 Screener Auto-Sync for {today_date}...")
+                        self.post_market_screener_done = True
+                        dispatch_auto_screener_sync_job()
+
+                    # Step 3: 16:30 IST - Auto-Run Param Calc (Bind official close + Screener scores into /param)
+                    if now_time >= t_post_param and not self.post_market_param_done:
+                        logger.info(f"[POST-MARKET] Triggering 16:30 Param Calc for {today_date}...")
+                        self.post_market_param_done = True
+                        def _run_post_param():
+                            update_all_parameters()
+                            logger.info("[POST-MARKET] 16:30 Parameter calculation completed. ✅")
+                            # Step 4: 16:35 IST - Lock system status
+                            try:
+                                db.reference("system_status").update({
+                                    "daily_cycle": "VERIFIED_LOCKED",
+                                    "last_verified_at": datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S IST")
+                                })
+                                logger.info("[POST-MARKET] 16:35 System verified & locked for night/weekend. 🔒")
+                            except Exception as lock_err:
+                                logger.warning(f"[POST-MARKET] Failed to record locked status: {lock_err}")
+                        threading.Thread(target=_run_post_param, daemon=True).start()
 
                 time.sleep(5)
 
@@ -563,6 +645,9 @@ class MasterOrchestrator:
         self.is_today_trading_day = self.calendar.is_trading_day(today)
         self.last_planned_date = today
         self.sync_audit_reported_today = False
+        self.post_market_sync_done = False
+        self.post_market_screener_done = False
+        self.post_market_param_done = False
 
         stock_map = get_stocklist_mapping(force_reconcile=True)
         new_status = {}

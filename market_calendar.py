@@ -4,6 +4,7 @@ Evaluates current market status against weekends, holidays, special sessions,
 and manual overrides dynamically loaded from Firebase.
 """
 from datetime import datetime, date, time as dt_time, timedelta
+from typing import Optional, Tuple
 import pytz
 from config import TIMEZONE, TEST_MODE, SIMULATED_TIME, logger
 from firebase_manager import get_calendar_config, set_calendar_config
@@ -214,6 +215,49 @@ class MarketCalendar:
         while not self.is_trading_day(target):
             target -= timedelta(days=1)
         return target
+
+    def get_current_trading_date(self, ref_date: Optional[date] = None) -> date:
+        """
+        Returns ref_date (default today) if it is a valid trading session,
+        otherwise steps backward to the most recent completed trading session.
+        """
+        cur = ref_date or self.get_current_time().date()
+        while not self.is_trading_day(cur):
+            cur -= timedelta(days=1)
+        return cur
+
+    def get_trading_session_window(self, check_date: Optional[date] = None) -> Optional[Tuple[dt_time, dt_time, str]]:
+        """
+        Returns (start_time, end_time, session_name) for check_date,
+        or None if check_date is not a trading day (e.g. weekend or holiday).
+        """
+        if check_date is None:
+            check_date = self.get_current_time().date()
+
+        if not self.is_trading_day(check_date):
+            return None
+
+        # 1. Manual Override
+        override = self.get_manual_override(check_date)
+        if override:
+            status = override.get("status", "").upper()
+            if status in ("TRADING", "SPECIAL_TRADING"):
+                s_str = override.get("start", "09:15")
+                e_str = override.get("end", "15:30")
+                return self._parse_time(s_str), self._parse_time(e_str), override.get("name", "Manual Override Session")
+            if status in ("HOLIDAY", "CLOSED"):
+                return None
+
+        # 2. Special Trading Day (e.g. Muhurat)
+        special = self.get_special_trading(check_date)
+        if special and special.get("status") == "SPECIAL_TRADING":
+            s_str = special.get("start", "18:00")
+            e_str = special.get("end", "19:00")
+            return self._parse_time(s_str), self._parse_time(e_str), special.get("name", "Special Trading Session")
+
+        # 3. Regular Trading Day
+        reg = self.config.get("regular_market", {"start": "09:15", "end": "15:30"})
+        return self._parse_time(reg.get("start", "09:15")), self._parse_time(reg.get("end", "15:30")), "Regular NSE Session"
 
     def get_trading_day_gap(self, start_date: date, end_date: date) -> int:
         """

@@ -16,8 +16,10 @@ import pytz
 from typing import Any, Dict, List, Optional, Set, Tuple
 from firebase_admin import db
 from config import logger, TIMEZONE
+from market_calendar import MarketCalendar
 
 IST = pytz.timezone(TIMEZONE)
+_CALENDAR = MarketCalendar()
 
 FIXED_INDICES = {
     "NIFTY50": "^NSEI",
@@ -170,12 +172,18 @@ def fetch_candles_for_aliases(aliases: List[str]) -> Tuple[List[Dict[str, Any]],
             if isinstance(stock_data, list):
                 ordered = [c for c in stock_data if isinstance(c, dict)]
             elif isinstance(stock_data, dict):
-                for i in range(len(stock_data)):
-                    idx_key = str(i)
-                    if idx_key in stock_data and isinstance(stock_data[idx_key], dict):
-                        ordered.append(stock_data[idx_key])
-                    else:
-                        break
+                # Robust index extraction: handles presence or absence of node 0 seamlessly
+                num_keys = []
+                for k in stock_data.keys():
+                    try:
+                        num_keys.append(int(k))
+                    except (ValueError, TypeError):
+                        pass
+                num_keys.sort()
+                for k in num_keys:
+                    val = stock_data.get(str(k))
+                    if isinstance(val, dict):
+                        ordered.append(val)
             if len(ordered) >= 1:
                 return ordered, candidate
     return [], None
@@ -364,9 +372,42 @@ def process_target_group(aliases: List[str]) -> bool:
         logger.warning(f"[{primary_code}] Skipped: No candle history found in /stocks under {clean_aliases}")
         return False
 
-    c_0 = candles[0] if len(candles) > 0 else None
-    close_0 = parse_price(c_0, "close")
-    open_0 = parse_price(c_0, "open")
+    # Identify candles by Date & Session Context
+    now_ist = datetime.now(IST)
+    today_date = now_ist.date()
+    today_str = today_date.strftime("%Y-%m-%d")
+    is_today_trading = _CALENDAR.is_trading_day(today_date)
+    prev_trading_date = _CALENDAR.get_previous_trading_day(today_date)
+    prev_date_str = prev_trading_date.strftime("%Y-%m-%d")
+    day_before_trading_date = _CALENDAR.get_previous_trading_day(prev_trading_date)
+    day_before_date_str = day_before_trading_date.strftime("%Y-%m-%d")
+
+    date_to_candle: Dict[str, Dict[str, Any]] = {
+        str(c.get("date")): c for c in candles if c.get("date")
+    }
+
+    top_candle = candles[0]
+    top_date_str = str(top_candle.get("date", ""))
+
+    c_today: Optional[Dict[str, Any]] = None
+    c_yesterday: Optional[Dict[str, Any]] = None
+    c_day_before: Optional[Dict[str, Any]] = None
+
+    if is_today_trading and (top_date_str == today_str or top_candle.get("time")):
+        # Active live session today
+        c_today = top_candle
+        c_yesterday = date_to_candle.get(prev_date_str) or (candles[1] if len(candles) > 1 else None)
+        c_day_before = date_to_candle.get(day_before_date_str) or (candles[2] if len(candles) > 2 else None)
+    else:
+        # Off-market, weekend, holiday, or official close already locked into index 1
+        c_today = candles[0]
+        c_yesterday = candles[1] if len(candles) > 1 else None
+        c_day_before = candles[2] if len(candles) > 2 else None
+
+    close_0 = parse_price(c_today, "close")
+    open_0 = parse_price(c_today, "open")
+    c_1 = parse_price(c_yesterday, "close")
+    c_2 = parse_price(c_day_before, "close")
 
     closes: List[float] = []
     highs: List[float] = []
@@ -420,28 +461,31 @@ def process_target_group(aliases: List[str]) -> bool:
     def get_close(idx: int) -> Optional[float]:
         return closes[idx] if len(closes) > idx else None
 
-    c_1 = get_close(1)
-    c_6 = get_close(6)
-    c_21 = get_close(21)
-    c_66 = get_close(66)
-    c_121 = get_close(121)
+    c_6 = get_close(5) or get_close(6)
+    c_21 = get_close(21) or get_close(20)
+    c_66 = get_close(66) or get_close(65)
+    c_121 = get_close(121) or get_close(120)
     c_251 = get_close(251) or get_close(250)
 
-    # Single-instance distinct returns
-    chng_2dy = safe_div(close_0 - open_0, open_0) if (close_0 is not None and open_0 is not None) else "N/A"
-    chng_ydy = safe_div(close_0 - c_1, c_1) if (close_0 is not None and c_1 is not None) else "N/A"
+    # Return calculations:
+    # Formula 1: Today % Change = ((Today CMP - Yesterday Close) / Yesterday Close) * 100
+    chng_tdy = safe_div(close_0 - c_1, c_1) if (close_0 is not None and c_1 is not None) else "N/A"
 
-    ret_1wr = safe_div(c_1 - c_6, c_6) if (c_1 is not None and c_6 is not None) else "N/A"
-    ret_1mr = safe_div(c_1 - c_21, c_21) if (c_1 is not None and c_21 is not None) else "N/A"
-    ret_3mr = safe_div(c_1 - c_66, c_66) if (c_1 is not None and c_66 is not None) else "N/A"
-    ret_6mr = safe_div(c_1 - c_121, c_121) if (c_1 is not None and c_121 is not None) else "N/A"
-    ret_1yr = safe_div(c_1 - c_251, c_251) if (c_1 is not None and c_251 is not None) else "N/A"
+    # Formula 2: Yesterday % Change = ((Yesterday Close - Day-Before Close) / Day-Before Close) * 100
+    chng_ydy = safe_div(c_1 - c_2, c_2) if (c_1 is not None and c_2 is not None) else "N/A"
+
+    # Multi-period historical returns
+    baseline_close = c_1 if c_1 is not None else close_0
+    ret_1wr = safe_div(baseline_close - c_6, c_6) if (baseline_close is not None and c_6 is not None) else "N/A"
+    ret_1mr = safe_div(baseline_close - c_21, c_21) if (baseline_close is not None and c_21 is not None) else "N/A"
+    ret_3mr = safe_div(baseline_close - c_66, c_66) if (baseline_close is not None and c_66 is not None) else "N/A"
+    ret_6mr = safe_div(baseline_close - c_121, c_121) if (baseline_close is not None and c_121 is not None) else "N/A"
+    ret_1yr = safe_div(baseline_close - c_251, c_251) if (baseline_close is not None and c_251 is not None) else "N/A"
 
     detailed_metrics = fetch_detailed_metrics(clean_aliases)
 
-    now_ist = datetime.now(IST)
     current_time_str = now_ist.strftime("%H:%M:%S")
-    current_date_str = str(c_0.get("date", now_ist.strftime("%Y-%m-%d"))) if c_0 else now_ist.strftime("%Y-%m-%d")
+    current_date_str = str(c_today.get("date", now_ist.strftime("%Y-%m-%d"))) if c_today else now_ist.strftime("%Y-%m-%d")
 
     # DEDUPLICATED CLEAN PAYLOAD
     payload = {
@@ -469,7 +513,8 @@ def process_target_group(aliases: List[str]) -> bool:
         "25H": h25,
         "25L": l25,
         "Ydy-%chng": chng_ydy,
-        "Tdy-%chng": chng_2dy,
+        "Tdy-%chng": chng_tdy,
+        "2dy-%chng": chng_tdy,
         "1W": ret_1wr,
         "1M": ret_1mr,
         "3M": ret_3mr,
